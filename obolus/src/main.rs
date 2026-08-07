@@ -11,10 +11,10 @@
 //! placeholders below are deliberately not real addresses and must be overridden for any real
 //! network; there is no mainnet signing path in this crate.
 //!
-//! The Phase-A fakes that used to drive the 402 handshake by hand are gone from this binary on
-//! purpose. They are `#[cfg(test)]`-only now, so the `server` target — which compiles the library
-//! without `cfg(test)` — physically cannot build an accept-every-payment facilitator or a pretend
-//! upstream into a shipped artifact (OBOL-001). The compiler is the guarantee, not a code review.
+//! The Phase-A fakes are absent from this binary on purpose. They are `#[cfg(test)]`-only, so the
+//! `server` target — which compiles the library without `cfg(test)` — physically cannot build an
+//! accept-every-payment facilitator or a pretend upstream into a shipped artifact (OBOL-001). The
+//! compiler is the guarantee, not a code review.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -519,11 +519,11 @@ async fn main() -> anyhow::Result<()> {
             }
             let verifier = PublicKeyTokenVerifier::with_keys(&keys, &issuer, audience.as_deref())
                 .map_err(|e| anyhow::anyhow!("{source}: {e}"))?;
-            // No description composed here, deliberately. Round 3 found that this file *could*
-            // still format one from `issuer` and `audience` that the verifier did not hold: with
-            // `None` passed above, the banner announced the configured audience while the
-            // `Validation` enforced none, and both test targets stayed green. The line now comes
-            // off the verifier's own enforcing state — see `TokenVerifier::description`.
+            // No description composed here, deliberately. This file *could* format one from
+            // `issuer` and `audience` that the verifier does not hold — with `None` passed above,
+            // a banner announcing the configured audience while the `Validation` enforces none
+            // leaves both test targets green. The line comes off the verifier's own enforcing
+            // state instead — see `TokenVerifier::description`.
             Some(TokenPath::new(Arc::new(verifier)))
         }
     };
