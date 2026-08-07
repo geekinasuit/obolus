@@ -1,0 +1,32 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Deliberately NOT a dependency of //obolus:server. The gateway delegates verification to a
+# facilitator and never inspects a signature; this crate exists for the development stub (OBOL-018)
+# and for anything else that needs to check an EIP-3009 authorization offline.
+rust_library(
+    name = "eip3009",
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:hex",
+        "@crates//:k256",
+        "@crates//:sha3",
+        "@crates//:thiserror",
+    ],
+)
+
+# `compile_data` is an explicit file list, never a glob: a glob that silently matches nothing would
+# leave the fixture-driven tests below passing with no fixtures to drive them.
+rust_test(
+    name = "eip3009_test",
+    compile_data = [
+        "fixtures/eip712-mail.json",
+        "fixtures/typehashes.json",
+        "fixtures/x402-authorization.json",
+    ],
+    crate = ":eip3009",
+    deps = [
+        "@crates//:serde",
+        "@crates//:serde_json",
+    ],
+)

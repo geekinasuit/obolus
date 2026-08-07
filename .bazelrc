@@ -1,0 +1,5 @@
+# Bazel 8, bzlmod only (MODULE.bazel; no WORKSPACE). This repo is pure Rust, so there is no JVM or
+# Kotlin toolchain to pin.
+
+# Per-user local overrides (gitignored). Optional — an absent file is fine.
+try-import %workspace%/user.bazelrc

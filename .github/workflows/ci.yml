@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# This repository is public, so pull requests carry code from people we do not know. Every job
+# below runs on a GitHub-hosted runner — never a self-hosted one, which would execute a stranger's
+# patch on our own hardware — and the token is read-only.
+permissions:
+  contents: read
+
+jobs:
+  no-stray-notes:
+    name: No working notes in the tree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Working notes are kept outside this repository. .gitignore keeps them out by default; this
+      # job is what makes that load-bearing, since an ignore rule is silently defeated by
+      # `git add -f`.
+      - name: Reject committed notes
+        run: |
+          if git ls-files | grep -E '(^|/)thoughts/'; then
+            echo "::error::Working notes must not be committed to this repository."
+            exit 1
+          fi
+          echo "No note files tracked."
+
+      # The subtler case: a path that is not in this repository but is still linked to. Such a link
+      # is a broken reference for anyone reading the code.
+      - name: Reject references to absent note paths
+        run: |
+          if git grep -nE '(\.\./)*thoughts/shared/' -- . ':!.github/workflows/ci.yml' ':!.gitignore'; then
+            echo "::error::Source refers to a path that is not in this repository. Reference the ticket ID alone instead."
+            exit 1
+          fi
+          echo "No references to absent note paths."
+
+  bazel:
+    name: bazel test //...
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      # The canonical build. Every test here is hermetic — no network, no chain, no model — so this
+      # is the gate that decides a merge; anything touching external reality runs outside it.
+      - name: Test
+        run: bazel test //...

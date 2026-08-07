@@ -1,0 +1,29 @@
+module(
+    name = "obolus",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "rules_rust", version = "0.65.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.90.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# Third-party crates are resolved from the Cargo manifests, so `cargo` and `bazel` build the same
+# dependency graph and Cargo.lock stays the single source of truth for versions.
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = [
+        "//:Cargo.toml",
+        "//eip3009:Cargo.toml",
+        "//obolus:Cargo.toml",
+    ],
+)
+use_repo(crate, "crates")

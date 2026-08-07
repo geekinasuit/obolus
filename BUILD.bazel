@@ -1,0 +1,7 @@
+# The repository root is a virtual Cargo workspace: no Rust targets are built here. This package
+# exists so the workspace manifest and lockfile are addressable as `//:Cargo.toml` and
+# `//:Cargo.lock`, which is how crate_universe in MODULE.bazel resolves the dependency graph.
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+])
