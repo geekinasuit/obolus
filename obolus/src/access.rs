@@ -54,14 +54,13 @@ pub trait TokenVerifier: Send + Sync + 'static {
 ///
 /// One value rather than two, and that is the whole point. `src/main.rs` is compiled by no test
 /// target, so nothing in the library suite can observe whether a verifier reached the router —
-/// passing `None` at the wiring site turned the entire feature off with all 153 tests still green.
+/// passing `None` at the wiring site turns the entire feature off with the library suite still green.
 /// Binding the description to the verifier makes the startup banner *derived* from what is routed,
 /// which is what lets `tests/server_arming.rs` check the wiring from outside: the ENABLED line
 /// cannot print for an instance that has no verifier, because there is nothing to describe.
 ///
-/// The description is taken *from* the verifier rather than passed alongside it, which is round 3's
-/// correction: while the caller supplied the text, the line could describe a posture the verifier
-/// did not hold, and it did — see [`TokenVerifier::description`].
+/// The description is taken *from* the verifier rather than passed alongside it: a caller-supplied
+/// string can describe a posture the verifier does not hold — see [`TokenVerifier::description`].
 pub struct TokenPath {
     verifier: Arc<dyn TokenVerifier>,
     description: String,

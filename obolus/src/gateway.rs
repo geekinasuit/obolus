@@ -215,11 +215,10 @@ async fn paid_completion<F: Facilitator, U: Upstream>(
     };
     if !response.status.is_success() {
         // The upstream refused: charge nothing, and hand its answer back the same way every other
-        // response here is built. This went through `(status, body)` until round 2, which dropped
-        // the upstream's content type — so one identical `503 {"error":..}` reached a paying client
-        // untyped and a token-holder as `application/json`. Small in itself; the point is that it
-        // was a live divergence between the paid and unpaid paths on the axis this module claims to
-        // have closed, and the path that had drifted was the unpaid one.
+        // response here is built. Constructing it as `(status, body)` instead drops the upstream's
+        // content type, so an identical `503 {"error":..}` reaches a paying client untyped and a
+        // token-holder as `application/json` — a divergence between the paid and unpaid paths on
+        // the very axis this module exists to close.
         return proxy_response(response, None);
     }
 
@@ -568,10 +567,9 @@ mod tests {
         assert!(headers.get(x402::HEADER_PAYMENT_RESPONSE).is_none());
         assert_eq!(calls.verifies(), 1, "we did check the payment");
         assert_eq!(calls.settles(), 0, "but must not charge for a request the upstream refused");
-        // The half round 2 fixed but did not observe. This arm used to return `(status, body)`
-        // directly and drop the upstream's content type, so a paying client got an untyped error
-        // body where a token holder got a typed one. Asserted here and in the token-path analogue
-        // against the same constant, which is what makes restoring that early return go red.
+        // Returning `(status, body)` directly here would drop the upstream's content type, giving a
+        // paying client an untyped error body where a token holder gets a typed one. Asserted here
+        // and in the token-path analogue against the same constant, so that regression goes red.
         assert_eq!(
             headers.get(axum::http::header::CONTENT_TYPE).map(|v| v.to_str().unwrap()),
             Some(UPSTREAM_REFUSAL_CONTENT_TYPE),
@@ -975,9 +973,8 @@ mod tests {
     #[tokio::test]
     async fn a_refusing_upstream_reaches_a_token_holder_the_same_way_it_reaches_a_payer() {
         // The paid path's analogue is `an_upstream_error_is_passed_through_and_costs_nothing`. Both
-        // arms now build their response through `proxy_response`, and that is the claim: an
-        // identical upstream refusal comes back identically on both paths, content type included.
-        // Until round 2 it did not — the paid path returned `(status, body)` and dropped the type.
+        // arms build their response through `proxy_response`, and that is the claim: an identical
+        // upstream refusal comes back identically on both paths, content type included.
         let (app, calls, forwards) = app_with_verifier(
             FakeFacilitator::accepting(),
             FakeUpstream::refusing(StatusCode::SERVICE_UNAVAILABLE),

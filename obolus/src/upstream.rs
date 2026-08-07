@@ -184,17 +184,6 @@ impl Upstream for FakeUpstream {
     }
 }
 
-/// The real upstream: a streaming reverse proxy to an Ollama server's OpenAI-compatible
-/// `/v1/chat/completions` endpoint.
-///
-/// [`forward`](OllamaUpstream::forward) returns the moment the response *head* arrives; the body
-/// then streams lazily as `hyper`'s `Incoming`, so the model's output is never buffered before
-/// the gateway has decided whether to charge. That timing is the whole point of the head/body
-/// split — see [`crate::gateway`].
-///
-/// It speaks plain HTTP: Ollama is a local origin (`http://127.0.0.1:11434`). TLS is not wired
-/// here because no hermetic path needs it; a facilitator that lives behind HTTPS is a separate,
-/// later concern (the connector, not this type, is where TLS would enter).
 /// How long to wait for the response *head* before treating the upstream as unreachable.
 ///
 /// Generous by design. `forward` resolves when the head arrives, and Ollama's timing splits on
@@ -208,6 +197,17 @@ impl Upstream for FakeUpstream {
 /// legitimate completion; the binary exposes `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS` to tune it.
 const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// The real upstream: a streaming reverse proxy to an Ollama server's OpenAI-compatible
+/// `/v1/chat/completions` endpoint.
+///
+/// [`forward`](OllamaUpstream::forward) returns the moment the response *head* arrives; the body
+/// then streams lazily as `hyper`'s `Incoming`, so the model's output is never buffered before
+/// the gateway has decided whether to charge. That timing is the whole point of the head/body
+/// split — see [`crate::gateway`].
+///
+/// It speaks plain HTTP: Ollama is a local origin (`http://127.0.0.1:11434`). TLS is not wired
+/// here because no hermetic path needs it; a facilitator that lives behind HTTPS is a separate,
+/// later concern (the connector, not this type, is where TLS would enter).
 pub struct OllamaUpstream {
     /// Origin only — scheme + host + port, no trailing slash, no path
     /// (e.g. `http://127.0.0.1:11434`). The endpoint path is appended per request.

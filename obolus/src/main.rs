@@ -33,7 +33,7 @@ use obolus::gateway::{router, Access, Gateway};
 use obolus::upstream::OllamaUpstream;
 use obolus::x402::PaymentRequirements;
 
-/// Not 8402 — that port belongs to ClawRouter on these machines (STORY-169).
+/// Deliberately not 8402, which x402 client-side tooling tends to bind.
 const DEFAULT_ADDR: &str = "127.0.0.1:8403";
 
 /// Ollama's default local origin: plain HTTP on loopback. The safe default upstream — overridden
@@ -55,12 +55,8 @@ const PLACEHOLDER_ASSET: &str = "0xTEST-ASSET-ADDRESS-NOT-REAL";
 /// unavailable rather than hanging.
 const SETTLE_TIMEOUT_MARGIN_SECS: u64 = 15;
 
-/// Generous by design — keep in step with `upstream::DEFAULT_HEAD_TIMEOUT`. `forward` resolves at
-/// the response head, and a **non-streaming** upstream request withholds the head until generation
-/// is complete, so for that shape this bounds *total generation time*, not connection setup. It is
-/// a hang-guard against an upstream that never answers, not a latency policy — the failure lands
-/// after `verify` and before `settle`, so too tight a value turns a slow-but-fine completion into
-/// an uncharged 502. Override with `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS`.
+/// Generous by design — keep in step with `upstream::DEFAULT_HEAD_TIMEOUT`, which documents what
+/// this bounds and why it stays loose. Override with `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS`.
 const DEFAULT_UPSTREAM_HEAD_TIMEOUT_SECS: u64 = 600;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -82,9 +78,8 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
 /// to go and fix, not the array entry.
 ///
 /// `parse_accepts` maps the same defects onto `OBOLUS_ACCEPTS entry for network "…"`. The check is
-/// shared ([`validated_option`]); only this naming is not, because "which entry" and "which
-/// variable" are different questions and an operator can only act on the one that matches how they
-/// configured it.
+/// shared ([`validated_option`]); only this naming is not, because an operator can only act on the
+/// one that matches how they configured it.
 ///
 /// Each message says the variable is *set but empty* rather than missing, because that is the
 /// distinction the operator cannot see from the outside: unset takes the placeholder default and
@@ -92,13 +87,9 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
 /// nothing. The usual causes are an unexpanded `${VAR}` in a compose file, an `EnvironmentFile`
 /// line ending in `=`, or an empty ConfigMap key.
 ///
-/// **No wildcard arm, deliberately.** `field` is [`EntryField`](obolus::config::EntryField) so this
-/// match is exhaustive, exactly like `ConfigError::in_accepts_entry` on the other side of the shared
-/// seam. A wildcard would let the next empty-able field compile clean and send an operator to clear a
-/// variable that was fine — confidently wrong about a named variable.
+/// The match is exhaustive on [`EntryField`](obolus::config::EntryField); see that type for why it
+/// carries no wildcard arm.
 fn single_chain_defect(defect: EntryDefect) -> anyhow::Error {
-    // By reference: every arm but one also interpolates the shared `{defect}` wording, so the
-    // scrutinee has to outlive the match.
     match &defect {
         EntryDefect::EmptyNetwork => anyhow::anyhow!(
             "OBOLUS_NETWORK is set but empty: {defect}. An empty network is not a chain this build \
@@ -117,9 +108,6 @@ fn single_chain_defect(defect: EntryDefect) -> anyhow::Error {
              nowhere. Unset it to run un-configured on the built-in placeholder, or set the \
              receiving address."
         ),
-        // An amount that is not a plain integer is not a different price, it is one no client can
-        // pay — so we refuse to start rather than advertise an unpayable challenge. Wording
-        // unchanged from before the two paths converged.
         EntryDefect::BadAmount(detail) => anyhow::anyhow!("OBOLUS_PRICE: {detail}"),
     }
 }
@@ -160,11 +148,9 @@ async fn main() -> anyhow::Result<()> {
         .with_timeout(settle_timeout);
 
     let upstream_url = env_or("OBOLUS_UPSTREAM_URL", DEFAULT_UPSTREAM_URL);
-    // Fail fast, symmetric with the facilitator URL above (same case-insensitive `http://`-scheme
-    // allowlist — hence `to_ascii_lowercase`, so `HTTP://` is accepted, not rejected as a typo).
-    // The upstream client speaks plain HTTP only (no TLS is wired; see `OllamaUpstream`), so an
-    // `https://` or schemeless value cannot reach the model and would 502 every paid request while
-    // /health still reports OK. Reject it at startup rather than at request time.
+    // Fail fast, symmetric with the facilitator URL above. Case-insensitive, so `HTTP://` is
+    // accepted rather than rejected as a typo. Left to request time, a bad scheme 502s every paid
+    // request while /health still reports OK.
     if !upstream_url.to_ascii_lowercase().starts_with("http://") {
         anyhow::bail!(
             "OBOLUS_UPSTREAM_URL must be an http:// origin (got {upstream_url:?}): the upstream \
@@ -184,8 +170,6 @@ async fn main() -> anyhow::Result<()> {
     let upstream =
         OllamaUpstream::new(&upstream_url).with_head_timeout(Duration::from_secs(head_timeout_secs));
 
-    // Fields shared by every advertised option — the parts that do not vary by chain.
-    //
     // The challenge tells the payer WHICH resource they are paying for, so `resource` must be an
     // address they can actually reach. Deriving it from the bind address is only right when that
     // address is routable — bind to `0.0.0.0` and the challenge advertises a resource nobody can
@@ -199,9 +183,9 @@ async fn main() -> anyhow::Result<()> {
 
     // One Obolus can advertise several chains at once (OBOL-003). `OBOLUS_ACCEPTS`, when set, is a
     // JSON array of `{network, asset, payTo, maxAmountRequired}` — the client picks one from the 402
-    // and pays it. Unset, we build the single legacy option from OBOLUS_NETWORK / OBOLUS_ASSET /
-    // OBOLUS_PAY_TO / OBOLUS_PRICE, byte-for-byte the previous behaviour. The `(scheme, network)`
-    // uniqueness of the resulting set is enforced by `Gateway::new` below, not here.
+    // and pays it. Unset, we build the single option from OBOLUS_NETWORK / OBOLUS_ASSET /
+    // OBOLUS_PAY_TO / OBOLUS_PRICE. The `(scheme, network)` uniqueness of the resulting set is
+    // enforced by `Gateway::new` below, not here.
     let requirements: Vec<PaymentRequirements> = match std::env::var("OBOLUS_ACCEPTS") {
         Ok(raw) => {
             // Set but empty, first — before the supersession bail below and before `parse_accepts`.
@@ -554,17 +538,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Read off the access surface, not off the configuration that built it — and printed before
     // `router` consumes it. This file is compiled by no test target, so anything keyed on a local
-    // would still print for an instance that does not hold what it claims. Two mutations proved
-    // that in turn: passing `None` at the wiring site turned the whole feature off with 153 tests
-    // green (round 2), and passing `None` for the audience left the banner naming an audience the
-    // verifier never enforced with 164 green (round 3). So both legs are derived — *whether* there
-    // is a token path from the routed `Access`, and *what it enforces* from the verifier's own
-    // `Validation` — and `tests/server_arming.rs` asserts this line, which makes the wiring
-    // checkable from outside the process.
+    // would still print for an instance that does not hold what it claims: passing `None` at the
+    // wiring site turns the whole feature off, and passing `None` for the audience leaves the banner
+    // naming an audience the verifier never enforces — both with the library suite green. So both
+    // legs are derived — *whether* there is a token path from the routed `Access`, and *what it
+    // enforces* from the verifier's own `Validation` — and `tests/server_arming.rs` asserts this
+    // line, which makes the wiring checkable from outside the process.
     //
     // Residual, stated rather than hidden: a *second* verifier or `Access` constructed purely to
-    // describe would still defeat this. That is the whole of it — mutating the real one no longer
-    // does, because the description has no source but the object that does the checking.
+    // describe would still defeat this. Mutating the real one does not, because the description has
+    // no source but the object that does the checking.
     if let Some(description) = access.token_path() {
         eprintln!(
             "obolus: bearer-token access ENABLED ({description}). Callers without an honoured \
