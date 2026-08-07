@@ -1,0 +1,19 @@
+[package]
+name = "eip3009"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# RustCrypto 0.13-generation, chosen so the shared workspace lock is perturbed additively: k256
+# and sha3 both sit on the digest 0.10 / generic-array 0.14 / sha2 0.10 line the lock already
+# carries for `ring` and `jsonwebtoken`. A libsecp256k1 C binding would instead drag a cc_library
+# and a non-hermetic toolchain into a Bazel build that is currently pure Rust.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+sha3 = "0.10"
+hex = "0.4"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,37 @@
+{
+  "kat": "x402-authorization",
+  "what_this_pins": "The complete EIP-3009 path on a real x402 payload: authorization struct hashing, the Base Sepolia USDC domain separator, the 0x1901 composition, and recovery to the authorizing party. This is the on-point vector — the same shape Obolus's facilitator sees on /verify.",
+  "source": {
+    "document": "x402 specification, `exact` scheme (EVM)",
+    "retrieved": "2026-08-05",
+    "note": "The `from` address also appears in serving/obolus/src/facilitator.rs's SPEC_VERIFY_* / SPEC_SETTLE_* fixtures, transcribed from the same specification."
+  },
+  "domain_provenance": {
+    "problem": "The x402 specification publishes this signature and every authorization field but NO EIP-712 domain — not the name, version, chainId or verifyingContract. As published, the payload is unverifiable: no domain means no separator, no digest, and nothing to check the signature against. That gap is OBOL-019.",
+    "how_it_was_closed": "By one trial, not a search. A single candidate domain was stated in advance — Circle's published Base Sepolia USDC contract address, that chain's id, and the FiatTokenV2 name and version — and tested once. It recovered the payload's `from` address exactly.",
+    "why_one_match_settles_it": "A wrong domain produces a different digest and therefore an essentially random recovered address. Agreeing with `from` on all 160 bits is not something a wrong guess does. The published signature is itself the attestation: it can only have been produced over this domain.",
+    "why_this_is_not_curve_fitting": "The distinction is pre-registration, not luck. Searching candidate domains until one verifies would eventually match something and prove nothing, because the test would have been fitted to pass. One candidate, named before the run, either matches or does not.",
+    "verifying_contract_source": {
+      "document": "Circle — USDC contract addresses",
+      "url": "https://developers.circle.com/stablecoins/usdc-contract-addresses",
+      "retrieved": "2026-08-05",
+      "note": "Circle publishes the address but no EIP-712 name or version string; those two fields are the ones the recovery establishes."
+    },
+    "what_remains_unestablished": "That the deployed contract at this address uses this domain. The recovery proves what the *signer* used, which is what a verifier needs and what this fixture tests. Reading the contract's own DOMAIN_SEPARATOR() would additionally confirm the two agree — strongly expected, since a payload signed under a domain the contract rejects would be unspendable, but not something this fixture checks."
+  },
+  "domain": {
+    "name": "USDC",
+    "version": "2",
+    "chain_id": 84532,
+    "verifying_contract": "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+  },
+  "authorization": {
+    "from": "0x857b06519E91e3A54538791bDbb0E22373e36b66",
+    "to": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+    "value": "10000",
+    "valid_after": "1740672089",
+    "valid_before": "1740672154",
+    "nonce": "0xf3746613c2d920b5fdabc0856f2aeb2d4f88ee6037b8cc5d04a71a4462f13480"
+  },
+  "signature": "0x2d6a7588d6acca505cbf0d9a4a227e0c52c6c34008c8e8986a1283259764173608a2ce6496642e377d6da8dbbf5836e9bd15092f9ecab05ded3d6293af148b571c"
+}

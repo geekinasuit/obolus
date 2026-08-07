@@ -1,0 +1,30 @@
+{
+  "kat": "eip712-mail",
+  "what_this_pins": "The complete chain from typed data to recovered signer: struct encoding, the domain separator, the 0x1901 digest composition, and secp256k1 recovery. The EIP-712 spec publishes the domain, types, message, signature, and expected signer — but NO intermediate hashes and no final digest. That absence is what makes this a strong vector: it cannot be passed by transcribing a published digest, only by computing the whole chain correctly.",
+  "not_an_eip3009_vector": "This is a generic EIP-712 example, not a token authorization. It is here because it is the only complete third-party end-to-end vector published for the EIP-712 machinery itself. Its nested Person structs exercise encodeType's recursive rule, which EIP-3009 never uses — so the test encodes it with a fixture-supplied type string rather than through the library, which deliberately carries no general encoder.",
+  "source": {
+    "document": "EIP-712: Typed structured data hashing and signing",
+    "url": "https://eips.ethereum.org/EIPS/eip-712",
+    "section": "Specification — worked example",
+    "status": "Final",
+    "retrieved": "2026-08-05"
+  },
+  "domain": {
+    "name": "Ether Mail",
+    "version": "1",
+    "chain_id": 1,
+    "verifying_contract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
+  },
+  "encode_type": {
+    "Person": "Person(string name,address wallet)",
+    "Mail": "Mail(Person from,Person to,string contents)Person(string name,address wallet)",
+    "note": "Both strings are published verbatim in the EIP-712 spec, including the alphabetical append of the referenced Person type onto Mail's signature. They are fixture data rather than derived, because this crate has no general encodeType implementation to derive them with."
+  },
+  "message": {
+    "from": { "name": "Cow", "wallet": "0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826" },
+    "to": { "name": "Bob", "wallet": "0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB" },
+    "contents": "Hello, Bob!"
+  },
+  "signature": "0x4355c47d63924e8a72e509b65029052eb6c299d53a04e167c5775fd466751c9d07299936d304c153f6443dfa05f40ff007d72911b6f72307f996231605b915621c",
+  "expected_signer": "0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826"
+}

@@ -1,0 +1,59 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+# The protocol + gateway live in a library so they can be unit-tested (and, later, reused by
+# the A3 real-facilitator integration tests). The binary is a thin main.
+rust_library(
+    name = "obolus",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    visibility = ["//visibility:public"],
+    deps = [
+        "@crates//:axum",
+        "@crates//:base64",
+        "@crates//:futures-util",
+        "@crates//:http-body-util",
+        "@crates//:hyper-util",
+        "@crates//:jsonwebtoken",
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:thiserror",
+        "@crates//:tokio",
+    ],
+)
+
+# The project's test target. CI runs `bazel test //...` with NO `|| test $? -eq 4` tolerance — so
+# this must not be deleted without a replacement, or the build goes red on purpose.
+rust_test(
+    name = "obolus_test",
+    crate = ":obolus",
+    deps = [
+        "@crates//:ring",
+        "@crates//:tower",
+    ],
+)
+
+rust_binary(
+    name = "server",
+    srcs = ["src/main.rs"],
+    deps = [
+        ":obolus",
+        "@crates//:anyhow",
+        "@crates//:axum",
+        "@crates//:tokio",
+    ],
+)
+
+# The arming guard's CALL SITE (OBOL-004). `obolus_test` above cannot cover it: it compiles
+# `crate = ":obolus"`, and src/main.rs is excluded from that library's glob — so main is compiled
+# by no test target and the only call to `check_arming` is unexercised. This target runs the real
+# `server` binary and reads startup behaviour off its stderr, which is the only vantage point from
+# which "the guard runs, and runs before anything is advertised" is checkable. Std-only: no new
+# crate deps. See the test's module docs for why it terminates and why it is hermetic.
+rust_test(
+    name = "server_arming_test",
+    srcs = ["tests/server_arming.rs"],
+    data = [":server"],
+    env = {"OBOLUS_SERVER_BIN": "$(rootpath :server)"},
+)

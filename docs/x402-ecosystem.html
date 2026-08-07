@@ -1,0 +1,584 @@
+<title>x402 — The Ecosystem, End to End</title>
+<style>
+  :root {
+    /* neutrals — cool slate bias, chosen not defaulted */
+    --paper:#f4f6fa; --surface:#ffffff; --surface-2:#eceff5; --surface-3:#e4e8f0;
+    --ink:#161a21; --ink-soft:#454e5e; --ink-faint:#6c7585;
+    --line:#d7dce6; --line-soft:#e5e9f1;
+    /* semantic hues: indigo = the rail, teal = settlement, amber = discovery */
+    --rail:#3350cf; --rail-strong:#2740ad; --rail-bg:#e7eafb; --rail-line:#b9c3f2;
+    --settle:#0d8a8c; --settle-strong:#0a6d6f; --settle-bg:#e0f3f2; --settle-line:#a4d9d7;
+    --disc:#b0530f; --disc-strong:#8f420b; --disc-bg:#fbeddf; --disc-line:#eecaa4;
+    --accent:#3350cf;
+    --shadow:0 1px 2px rgba(20,26,40,.06),0 8px 28px rgba(20,26,40,.07);
+    --shadow-lift:0 2px 6px rgba(20,26,40,.10),0 18px 44px rgba(20,26,40,.12);
+    --radius:14px; --radius-sm:9px;
+    --font-display:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,"Helvetica Neue",Arial,sans-serif;
+    --font-body:Charter,"Bitstream Charter","Iowan Old Style","Palatino Linotype",Georgia,Cambria,serif;
+    --font-mono:ui-monospace,"SF Mono","Cascadia Code","Roboto Mono",Menlo,Consolas,monospace;
+    --maxw:1080px; --prose:70ch;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:#0d1015; --surface:#151a22; --surface-2:#1b2130; --surface-3:#222a3a;
+      --ink:#e8edf4; --ink-soft:#aab3c3; --ink-faint:#7d8797;
+      --line:#293040; --line-soft:#212736;
+      --rail:#7f97ff; --rail-strong:#9db0ff; --rail-bg:#161d3a; --rail-line:#39457f;
+      --settle:#37d4c8; --settle-strong:#59e2d6; --settle-bg:#0f2f2d; --settle-line:#1f5854;
+      --disc:#f89b50; --disc-strong:#ffb673; --disc-bg:#301f0e; --disc-line:#66401b;
+      --accent:#8298ff;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.45);
+      --shadow-lift:0 2px 6px rgba(0,0,0,.5),0 18px 44px rgba(0,0,0,.55);
+    }
+  }
+  :root[data-theme="light"]{
+    --paper:#f4f6fa; --surface:#ffffff; --surface-2:#eceff5; --surface-3:#e4e8f0;
+    --ink:#161a21; --ink-soft:#454e5e; --ink-faint:#6c7585;
+    --line:#d7dce6; --line-soft:#e5e9f1;
+    --rail:#3350cf; --rail-strong:#2740ad; --rail-bg:#e7eafb; --rail-line:#b9c3f2;
+    --settle:#0d8a8c; --settle-strong:#0a6d6f; --settle-bg:#e0f3f2; --settle-line:#a4d9d7;
+    --disc:#b0530f; --disc-strong:#8f420b; --disc-bg:#fbeddf; --disc-line:#eecaa4;
+    --accent:#3350cf;
+    --shadow:0 1px 2px rgba(20,26,40,.06),0 8px 28px rgba(20,26,40,.07);
+    --shadow-lift:0 2px 6px rgba(20,26,40,.10),0 18px 44px rgba(20,26,40,.12);
+  }
+  :root[data-theme="dark"]{
+    --paper:#0d1015; --surface:#151a22; --surface-2:#1b2130; --surface-3:#222a3a;
+    --ink:#e8edf4; --ink-soft:#aab3c3; --ink-faint:#7d8797;
+    --line:#293040; --line-soft:#212736;
+    --rail:#7f97ff; --rail-strong:#9db0ff; --rail-bg:#161d3a; --rail-line:#39457f;
+    --settle:#37d4c8; --settle-strong:#59e2d6; --settle-bg:#0f2f2d; --settle-line:#1f5854;
+    --disc:#f89b50; --disc-strong:#ffb673; --disc-bg:#301f0e; --disc-line:#66401b;
+    --accent:#8298ff;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.45);
+    --shadow-lift:0 2px 6px rgba(0,0,0,.5),0 18px 44px rgba(0,0,0,.55);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0}
+  .page{
+    background:var(--paper); color:var(--ink);
+    font-family:var(--font-body); font-size:17px; line-height:1.62;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    padding:clamp(20px,5vw,64px) clamp(16px,5vw,40px) 80px;
+  }
+  .wrap{max-width:var(--maxw); margin:0 auto}
+  .col{max-width:var(--prose)}
+
+  h1,h2,h3,h4,.eyebrow,.chip,.tag,thead th,.legend,.metabar,.setnav,.step__n,.role,.lbl{font-family:var(--font-display)}
+  h1{font-size:clamp(2.1rem,5.2vw,3.4rem); line-height:1.03; letter-spacing:-.022em; font-weight:800; margin:.1em 0 .28em; text-wrap:balance}
+  h1 .x{color:var(--rail); font-weight:500}
+  h2{font-size:clamp(1.4rem,3vw,1.9rem); line-height:1.12; letter-spacing:-.015em; font-weight:750; margin:0 0 .5em; text-wrap:balance}
+  h3{font-size:1.06rem; letter-spacing:-.006em; font-weight:700; margin:0 0 .35em}
+  p{margin:0 0 1em}
+  a{color:var(--accent); text-decoration-color:color-mix(in srgb,var(--accent) 40%,transparent); text-underline-offset:2px}
+  strong{font-weight:700; color:var(--ink)}
+  code,.mono{font-family:var(--font-mono); font-size:.86em}
+  code{background:var(--surface-2); border:1px solid var(--line-soft); border-radius:5px; padding:.08em .35em; color:var(--ink-soft)}
+
+  .eyebrow{font-size:.74rem; font-weight:700; letter-spacing:.16em; text-transform:uppercase; color:var(--rail-strong)}
+  .dek{font-size:clamp(1.06rem,2.2vw,1.28rem); line-height:1.5; color:var(--ink-soft); max-width:64ch; margin:.2em 0 1.1em}
+  .metabar{display:flex; flex-wrap:wrap; gap:.5rem .9rem; align-items:center; font-size:.78rem; color:var(--ink-faint)}
+  .metabar .dot{width:4px;height:4px;border-radius:50%;background:var(--ink-faint);opacity:.6}
+  .metabar b{color:var(--ink-soft); font-weight:650}
+  .setnav{font-size:.8rem; color:var(--ink-faint); margin-bottom:1.1rem; line-height:1.5}
+  .setnav .here{color:var(--ink-soft); font-weight:650}
+
+  .legend{display:flex; flex-wrap:wrap; gap:1.1rem; font-size:.8rem; color:var(--ink-soft); margin:1rem 0 0}
+  .legend span{display:inline-flex; align-items:center; gap:.4rem}
+  .legend i{width:.7rem;height:.7rem;border-radius:3px;display:inline-block}
+  .l-rail{background:var(--rail)} .l-settle{background:var(--settle)} .l-disc{background:var(--disc)}
+
+  section{margin-top:clamp(2.6rem,6vw,4rem)}
+  .sec-head{display:flex; align-items:baseline; gap:.7rem; margin-bottom:1.1rem}
+  .sec-head .num{font-family:var(--font-mono); font-size:.82rem; color:var(--ink-faint); padding-top:.15rem}
+
+  /* TL;DR */
+  .tldr{background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:clamp(18px,3vw,28px); box-shadow:var(--shadow); margin-top:1.8rem}
+  .tldr h2{font-size:.78rem; letter-spacing:.15em; text-transform:uppercase; color:var(--ink-faint); margin-bottom:.9em}
+  .tldr ul{list-style:none; margin:0; padding:0; display:grid; gap:.85rem}
+  .tldr li{display:grid; grid-template-columns:auto 1fr; gap:.7rem; align-items:start; font-size:1.02rem; line-height:1.5}
+  .tldr li .k{width:.62rem;height:.62rem;border-radius:3px;margin-top:.52rem; flex:none}
+
+  /* cast — role cards */
+  .cast{display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; margin:1.4rem 0 0}
+  .actor{border:1px solid var(--line); border-top:3px solid var(--ink-faint); border-radius:var(--radius); background:var(--surface); padding:15px 18px; box-shadow:var(--shadow)}
+  .actor.buyer{border-top-color:var(--rail)}
+  .actor.seller{border-top-color:var(--rail)}
+  .actor.fac{border-top-color:var(--settle)}
+  .actor.chain{border-top-color:var(--settle)}
+  .actor.bazaar{border-top-color:var(--disc)}
+  .actor .role{font-size:.64rem; letter-spacing:.13em; text-transform:uppercase; font-weight:700; color:var(--ink-faint)}
+  .actor h3{font-size:1.02rem; margin:.15rem 0 .3rem}
+  .actor p{font-size:.89rem; color:var(--ink-soft); line-height:1.48; margin:0 0 .5rem}
+  .actor p:last-child{margin-bottom:0}
+  .actor .who{font-family:var(--font-mono); font-size:.76rem; color:var(--ink-faint); display:block; margin-top:.4rem}
+
+  /* flow steps */
+  .flow{display:grid; gap:0; margin:1.5rem 0 0; counter-reset:s}
+  .step{display:grid; grid-template-columns:auto 1fr; gap:1rem; align-items:start; background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); padding:16px 20px; box-shadow:var(--shadow); position:relative; z-index:2}
+  .step__n{counter-increment:s; font-weight:800; font-size:.95rem; width:2rem;height:2rem;border-radius:8px; display:flex;align-items:center;justify-content:center; flex:none; border:1px solid}
+  .step__n::before{content:counter(s)}
+  .step.r .step__n{color:var(--rail); background:var(--rail-bg); border-color:var(--rail-line)}
+  .step.s .step__n{color:var(--settle-strong); background:var(--settle-bg); border-color:var(--settle-line)}
+  .step.d .step__n{color:var(--disc-strong); background:var(--disc-bg); border-color:var(--disc-line)}
+  .step h3{margin-bottom:.2rem; font-size:1rem}
+  .step p{margin:0; font-size:.92rem; color:var(--ink-soft); line-height:1.5}
+  .step .wire + p{margin-top:.6rem}
+  .step .wire{margin-top:.55rem; font-family:var(--font-mono); font-size:.78rem; background:var(--surface-2); border:1px solid var(--line-soft); border-radius:var(--radius-sm); padding:9px 12px; color:var(--ink-soft); overflow-x:auto; white-space:pre; line-height:1.5}
+  .hop{display:flex; align-items:center; justify-content:center; font-family:var(--font-display); font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-faint); padding:.5rem 0; position:relative}
+  .hop::before{content:""; position:absolute; left:calc(1rem + 1px); top:0; bottom:0; width:2px; background:var(--rail-line); opacity:.7; z-index:0}
+  .hop span{background:var(--paper); padding:0 .6rem; position:relative; z-index:1; margin-left:0}
+
+  /* schema table */
+  .tablewrap{overflow-x:auto; border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); background:var(--surface); margin-top:1.3rem}
+  table{border-collapse:collapse; width:100%; min-width:600px; font-size:.92rem}
+  thead th{font-size:.7rem; letter-spacing:.09em; text-transform:uppercase; font-weight:700; text-align:left; padding:13px 16px; background:var(--surface-2); color:var(--ink-soft); border-bottom:1px solid var(--line)}
+  tbody td,tbody th{padding:11px 16px; border-bottom:1px solid var(--line-soft); vertical-align:top; line-height:1.45}
+  tbody th{font-family:var(--font-mono); font-weight:600; font-size:.82rem; color:var(--rail); text-align:left; white-space:nowrap}
+  tbody tr:last-child td,tbody tr:last-child th{border-bottom:none}
+  td.opt{font-family:var(--font-display); font-size:.7rem; text-transform:uppercase; letter-spacing:.06em; color:var(--ink-faint); white-space:nowrap}
+  tbody th.d{color:var(--disc-strong)}
+
+  /* ecosystem map */
+  .map{margin:1.5rem 0 0}
+  .tier{border:1px solid var(--line); border-radius:var(--radius); background:var(--surface); padding:14px 18px; box-shadow:var(--shadow); margin-bottom:0}
+  .tier .lbl{font-size:.64rem; letter-spacing:.13em; text-transform:uppercase; font-weight:700; color:var(--ink-faint); margin-bottom:.5rem}
+  .tier .row{display:flex; flex-wrap:wrap; gap:8px}
+  .chip{font-size:.8rem; font-weight:650; padding:.32em .7em; border-radius:20px; border:1px solid var(--line); background:var(--surface-2); color:var(--ink-soft); white-space:nowrap}
+  .chip.us{background:var(--rail-bg); border-color:var(--rail-line); color:var(--rail)}
+  .chip.set{background:var(--settle-bg); border-color:var(--settle-line); color:var(--settle-strong)}
+  .chip.dis{background:var(--disc-bg); border-color:var(--disc-line); color:var(--disc-strong)}
+  .tier.railband{background:var(--rail-bg); border:1.5px solid var(--rail-line)}
+  .tier.railband .lbl{color:var(--rail)}
+  .down{display:flex; align-items:center; justify-content:center; gap:.5rem; font-family:var(--font-display); font-size:.7rem; letter-spacing:.08em; text-transform:uppercase; color:var(--ink-faint); padding:.5rem 0; position:relative}
+  .down::before{content:""; position:absolute; left:50%; top:0; bottom:0; width:2px; transform:translateX(-50%); background:var(--rail-line); opacity:.7; z-index:0}
+  .down span{background:var(--paper); padding:0 .6rem; position:relative; z-index:1}
+  .cap{font-size:.8rem; color:var(--ink-faint); text-align:center; margin:.9rem 0 0; font-style:italic}
+
+  /* callouts */
+  .callout{background:color-mix(in srgb,var(--rail-bg) 55%,var(--surface)); border:1px solid var(--rail-line); border-radius:var(--radius); padding:17px 22px; margin:1.4rem 0; box-shadow:var(--shadow)}
+  .callout h3{color:var(--rail); font-size:1.02rem; margin-bottom:.35rem}
+  .callout p{margin:0 0 .6em; font-size:.93rem; color:var(--ink-soft); line-height:1.55; max-width:68ch}
+  .callout p:last-child{margin-bottom:0}
+  .warn{background:var(--surface); border:1px solid var(--disc-line); border-left:4px solid var(--disc); border-radius:var(--radius); padding:clamp(18px,3vw,26px); box-shadow:var(--shadow-lift); margin:1.4rem 0}
+  .warn .eyebrow{color:var(--disc-strong)}
+  .warn h3{margin:.3em 0 .4em; font-size:1.1rem}
+  .warn p{margin:0 0 .7em; font-size:.94rem; color:var(--ink-soft); line-height:1.55; max-width:68ch}
+  .warn p:last-child{margin-bottom:0}
+
+  /* status grid */
+  .status{display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:12px; margin-top:1.3rem}
+  .st{border:1px solid var(--line); border-radius:var(--radius-sm); padding:13px 16px; background:var(--surface-2)}
+  .st .lbl{font-size:.66rem; letter-spacing:.1em; text-transform:uppercase; font-weight:700; margin-bottom:.35rem}
+  .st.live .lbl{color:var(--settle-strong)}
+  .st.gap .lbl{color:var(--disc-strong)}
+  .st.next .lbl{color:var(--rail)}
+  .st p{font-size:.88rem; color:var(--ink-soft); margin:0; line-height:1.48}
+  .st code{font-size:.8em}
+
+  .foot{margin-top:clamp(2.6rem,6vw,4rem); border-top:1px solid var(--line); padding-top:1.4rem; font-size:.85rem; color:var(--ink-faint)}
+  .foot h3{font-size:.72rem; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-faint); margin-bottom:.6rem}
+  .foot ul{margin:0 0 1rem; padding-left:1.1rem; display:grid; gap:.3rem}
+  .foot .note{font-style:italic; color:var(--ink-faint); border-left:2px solid var(--line); padding-left:.9rem; max-width:70ch}
+  .v-ok{color:var(--settle-strong); font-weight:650; font-family:var(--font-display); font-size:.72rem}
+  .v-soft{color:var(--disc-strong); font-weight:650; font-family:var(--font-display); font-size:.72rem}
+
+  @media (max-width:720px){
+    .page{font-size:16px}
+    .tldr li{font-size:.98rem}
+    .step{grid-template-columns:1fr}
+    .step__n{margin-bottom:.2rem}
+    .hop::before{left:50%; transform:translateX(-50%)}
+  }
+  @media (prefers-reduced-motion:no-preference){ a{transition:color .15s} }
+</style>
+
+<div class="page">
+<div class="wrap">
+
+  <header class="col">
+    <div class="setnav">
+      Obolus docs · <span class="here">x402 ecosystem</span>
+    </div>
+    <div class="eyebrow">Protocol explainer · Ecosystem map</div>
+    <h1>x402 <span class="x">—</span> the ecosystem, end to end</h1>
+    <p class="dek">How a machine pays for a single HTTP request with no account, no invoice and no identity — who the participants are, what the Bazaar adds on top, and where our own pieces sit on the rail.</p>
+    <div class="metabar">
+      <span><b>Prepared</b> 2026-08-05</span><i class="dot"></i>
+      <span>Protocol facts from <b>coinbase/x402 specs/x402-specification-v1.md</b></span><i class="dot"></i>
+      <span>Discovery facts from <b>docs.cdp.coinbase.com/x402</b></span><i class="dot"></i>
+      <span>Obolus project documentation</span>
+    </div>
+    <div class="legend">
+      <span><i class="l-rail"></i> the rail — protocol surface, challenge and payload</span>
+      <span><i class="l-settle"></i> settlement — facilitator, chain, funds</span>
+      <span><i class="l-disc"></i> discovery — the Bazaar catalog</span>
+    </div>
+  </header>
+
+  <div class="tldr col">
+    <h2>The short version</h2>
+    <ul>
+      <li><span class="k l-rail"></span><span><strong>x402 revives HTTP 402.</strong> A server answers an unpaid request with <code>402</code> and a machine-readable list of ways to pay; the client picks one, signs it, and retries with the payment attached. No account is created, so nothing identifies the buyer.</span></li>
+      <li><span class="k l-settle"></span><span><strong>The seller never touches a chain.</strong> A <em>facilitator</em> verifies the signed authorization and broadcasts settlement. That is what lets a gateway hold no keys and still take money.</span></li>
+      <li><span class="k l-disc"></span><span><strong>The Bazaar is the index.</strong> Discovery turns "you must already know the URL" into a browsable, searchable catalog of payable resources — the same <code>accepts</code> data, published ahead of the request instead of only in the 402.</span></li>
+      <li><span class="k l-rail"></span><span><strong>Obolus is a seller on this rail.</strong> It fronts local inference and charges per request — so the buyers it serves are agent harnesses and apps that need a resource for a fee, without either side holding an account with the other.</span></li>
+    </ul>
+  </div>
+
+  <section>
+    <div class="sec-head"><span class="num">01</span><h2>The cast</h2></div>
+    <p class="col">Five roles. Any one participant can hold more than one — a gateway that also lists itself in the catalog is playing seller and listing at once — but the roles stay distinct because they trust each other differently.</p>
+
+    <div class="cast">
+      <div class="actor buyer">
+        <div class="role">Buyer</div>
+        <h3>Client</h3>
+        <p>Makes the request, receives the challenge, chooses among the offered options, signs a payment authorization and retries. Holds a wallet and therefore holds the only key that matters.</p>
+        <span class="who">agent harnesses with their own budgets; apps that need a resource for a fee</span>
+      </div>
+      <div class="actor seller">
+        <div class="role">Seller</div>
+        <h3>Resource server</h3>
+        <p>Owns something worth paying for and refuses to serve it unpaid. Issues the <code>402</code>, states its price, and hands verification and settlement to someone else. Needs no chain access and no private key.</p>
+        <span class="who">Obolus (fronting Ollama / vLLM); Venice; other x402-priced APIs</span>
+      </div>
+      <div class="actor fac">
+        <div class="role">Settlement</div>
+        <h3>Facilitator</h3>
+        <p>The only party that talks to the chain. Checks a signed authorization is valid and funded, then broadcasts it. Sellers delegate here precisely so they can stay keyless.</p>
+        <span class="who">x402.org (testnet); Coinbase CDP facilitator</span>
+      </div>
+      <div class="actor chain">
+        <div class="role">Settlement</div>
+        <h3>Chain &amp; asset</h3>
+        <p>Where value actually moves. Networks are named in CAIP-2 form, and the asset is a token contract address — normally USDC, because a stablecoin makes a per-request price legible.</p>
+        <span class="who">Base / Base Sepolia; Solana / devnet</span>
+      </div>
+      <div class="actor bazaar">
+        <div class="role">Discovery</div>
+        <h3>The Bazaar</h3>
+        <p>A catalog of resources that are known to be payable, with their prices attached. Turns the rail from point-to-point into something an agent can shop across without being told where to look.</p>
+        <span class="who">CDP facilitator discovery endpoints</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">02</span><h2>The pay-per-request flow</h2></div>
+    <p class="col">This is the whole protocol. Everything else in this document is either a detail of one of these steps or a way of finding out that step&nbsp;1 is worth making at all.</p>
+
+    <div class="flow">
+      <div class="step r">
+        <div class="step__n"></div>
+        <div>
+          <h3>The client asks, and is refused</h3>
+          <p>An ordinary request with nothing attached. The server answers <code>402 Payment Required</code> with a body containing an <code>accepts</code> array — every payment option it will honour, each one complete enough to act on without a follow-up call.</p>
+          <div class="wire">402 Payment Required
+{
+  "x402Version": 1,
+  "accepts": [
+    {
+      "scheme":            "exact",
+      "network":           "base-sepolia",
+      "maxAmountRequired": "1000",            ← atomic units. NOT 0.001
+      "asset":             "0xUSDC_CONTRACT",
+      "payTo":             "0xSELLER_ADDRESS",
+      "resource":          "https://obolus.example/v1/chat/completions",
+      "description":       "One chat completion",
+      "mimeType":          "application/json",
+      "maxTimeoutSeconds": 60
+    },
+    {
+      "scheme":            "exact",
+      "network":           "solana-devnet",   ← same price, different rail
+      "maxAmountRequired": "1000",
+      "asset":             "USDC_MINT_ADDRESS",
+      "payTo":             "SELLER_PUBKEY",
+      "resource":          "https://obolus.example/v1/chat/completions",
+      "description":       "One chat completion",
+      "mimeType":          "application/json",
+      "maxTimeoutSeconds": 60
+    }
+  ]
+}</div>
+          <p>Addresses above are placeholders. Two entries, one resource: a wallet funded on Base takes the first, a Solana wallet takes the second, and the seller settles against whichever was actually used.</p>
+        </div>
+      </div>
+      <div class="hop"><span>402 + accepts[]</span></div>
+      <div class="step r">
+        <div class="step__n"></div>
+        <div>
+          <h3>The client picks an option and signs</h3>
+          <p>Options differ by chain, asset and price, so the choice is the client's — a wallet funded on Base cannot pay a Solana option. Under the <code>exact</code> scheme the client signs an authorization to move a precise amount, rather than sending a transaction itself.</p>
+          <div class="wire">EVM   EIP-3009 TransferWithAuthorization, signed EIP-712
+      from · to · value · validAfter · validBefore · nonce
+SVM   SPL TransferChecked, fixed instruction layout
+      amount must equal maxAmountRequired exactly</div>
+        </div>
+      </div>
+      <div class="hop"><span>retry, payment attached</span></div>
+      <div class="step r">
+        <div class="step__n"></div>
+        <div>
+          <h3>The same request, carrying payment</h3>
+          <p>The signed payload rides in a request header. Note what has <em>not</em> happened: nothing has hit a chain, no funds have moved, and the server still has not served anything.</p>
+          <div class="wire">X-PAYMENT: &lt;base64 payment envelope&gt;</div>
+        </div>
+      </div>
+      <div class="hop"><span>seller → facilitator</span></div>
+      <div class="step s">
+        <div class="step__n"></div>
+        <div>
+          <h3>Verify before serving</h3>
+          <p>The seller posts the payload to the facilitator's <code>/verify</code>, which checks the signature, the balance, the amount, the validity window and that the parameters match what was demanded — without broadcasting anything. A failure here costs nobody anything.</p>
+        </div>
+      </div>
+      <div class="hop"><span>verified</span></div>
+      <div class="step r">
+        <div class="step__n"></div>
+        <div>
+          <h3>Serve the work</h3>
+          <p>Only now does the request reach the thing behind the gate — an inference call, an API response, whatever was being sold.</p>
+        </div>
+      </div>
+      <div class="hop"><span>seller → facilitator</span></div>
+      <div class="step s">
+        <div class="step__n"></div>
+        <div>
+          <h3>Settle, and hand back a receipt</h3>
+          <p><code>/settle</code> broadcasts the authorization and money moves. The response carries a settlement receipt back to the client, so the payer learns what it actually paid without watching the chain itself.</p>
+          <div class="wire">X-PAYMENT-RESPONSE: &lt;base64 settlement receipt&gt;</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="callout">
+      <h3>Why the ordering is the interesting part</h3>
+      <p>Verify precedes work; settle follows it. A client that cannot pay is turned away before any compute is spent, and a seller that cannot deliver has not yet taken the money. The expensive, irreversible step sits between two cheap reversible ones.</p>
+      <p>The same shape is what makes the anonymous path viable at all: because authorization is proved per request, the seller never needs an account to attach it to.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">03</span><h2>What is in the challenge</h2></div>
+    <p class="col">Each entry of <code>accepts</code> is one complete offer. A client should be able to evaluate and pay it without asking anything further — which is why price, chain, asset and destination all travel together.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Field</th><th>Required</th><th>What it carries</th></tr></thead>
+        <tbody>
+          <tr><th>scheme</th><td class="opt">required</td><td>How payment is constructed — <code>exact</code> is the one in general use.</td></tr>
+          <tr><th>network</th><td class="opt">required</td><td>Which chain, in CAIP-2 form (e.g.&nbsp;<code>base-sepolia</code>).</td></tr>
+          <tr><th>maxAmountRequired</th><td class="opt">required</td><td>The price, in atomic token units — never a decimal.</td></tr>
+          <tr><th>asset</th><td class="opt">required</td><td>Token contract address. Normally USDC.</td></tr>
+          <tr><th>payTo</th><td class="opt">required</td><td>Where the money lands. The seller's address.</td></tr>
+          <tr><th>resource</th><td class="opt">required</td><td>The URL being paid for.</td></tr>
+          <tr><th>description</th><td class="opt">required</td><td>Human-readable statement of what is being sold.</td></tr>
+          <tr><th>maxTimeoutSeconds</th><td class="opt">required</td><td>How long the offer stays payable. A zero window is unpayable.</td></tr>
+          <tr><th>mimeType</th><td class="opt">optional</td><td>Response content type.</td></tr>
+          <tr><th>outputSchema</th><td class="opt">optional</td><td>JSON schema of the response — what a buyer gets for the money.</td></tr>
+          <tr><th>extra</th><td class="opt">optional</td><td>Scheme-specific additions.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <h3>An array, not a price</h3>
+      <p>A seller advertising several entries is offering genuine alternatives — Base <em>or</em> Solana, one asset <em>or</em> another — and the client settles against exactly the option it chose. That is what stops multi-chain support from becoming a deployment decision the operator has to make in advance on the buyer's behalf.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">04</span><h2>The Bazaar — discovery on top of the rail</h2></div>
+    <p class="col">The base protocol assumes you already know the URL. That is fine for a client wired to one provider and useless for an agent that should be able to find a cheaper one. Discovery closes that gap by publishing the offer <em>before</em> anyone makes a request.</p>
+
+    <div class="flow">
+      <div class="step d">
+        <div class="step__n"></div>
+        <div>
+          <h3>A seller opts in</h3>
+          <p>Services using the CDP facilitator with the bazaar extension enabled are listed automatically. Listing is free, and sellers keep setting their own prices — the catalog indexes offers, it does not make them.</p>
+        </div>
+      </div>
+      <div class="hop"><span>indexed</span></div>
+      <div class="step d">
+        <div class="step__n"></div>
+        <div>
+          <h3>A buyer browses or searches</h3>
+          <p>A paginated catalog endpoint returns resources with their payment options attached, filterable and searchable — hybrid full-text plus semantic retrieval, so an agent can ask for a capability rather than a hostname.</p>
+          <div class="wire">GET /v2/x402/discovery/resources?limit=&amp;offset=
+→ { resources[], partialResults, searchMethod, x402Version }</div>
+        </div>
+      </div>
+      <div class="hop"><span>resource + accepts[]</span></div>
+      <div class="step d">
+        <div class="step__n"></div>
+        <div>
+          <h3>…and then it is just section 02 again</h3>
+          <p>Discovery hands back a URL and its price. From there the ordinary 402 handshake runs unchanged. Nothing about the payment path is special because the resource was found rather than known.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Discovery resource field</th><th>What it carries</th></tr></thead>
+        <tbody>
+          <tr><th class="d">resource</th><td>The URL of the payable resource.</td></tr>
+          <tr><th class="d">accepts[]</th><td>The payment options — <code>scheme</code>, <code>network</code>, <code>amount</code>, <code>asset</code>, <code>payTo</code>, <code>maxTimeoutSeconds</code>.</td></tr>
+          <tr><th class="d">type</th><td>How to talk to it: <code>http</code> or <code>mcp</code>.</td></tr>
+          <tr><th class="d">description</th><td>What the resource does, for a human or a model.</td></tr>
+          <tr><th class="d">serviceName</th><td>Display name of the service.</td></tr>
+          <tr><th class="d">tags</th><td>Labels for filtering.</td></tr>
+          <tr><th class="d">iconUrl</th><td>Square icon for presentation.</td></tr>
+          <tr><th class="d">skillUrl</th><td>Link to a <code>SKILL.md</code> — instructions for an agent, not a person.</td></tr>
+          <tr><th class="d">extensions</th><td>Which protocol extensions the service supports.</td></tr>
+          <tr><th class="d">quality</th><td>Usage metrics.</td></tr>
+          <tr><th class="d">curated</th><td>Whether Coinbase has vetted the listing.</td></tr>
+          <tr><th class="d">lastUpdated</th><td>Freshness of the entry.</td></tr>
+          <tr><th class="d">x402Version</th><td>Protocol version the listing speaks.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="warn">
+      <div class="eyebrow">Implementation trap</div>
+      <h3>The discovery entry is not byte-identical to the challenge</h3>
+      <p>The 402 challenge names the price <code>maxAmountRequired</code>; the discovery entry names it <code>amount</code>. They describe the same thing, and code that assumes one shape will silently mis-read the other — a price field that parses to nothing is the worst possible field to get wrong.</p>
+      <p>Treat the catalog entry as an <em>advertisement</em> of an offer and the 402 body as the offer itself. When they disagree, the challenge is authoritative: it is the one the seller will actually settle against.</p>
+    </div>
+
+    <div class="callout">
+      <h3>What discovery changes strategically</h3>
+      <p>Once prices are published ahead of the request, an agent with a budget can comparison-shop, and a seller's price becomes visible next to its rivals'. That is a market forming on top of a payment protocol — and it is the mechanism that makes agent-run budgets meaningful rather than decorative, because an agent can now choose to spend less instead of merely refusing to spend more.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">05</span><h2>How the pieces fit together</h2></div>
+
+    <div class="map">
+      <div class="tier">
+        <div class="lbl">Buyers — hold wallets, spend</div>
+        <div class="row">
+          <span class="chip">agent harnesses w/ budgets</span>
+          <span class="chip">apps buying a resource for a fee</span>
+          <span class="chip">any x402-aware client</span>
+        </div>
+      </div>
+      <div class="down"><span>402 · X-PAYMENT · X-PAYMENT-RESPONSE</span></div>
+      <div class="tier railband">
+        <div class="lbl">The rail — one protocol, many participants</div>
+        <div class="row">
+          <span class="chip">HTTP 402 challenge</span>
+          <span class="chip">accepts[] offer set</span>
+          <span class="chip">exact scheme · EVM + SVM</span>
+          <span class="chip dis">Bazaar discovery</span>
+        </div>
+      </div>
+      <div class="down"><span>sellers price and refuse</span></div>
+      <div class="tier">
+        <div class="lbl">Sellers — price requests, stay keyless</div>
+        <div class="row">
+          <span class="chip us">Obolus → Ollama / vLLM</span>
+          <span class="chip">Venice</span>
+          <span class="chip">other x402-priced APIs</span>
+        </div>
+      </div>
+      <div class="down"><span>/verify · /settle · /supported</span></div>
+      <div class="tier">
+        <div class="lbl">Settlement — the only chain-facing hop</div>
+        <div class="row">
+          <span class="chip set">facilitator (x402.org · CDP)</span>
+          <span class="chip set">Base / Base Sepolia</span>
+          <span class="chip set">Solana / devnet</span>
+          <span class="chip set">USDC</span>
+        </div>
+      </div>
+      <p class="cap">Buyers and sellers never share a key, an account, or an identity — only a protocol and a facilitator they both trust to be honest about the chain.</p>
+    </div>
+
+    <div class="callout">
+      <h3>Why a seller is also the best test rig</h3>
+      <p>A gateway you operate is the most controllable counterparty a payment client can be exercised against: you decide what it charges, which chains it offers, and exactly how it behaves when payment is absent, malformed, expired, or refused mid-flight. Public providers will not fail on command.</p>
+      <p>So Obolus is useful to any x402 buyer twice over — as a real thing to pay for real inference, and as the fixture that makes the unhappy paths reproducible. That second role is the one that is hard to get anywhere else.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">06</span><h2>The pricing seam</h2></div>
+    <p class="col">x402 prices a <em>request</em>, in atomic units, at the moment of asking. The model world prices <em>tokens</em>, in fractions of a cent, in published tables. A gateway selling inference over x402 stands exactly on that seam and has to reconcile the two.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>&nbsp;</th><th>x402</th><th>Model-metadata world</th></tr></thead>
+        <tbody>
+          <tr><th>Unit</th><td>One request</td><td>Per input / output token</td></tr>
+          <tr><th>Denomination</th><td>Atomic token units of a specific asset</td><td>Fiat fractions, provider-published</td></tr>
+          <tr><th>Where it lives</th><td><code>accepts[]</code> — challenge or catalog entry</td><td>A models endpoint or a pricing registry</td></tr>
+          <tr><th>Known when?</th><td>Before the work — it is the offer</td><td>After the work — it depends on token count</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <h3>The reconciliation is a product decision, not a formatting one</h3>
+      <p>A per-request price must be fixed before the response length is known, so a seller either charges a flat rate per resource, estimates from the input and eats the variance, or splits the resource so each price band is its own URL. Discovery pushes toward the last of these: catalog entries are keyed on a resource, so per-model pricing means per-model resources.</p>
+      <p>Where the protocol is silent — capability flags, context windows, per-token rates — the sensible move is to follow whoever the ecosystem already follows rather than coin new names: a live models endpoint shaped as an OpenAI superset, and cost/capability field <em>vocabulary</em> borrowed from the widely-mirrored pricing registries. Both are additive, so an OpenAI-shaped client keeps working and simply ignores what it does not understand.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">07</span><h2>Where our own pieces actually stand</h2></div>
+    <p class="col">Stated plainly, because a living document that flatters the implementation is worse than no document.</p>
+
+    <div class="status">
+      <div class="st live">
+        <div class="lbl">Live</div>
+        <p>Obolus issues real 402 challenges and advertises a multi-option <code>accepts</code> array. Deployed loopback-only.</p>
+      </div>
+      <div class="st live">
+        <div class="lbl">Live</div>
+        <p>An arming guard refuses to advertise any network not provably testnet unless explicitly armed — the challenge is the real-money trigger, so it is the thing that is guarded.</p>
+      </div>
+      <div class="st live">
+        <div class="lbl">Live</div>
+        <p>A bearer-token path exists alongside the 402 branch, fail-closed: anything not positively verified takes the payment branch.</p>
+      </div>
+      <div class="st gap">
+        <div class="lbl">Blocked</div>
+        <p>No outbound TLS client, so the facilitator URL must be <code>http://</code>. A real facilitator is <code>https://</code> — settlement therefore cannot run yet.</p>
+      </div>
+      <div class="st gap">
+        <div class="lbl">Not yet</div>
+        <p>The deployed instance is deliberately unpayable: placeholder network, no pay-to wallet. Inert by construction rather than by configuration.</p>
+      </div>
+      <div class="st next">
+        <div class="lbl">Not yet</div>
+        <p>No discovery listing, no catalog presence, and no per-model resource split.</p>
+      </div>
+    </div>
+
+    <div class="warn">
+      <div class="eyebrow">The one that gates the rest</div>
+      <h3>Everything downstream waits on reaching a real facilitator</h3>
+      <p>Verification and settlement are the only steps that leave the building, and they are the steps we cannot yet take. Until an <code>https://</code> facilitator is reachable — by wiring a TLS client or by terminating TLS in front of the gateway — the 402 path is exercisable only against fakes, and a fake we wrote proves nothing about a rail we do not control.</p>
+      <p>That is also why a payable testnet instance is the milestone worth aiming at rather than a broader feature set: it is the first point at which the protocol claims stop being claims.</p>
+    </div>
+  </section>
+
+  <div class="foot col">
+    <h3>Sources &amp; provenance</h3>
+    <ul>
+      <li><span class="v-ok">SPEC</span> — <code>accepts</code> field names, facilitator <code>/verify</code>, <code>/settle</code>, <code>/supported</code>, and the <code>exact</code> scheme's EVM (EIP-3009 / EIP-712) and Solana (SPL <code>TransferChecked</code>) constructions: <a href="https://github.com/coinbase/x402/blob/main/specs/x402-specification-v1.md">coinbase/x402 · x402-specification-v1.md</a>, the same spec our gateway is built against.</li>
+      <li><span class="v-ok">DOCS</span> — Bazaar behaviour, the discovery resource schema and the paginated catalog endpoint: <a href="https://docs.cdp.coinbase.com/x402/bazaar">CDP · x402 Bazaar</a> and <a href="https://docs.cdp.coinbase.com/api-reference/v2/rest-api/x402-facilitator/search-x402-resources">Search x402 resources</a>.</li>
+      <li><span class="v-soft">OURS</span> — <code>X-PAYMENT</code> / <code>X-PAYMENT-RESPONSE</code> header names read from our own implementation. The core specification scopes transport headers to separate transport documents, so treat these as what we send, corroborated by ecosystem convention, rather than as quoted from the core spec.</li>
+      <li><span class="v-ok">OURS</span> — the status section reflects the gateway source directly, including the <code>https://</code> rejection and the test that pins it.</li>
+    </ul>
+    <p class="note">Living document — re-verify load-bearing protocol facts before requoting; the x402 surface, and the discovery layer especially, is still moving. Orientation material for anyone picking up Obolus: this describes the rail Obolus sells on, not the gateway's own internals (see the project <code>README</code>).</p>
+  </div>
+
+</div>
+</div>
