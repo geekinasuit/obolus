@@ -6,10 +6,9 @@
 //! `arming.rs`'s unit tests call [`check_arming`] directly, and every teeth-measurement taken on
 //! them mutated `arming.rs`. That proves the *function* and says nothing about the *call site* —
 //! and the call site is where this guard can actually be defeated. `src/main.rs` is excluded from
-//! the `obolus` library glob and is compiled by no other test target, so before this file existed
-//! the whole of `main` was untested: hardcoding `armed` to `true`, swapping `?` for
-//! `unwrap_or_default()`, or moving `check_arming` below `Gateway::new` all compiled and left the
-//! library suite fully green.
+//! the `obolus` library glob and is compiled by no other test target, so nothing else covers it:
+//! hardcoding `armed` to `true`, swapping `?` for `unwrap_or_default()`, or moving `check_arming`
+//! below `Gateway::new` all compile and leave the library suite fully green.
 //!
 //! So these tests run the shipped binary and read its behaviour off stderr and its exit status.
 //! That is the only vantage point from which "the guard runs, and runs *before* the gateway
@@ -232,8 +231,8 @@ const ACCEPTS_MAINNET_PLUS_PLACEHOLDER: &str = r#"[
 /// `Access::token_path()`, so it can only print for an access surface that actually holds a
 /// verifier — which is why its presence is evidence that the verifier reached the router. Nothing
 /// else here can be: `src/main.rs` is compiled by no test target, the library tests build routers
-/// directly, and before this constant existed, dropping the verifier at the wiring site turned the
-/// whole feature off with every one of those tests still green.
+/// directly, and dropping the verifier at the wiring site turns the whole feature off with every one
+/// of those tests still green.
 const TOKEN_ENABLED: &str = "bearer-token access ENABLED";
 
 /// An Ed25519 SubjectPublicKeyInfo PEM built from 32 obviously-synthetic bytes (`01..20`).
@@ -697,7 +696,7 @@ fn an_empty_accepts_variable_refuses_to_start_and_says_so() {
 
     run.must_say("OBOLUS_ACCEPTS is set but empty");
     run.must_say("Unset it"); // the actual remedy, which the serde error never named
-    run.must_not_say("EOF while parsing"); // the parser error it used to be
+    run.must_not_say("EOF while parsing"); // the raw serde error, which names no remedy
     run.must_have_refused_during_startup();
 }
 
@@ -764,7 +763,7 @@ const TEST_ISSUER: &str = "https://issuer.invalid/obolus";
 fn a_token_key_without_an_issuer_refuses_to_start() {
     // Without `iss` every token the configured key ever minted — for any service sharing that IdP —
     // would buy inference here. The guard is in `main`, so nothing in the library suite sees it:
-    // replacing the `?` with `unwrap_or_default()` left all 133 library tests green.
+    // replacing the `?` with `unwrap_or_default()` leaves that suite green.
     let run = run(&[("OBOLUS_TOKEN_PUBKEY_FILE", ABSENT_KEY_PATH)]);
 
     run.must_have_refused_the_token_path("OBOLUS_TOKEN_ISSUER is not");
@@ -811,9 +810,9 @@ fn an_unreadable_token_key_refuses_to_start_and_names_the_path() {
 fn an_empty_token_key_path_refuses_to_start() {
     // The variable whose set-ness *picks the branch*, and the only one that had no empty check: an
     // empty value takes the `Ok` arm, so it asks for a token path while naming no key to build one
-    // from. Round 3 measured what that produced — the orphan guard does not fire (the variable is
-    // set), and the operator is instead pointed at whichever of issuer/key-path fails next, which
-    // is never the one they actually got wrong.
+    // from. Without the empty check the orphan guard does not fire (the variable *is* set), and the
+    // operator is instead pointed at whichever of issuer/key-path fails next, which is never the one
+    // they actually got wrong.
     let run = run(&[("OBOLUS_TOKEN_PUBKEY_FILE", ""), ("OBOLUS_TOKEN_ISSUER", TEST_ISSUER)]);
 
     run.must_have_refused_the_token_path("OBOLUS_TOKEN_PUBKEY_FILE is set but empty");
@@ -919,8 +918,8 @@ fn a_malformed_key_array_refuses_rather_than_dropping_keys() {
 #[test]
 fn a_configured_token_path_boots_and_says_which_verifier_it_wired() {
     // The wiring test, and the reason `main` derives this line from `Access::token_path()` rather
-    // than from the local variable that built it. Dropping the verifier at the wiring site — the
-    // one-line mutation that turned the entire feature off with all 153 tests green — now removes
+    // than from the local variable that built it. Dropping the verifier at the wiring site — a
+    // one-line mutation that turns the entire feature off with the library suite green — removes
     // this banner, because there is no token path left to describe. Read the assertions as: the
     // verifier was built, it reached the access surface, and the access surface is what was routed.
     let key = temp_file("obolus-token-key.pem", SYNTHETIC_PUBKEY_PEM);

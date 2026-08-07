@@ -254,10 +254,8 @@ an x402 short name like `base-sepolia`. The arming guard compares byte-exactly a
 allowlist, so a short name refuses to boot even when it names a genuine testnet — the refusal
 diagnoses it as a short name rather than blaming a mainnet, and points at `TESTNET_NETWORKS` for the
 CAIP-2 form. It deliberately does **not** guess which chain you meant: the two ids it shows are
-worked examples of the form, so look yours up in that list. (Said that way on purpose — this
-paragraph used to promise the refusal "names the id to use instead", which is a *per-input* property
-the clause disclaims, and the reader most likely to rely on it is the one configuring the Solana
-Devnet entry above, where both worked examples are `eip155:`.)
+worked examples of the form, so look yours up in that list — particularly for a Solana entry, where
+both worked examples are `eip155:`.
 
 Each entry becomes one option in the 402 `accepts` array; the client chooses which to pay, and
 Obolus settles against the option it **actually paid**. The gateway-wide fields — `OBOLUS_RESOURCE`,

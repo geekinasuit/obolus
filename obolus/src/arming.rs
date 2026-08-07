@@ -236,9 +236,9 @@ pub struct NotProvablyTestnet {
     /// One bullet per *kind*, listing every offender that carries it. **All** applicable kinds are
     /// emitted, never the first that matches — they overlap in both directions (a trailing U+00A0 is
     /// both a near-miss and non-ASCII; a short name with a homoglyph is both non-CAIP-2 and
-    /// non-ASCII) and each names a different thing to fix. Suppressing later kinds is a defect this
-    /// codebase has shipped twice, so [`diagnose`] is written as independent passes with no chain to
-    /// shorten, and both overlap directions have regression tests.
+    /// non-ASCII) and each names a different thing to fix. Suppressing later kinds is an easy defect
+    /// to reintroduce, so [`diagnose`] runs independent passes and both overlap directions have
+    /// regression tests.
     pub diagnosis: String,
 }
 
@@ -291,10 +291,9 @@ pub fn check_arming(
     armed: bool,
 ) -> Result<Vec<String>, NotProvablyTestnet> {
     // Distinct, in first-advertised order. Two `OBOLUS_ACCEPTS` entries can name the same bad
-    // network: `Gateway::new` would reject that pair as a duplicate `(scheme, network)`, but this
-    // guard runs first and preempts it, so the operator only ever sees this message. Listing the id
-    // twice — and repeating its whole diagnosis paragraph byte-identically — reads like the message
-    // is broken rather than like the configuration is.
+    // network, and this guard runs before `Gateway::new`'s duplicate check would reject the pair —
+    // so listing the id twice, with its whole diagnosis paragraph repeated byte-identically, is what
+    // the operator would see.
     let mut unproven: Vec<String> = Vec::new();
     for r in requirements {
         if !is_provably_testnet(&r.network) && !unproven.contains(&r.network) {
@@ -340,16 +339,14 @@ pub fn check_arming(
 ///
 /// # Why by kind, and not by offender
 ///
-/// Per-offender emission — for each offender, every clause that fires — measured at **3,377
-/// characters on one unwrapped line** for a five-entry `OBOLUS_ACCEPTS`, repeating one ~470-character
-/// paragraph four times and `OBOLUS_ALLOW_MAINNET` **seven** times. It degrades in the direction that
-/// matters: the flag's salience rises with N while the fix for any one offender gets buried, and this
-/// guard's protection is the operator *not* reaching for the flag.
+/// Emitting every firing clause per offender repeats a whole paragraph — and
+/// `OBOLUS_ALLOW_MAINNET` — once per offender, so it degrades in the direction that matters: the
+/// flag's salience rises with N while the fix for any one offender gets buried, and this guard's
+/// protection is the operator *not* reaching for the flag.
 ///
-/// Grouping by kind also makes the clauses structurally un-collapsible. One clause suppressing
-/// another has shipped twice here; independent passes over the offender list cannot express that bug
-/// — there is no chain to shorten. The overlap tests below remain, because a structure can be
-/// rewritten back.
+/// Grouping by kind also makes the clauses structurally un-collapsible: independent passes over the
+/// offender list cannot express a suppressing chain, because there is no chain to shorten. The
+/// overlap tests below remain, because a structure can be rewritten back.
 ///
 /// # Order
 ///

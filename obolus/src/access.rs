@@ -41,11 +41,11 @@ pub trait TokenVerifier: Send + Sync + 'static {
 
     /// How this verifier describes its own posture for the startup banner.
     ///
-    /// On the trait rather than supplied by the caller, and that is the point. Round 3 found that
-    /// composing this line in `main` from the same variables that *built* the verifier still lets
-    /// the two drift: the banner named an audience while the verifier enforced none, because the
-    /// text came from the local rather than from the thing doing the checking. An implementation
-    /// must read its own enforcing state, so there is no configuration the banner can misreport.
+    /// On the trait rather than supplied by the caller, and that is the point. Composing the line in
+    /// `main` from the same variables that *built* the verifier still lets the two drift: the text
+    /// would come from the local rather than from the thing doing the checking, so the banner can
+    /// name an audience the verifier enforces nowhere. An implementation must read its own enforcing
+    /// state, so there is no configuration the banner can misreport.
     fn description(&self) -> String;
 }
 
@@ -1318,12 +1318,11 @@ mod signature_tests {
     /// each enforcement leg it has, a variant with that leg changed must describe itself
     /// differently.
     ///
-    /// Round 3's single-variable inversion, lifted out of one implementation's tests so the next one
-    /// inherits it rather than re-deriving it. It does **not** fully close the residual — an
-    /// implementation that lies consistently in both `verify` and `description` still passes, and no
-    /// trait-level test can catch that. What it does catch is the failure that actually happened: a
-    /// description composed from the arguments a constructor was handed rather than from the state
-    /// the request path consults.
+    /// A single-variable inversion, kept at the trait level so each new implementation inherits it
+    /// rather than re-deriving it. It does **not** fully close the residual — an implementation that
+    /// lies consistently in both `verify` and `description` still passes, and no trait-level test can
+    /// catch that. What it does catch is the likely failure: a description composed from the
+    /// arguments a constructor was handed rather than from the state the request path consults.
     fn assert_description_tracks_enforcement(
         baseline: &dyn TokenVerifier,
         variants: &[(&str, &dyn TokenVerifier)],

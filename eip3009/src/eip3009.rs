@@ -3,13 +3,17 @@
 use crate::eip712::{digest, encode_address, encode_u256, Eip712Domain};
 use crate::{keccak256, recover_address, Eip3009Error};
 
-/// Canonical EIP-3009 type signatures. The typehash is the keccak256 of these exact strings —
-/// whitespace and field order are part of the hash, so these are transcribed verbatim from the
-/// spec rather than reformatted to fit a line width.
+/// Canonical EIP-3009 `transferWithAuthorization` type signature.
+///
+/// The typehash is the keccak256 of this exact string — whitespace and field order are part of the
+/// hash, so it is transcribed verbatim from the spec rather than reformatted to fit a line width.
+/// The same holds for [`RECEIVE_WITH_AUTHORIZATION_TYPE`] and [`CANCEL_AUTHORIZATION_TYPE`].
 pub const TRANSFER_WITH_AUTHORIZATION_TYPE: &str = "TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)";
 
+/// Canonical EIP-3009 `receiveWithAuthorization` type signature, transcribed verbatim.
 pub const RECEIVE_WITH_AUTHORIZATION_TYPE: &str = "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)";
 
+/// Canonical EIP-3009 `cancelAuthorization` type signature, transcribed verbatim.
 pub const CANCEL_AUTHORIZATION_TYPE: &str =
     "CancelAuthorization(address authorizer,bytes32 nonce)";
 

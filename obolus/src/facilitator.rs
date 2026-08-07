@@ -250,9 +250,7 @@ impl Facilitator for FakeFacilitator {
 const MAX_FACILITATOR_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// How long we wait for one facilitator call before treating it as unavailable. Settlement can
-/// legitimately block while the facilitator waits for an on-chain receipt, so this is generous;
-/// the live rail may later derive it from the requirement's `maxTimeoutSeconds` instead of a flat
-/// value.
+/// legitimately block while the facilitator waits for an on-chain receipt, so this is generous.
 const DEFAULT_FACILITATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The longest facilitator-supplied reason we echo verbatim into a client-facing 402. A real
@@ -261,14 +259,14 @@ const DEFAULT_FACILITATOR_TIMEOUT: Duration = Duration::from_secs(30);
 /// (currently un-TLS'd) channel cannot reflect bulk content into our response body.
 const MAX_REJECT_REASON_LEN: usize = 128;
 
-/// Why a [`DelegatedFacilitator`] could not be constructed.
+/// Why a [`DelegatedFacilitator`] could not be constructed. Both variants are base-URL problems
+/// caught at construction, where the cause is legible, rather than surfaced later as a connect-time
+/// "facilitator unavailable" once the URL has reached config.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DelegatedFacilitatorError {
-    /// The base URL is `https://`, but Phase A has no TLS client wired. Failing here — at
-    /// construction, where the cause is legible — beats surfacing every payment as a runtime
-    /// "facilitator unavailable" once the URL reaches config. TLS enters at the connector when the
-    /// live rail is built; until then this type speaks plain HTTP only (a loopback in tests, a
-    /// local facilitator otherwise).
+    /// The base URL is `https://`, but Phase A has no TLS client wired. TLS enters at the connector
+    /// when the live rail is built; until then this type speaks plain HTTP only (a loopback in
+    /// tests, a local facilitator otherwise).
     #[error(
         "facilitator base URL {0:?} uses https, but Obolus Phase A has no TLS client wired yet; \
          use an http:// endpoint until the live rail adds TLS"
@@ -277,14 +275,12 @@ pub enum DelegatedFacilitatorError {
 
     /// The base URL is not an `http://` endpoint (a schemeless or other-scheme base). We build
     /// request URLs by string concatenation and speak only plain HTTP, so an explicit `http://`
-    /// base is required. Caught here, at construction, rather than surfaced later as a connect-time
-    /// "facilitator unavailable" once the URL reaches config.
+    /// base is required.
     #[error("facilitator base URL {0:?} is not an http:// endpoint")]
     NotAnHttpBase(String),
 }
 
-/// The body both `/verify` and `/settle` take. `paymentPayload` / `paymentRequirements` serialize
-/// through their own camelCase impls; this wrapper only adds the top-level `x402Version`.
+/// The body both `/verify` and `/settle` take; this wrapper only adds the top-level `x402Version`.
 ///
 /// The legacy facilitator *type* omits `x402Version` at this level, but every reference
 /// implementation puts it on the wire — so we send it, trusting the wire over the stale type.
@@ -298,7 +294,6 @@ struct FacilitatorRequest<'a> {
 
 /// The `/verify` response. Every field is optional on the wire: only `isValid` is load-bearing,
 /// and a response missing even that is an ambiguity we report as unavailable, never a rejection.
-/// Unknown fields (a newer protocol's additions) are ignored rather than rejected.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VerifyResponse {
@@ -312,7 +307,7 @@ struct VerifyResponse {
 /// on-chain settlement comes back with a real `transaction` hash *and* `success: false`, so we
 /// must never infer settlement from a transaction being present. `transaction` / `network` are
 /// plain strings, not enums — the live facilitator returns network identifiers a closed enum would
-/// fail to parse — and unknown fields are ignored.
+/// fail to parse.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SettleResponse {
@@ -364,10 +359,8 @@ impl DelegatedFacilitator {
     pub fn new(base_url: impl Into<String>) -> Result<Self, DelegatedFacilitatorError> {
         let base = base_url.into();
         let base = base.trim_end_matches('/');
-        // Allowlist the scheme, case-insensitively: `https` is rejected (no TLS wired), and anything
-        // that is not an explicit `http://` base is a config error. A case-sensitive `https://`
-        // denylist would wave through `HTTPS://…` and schemeless bases, which then fail later at
-        // connect as an opaque "unavailable" — the very outcome this guard exists to prevent.
+        // Allowlist the scheme case-insensitively. A case-sensitive `https://` denylist would wave
+        // through `HTTPS://…` and schemeless bases, defeating the guard.
         let lowered = base.to_ascii_lowercase();
         if lowered.starts_with("https://") {
             return Err(DelegatedFacilitatorError::TlsNotWired(base.to_string()));
@@ -378,11 +371,9 @@ impl DelegatedFacilitator {
         Ok(Self {
             verify_url: format!("{base}/verify"),
             settle_url: format!("{base}/settle"),
-            // OBOL-002 item 6: a pooled, reused connection that fails the instant we hand it a
-            // request would, by default, be silently retried — re-sending POST /settle and risking
-            // a double settlement. Disable that retry so the failure surfaces as an error we treat
-            // as `Unavailable` instead. (The end-to-end fix is the A3 idempotency cache; this
-            // closes the specific pooled-retry vector.)
+            // A pooled connection that fails the instant we hand it a request would, by default, be
+            // silently retried — re-sending POST /settle and risking a double settlement. Disable
+            // the retry so the failure surfaces as `Unavailable` instead (see OBOL-002).
             client: Client::builder(TokioExecutor::new())
                 .retry_canceled_requests(false)
                 .build_http::<Full<Bytes>>(),
@@ -474,8 +465,7 @@ impl Facilitator for DelegatedFacilitator {
         // (accepted it, or refused it for a client-side reason). A 5xx — or a 1xx/3xx — means it
         // failed before reaching a verdict, so we do not read a verdict out of its body: trusting one
         // would let a 5xx `isValid:true` wave a payment through (free inference) and a 5xx
-        // `isValid:false` blame the client for the facilitator's outage. Only the status is logged —
-        // the untrusted body is left for A3 structured logging to capture safely (bounded/escaped).
+        // `isValid:false` blame the client for the facilitator's outage.
         if !status.is_success() && !status.is_client_error() {
             return Err(FacilitatorError::Unavailable(format!(
                 "facilitator /verify returned non-verdict status {status}"
@@ -564,11 +554,10 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|s| !s.is_empty())
 }
 
-/// The reason handed back on a rejection, echoed to the unauthenticated caller in the 402 body. The
-/// facilitator's `errorReason`/`invalidReason` is an *unvalidated* `Option<String>`, not a
-/// guaranteed closed enum, so we surface it only when it is present and within
-/// [`MAX_REJECT_REASON_LEN`]; otherwise a fixed generic. Deliberately never includes our transport
-/// detail (status/URL/body) — that lives only in [`Unavailable`](FacilitatorError::Unavailable).
+/// The reason handed back on a rejection, echoed to the unauthenticated caller in the 402 body.
+/// The facilitator's reason is unvalidated, so we surface it only when present and within
+/// [`MAX_REJECT_REASON_LEN`], otherwise a fixed generic. Never includes our transport detail
+/// (status/URL/body) — that lives only in [`Unavailable`](FacilitatorError::Unavailable).
 fn reject_reason(reason: Option<&str>, fallback: &str) -> String {
     match reason {
         Some(reason) if !reason.is_empty() && reason.len() <= MAX_REJECT_REASON_LEN => {
