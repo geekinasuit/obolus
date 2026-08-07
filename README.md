@@ -65,7 +65,8 @@ do not delete the test target without a replacement.
 OBOLUS_FACILITATOR_URL=http://127.0.0.1:8404/facilitator bazel run //obolus:server
 ```
 
-Listens on `127.0.0.1:8403` (not 8402 — that belongs to ClawRouter). `POST /v1/chat/completions`
+Listens on `127.0.0.1:8403` (deliberately not 8402, which x402 client-side tooling tends to bind).
+`POST /v1/chat/completions`
 is payment-gated; `GET /health` is not. On startup it announces the facilitator and upstream it is
 wired to, and that it is **live wiring**: payments are verified and settled by the facilitator, and
 inference is proxied to the upstream. It stays **testnet-by-construction** — the pay-to / asset /
