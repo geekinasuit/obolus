@@ -13,9 +13,6 @@
 //! payment until the upstream has committed to a successful response, charge at that moment,
 //! and only then emit headers and stream.
 //!
-//! (The plan sketched this as verify → settle → proxy. Starting the upstream first is a
-//! deliberate refinement — it costs nothing and removes the charge-for-nothing case.)
-//!
 //! ## Exactly how far "costs the client nothing" goes
 //!
 //! It covers everything up to and including the response head: an upstream that cannot be
@@ -155,8 +152,7 @@ impl<F: Facilitator, U: Upstream> Gateway<F, U> {
 /// `detail` can name internal infrastructure — at A3 the facilitator or Ollama URL, a host, a
 /// connection string. That belongs in our logs, not in a response body any unauthenticated
 /// caller can read back. The client is told only that the gateway (not their payment) failed;
-/// the specifics stay server-side. (`eprintln!` is the log sink Phase A has; structured logging
-/// with request correlation lands with the real clients at A3.)
+/// the specifics stay server-side.
 fn upstream_failure(detail: String) -> Response {
     eprintln!("obolus: upstream/settlement failure: {detail}");
     (
@@ -190,11 +186,10 @@ async fn paid_completion<F: Facilitator, U: Upstream>(
         Err(err) => return gateway.challenge(Some(err.to_string())),
     };
 
-    // Our own policy check, not the facilitator's: which advertised option did the client pay? The
-    // envelope carries (scheme, network); match it to one of our offers. None → they picked an offer
-    // we did not make, so re-challenge with everything we DO accept. This is the only place the paid
-    // option is chosen, and the *matched* `requirements` — not "the" requirements — is what we then
-    // verify and settle against.
+    // Our own policy check, not the facilitator's: which advertised option did the client pay? None
+    // → they picked an offer we did not make, so re-challenge with everything we DO accept. This is
+    // the only place the paid option is chosen, and the *matched* `requirements` — not "the"
+    // requirements — is what we verify and settle against.
     let Some(requirements) = gateway.accepted_for(&payment) else {
         return gateway.challenge(Some(format!(
             "payment offers {}/{}, which is not one of the payment options this resource accepts",
