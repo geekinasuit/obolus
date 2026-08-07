@@ -1,8 +1,13 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
+# The published x402 authorization vector, exported so //devseller can compile it in as well. It is
+# a third-party fixture: the same bytes driving two independent decoders is the point, and a copy
+# under //devseller would let one drift while both stayed green.
+exports_files(["fixtures/x402-authorization.json"])
+
 # Deliberately NOT a dependency of //obolus:server. The gateway delegates verification to a
-# facilitator and never inspects a signature; this crate exists for the development stub (OBOL-018)
-# and for anything else that needs to check an EIP-3009 authorization offline.
+# facilitator and never inspects a signature; this crate exists for the development seller
+# (OBOL-018) and for anything else that needs to check an EIP-3009 authorization offline.
 rust_library(
     name = "eip3009",
     srcs = glob(["src/**/*.rs"]),
