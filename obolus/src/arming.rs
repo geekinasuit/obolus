@@ -38,9 +38,6 @@
 //! cause. That matters because this guard's real protection is the operator **not** reaching for the
 //! flag, and a refusal whose stated causes are all visibly false is what makes the flag look like the
 //! answer.
-//!
-//! Review history — what each review round found and why the shape changed — lives in OBOL-004,
-//! not in these comments.
 
 use crate::x402::PaymentRequirements;
 
@@ -164,11 +161,10 @@ pub fn legible(network: &str) -> String {
 /// like the one the operator configured, so every generic cause reads as false.
 ///
 /// **This clause and [`near_miss`] are not alternatives; the caller must run both.** A *substituted*
-/// homoglyph is invisible to `near_miss` — `eq_ignore_ascii_case` folds only ASCII, so a multi-byte
-/// character never matches a one-byte one. An *added* non-ASCII space is the opposite case:
-/// `str::trim` is Unicode-aware, so a trailing U+00A0 trims away and `near_miss` reports an exact hit
-/// while saying nothing about the character that actually broke the comparison. Each is blind to
-/// what the other sees.
+/// homoglyph is invisible to `near_miss` (`eq_ignore_ascii_case` folds only ASCII, so a multi-byte
+/// character never matches a one-byte one); an *added* non-ASCII space is the opposite case, since
+/// `str::trim` is Unicode-aware, so `near_miss` reports an exact hit while saying nothing about the
+/// character that actually broke the comparison.
 fn is_non_ascii(network: &str) -> bool {
     !network.is_ascii()
 }

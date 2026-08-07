@@ -14,9 +14,8 @@ use serde::Deserialize;
 
 use crate::x402::{validate_atomic_amount, PaymentRequirements, SCHEME_EXACT};
 
-/// One per-chain entry in `OBOLUS_ACCEPTS`: only the fields a chain actually changes. The
-/// gateway-wide fields (scheme, resource, description, mime type, timeout) are shared across every
-/// option and come from [`SharedOffer`], so an entry names just network / asset / pay-to / price.
+/// One per-chain entry in `OBOLUS_ACCEPTS`: network / asset / pay-to / price. The gateway-wide
+/// fields come from [`SharedOffer`].
 ///
 /// `deny_unknown_fields` on purpose: a typo (`payto`, `amount`) must fail loudly at startup rather
 /// than be silently dropped, leaving a challenge with a defaulted-away field that no client can pay
@@ -62,18 +61,15 @@ pub enum ConfigError {
     #[error("OBOLUS_ACCEPTS entry for network {network:?}: maxAmountRequired {detail}")]
     BadAmount { network: String, detail: String },
 
-    /// An entry's `network` is empty. `network` is the match key, so an empty one yields a gateway
-    /// that can never match a real payment — an un-payable route that starts cleanly and 402s every
-    /// request forever, the same failure [`Empty`](ConfigError::Empty) guards against arriving
-    /// through a different door.
+    /// An entry's `network` is empty. It is the match key, so the gateway starts cleanly and 402s
+    /// every request forever — the same failure [`Empty`](ConfigError::Empty) guards against,
+    /// arriving through a different door.
     #[error("OBOLUS_ACCEPTS entry has an empty network; network is the match key and must be set")]
     EmptyNetwork,
 
-    /// An entry's `asset` or `pay_to` is empty. A *missing* one is already rejected (both are
-    /// required, no serde default), so this is the present-but-`""` case: it would advertise an
-    /// option that "sends money nowhere" — the exact failure `deny_unknown_fields` prevents for a
-    /// dropped field, caught here at startup rather than left for the facilitator to reject at settle
-    /// time. Names the entry's network so an operator can find it.
+    /// An entry's `asset` or `pay_to` is present but empty — a *missing* one is already rejected, so
+    /// this is the `""` case, advertising an option that sends money nowhere. Names the entry's
+    /// network so an operator can find it.
     #[error("OBOLUS_ACCEPTS entry for network {network:?}: {field} must not be empty")]
     EmptyField { network: String, field: EntryField },
 }
@@ -93,17 +89,11 @@ impl ConfigError {
 
 /// Which of an option's fields is empty.
 ///
-/// A closed set on purpose, so that every consumer of [`EntryDefect`] is made by the compiler to say
-/// something true about each member. A `&'static str` here is the same shape with exhaustiveness
-/// silently switched off, and it is where the two consumers drift: `main`'s `single_chain_defect`
-/// would discriminate on the string *value* with a `{ .. }` catch-all naming `OBOLUS_PAY_TO`, so a
-/// third empty-able field added to [`validated_option`] — `OBOLUS_RESOURCE` is operator-settable and
-/// unvalidated today, and OBOL-005 will be editing that function — compiles clean and tells an
-/// operator to go and clear a variable that was fine.
-///
-/// That is the dead end this whole layer exists to close (a refusal whose named cause is visibly
-/// false leaves `OBOLUS_ALLOW_MAINNET` as the only actionable-looking thing in the message), only
-/// worse: confidently wrong about a specific variable rather than merely generic.
+/// A closed set, so the compiler makes every consumer say something true about each member. A
+/// `&'static str` is the same shape with exhaustiveness switched off: `main`'s `single_chain_defect`
+/// discriminates on the value behind a `{ .. }` catch-all, so a third empty-able field added to
+/// [`validated_option`] would compile clean and tell an operator to go and clear a variable that was
+/// fine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryField {
     /// The token a client pays in.
@@ -113,9 +103,8 @@ pub enum EntryField {
 }
 
 impl std::fmt::Display for EntryField {
-    /// The `OBOLUS_ACCEPTS` JSON key — which is what both error texts printed when this was a
-    /// string literal, so the rendered messages are byte-identical across the change and the
-    /// `config` tests that pin them keep their meaning.
+    /// The `OBOLUS_ACCEPTS` JSON key, not the Rust field name — an operator has to find this in
+    /// their own array.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             EntryField::Asset => "asset",
@@ -130,9 +119,7 @@ impl std::fmt::Display for EntryField {
 /// `main`'s single-chain arm — and the defects are identical at both. What differs is only the name
 /// an operator must go and fix: `OBOLUS_ACCEPTS entry for network "…"` on one path,
 /// `OBOLUS_PAY_TO` on the other. So the *checking* lives once, here, and each caller supplies its own
-/// naming. With the checks in [`parse_accepts`] alone, `OBOLUS_PAY_TO=` advertised a challenge that
-/// sends money nowhere while the identical `OBOLUS_ACCEPTS` entry was rejected, and an empty
-/// `OBOLUS_NETWORK` reached the arming guard to be diagnosed as an x402 short name.
+/// naming; a check added at one call site instead leaves the other door open.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum EntryDefect {
     /// `network` is absent or whitespace-only. It is the gateway's match key, so an empty one can
@@ -156,19 +143,14 @@ pub enum EntryDefect {
 /// Build one advertised payment option, applying the validation **both** configuration forms owe.
 ///
 /// This is the single per-option seam: every field an operator can set arrives here, from either
-/// door, before it can become something a client pays against. Two consequences worth stating:
-///
-/// - A validation added here covers both paths by construction. One added at a call site does not,
-///   and the divergence is silent.
-/// - [OBOL-005]'s CAIP-2 canonicalisation belongs **here**, not in [`parse_accepts`], which is one of
-///   two sites — landing it there would canonicalise the multi-chain path and leave the default
-///   single-chain one raw.
+/// door, before it can become something a client pays against. So OBOL-005's CAIP-2 canonicalisation
+/// belongs here, not in [`parse_accepts`] — landing it there would canonicalise the multi-chain path
+/// and leave the default single-chain one raw.
 ///
 /// Trimming is deliberately *not* done: what the guard checks must be byte-identical to what is
 /// advertised, and silently trimming here would make `" eip155:84532 "` boot while the near-miss
-/// diagnosis that exists to explain it never fires. Emptiness is judged on the trimmed value
-/// because a whitespace-only id is not a value; canonicalising a real one is OBOL-005's decision to
-/// make, in one place, on purpose.
+/// diagnosis that exists to explain it never fires. Emptiness is judged on the trimmed value because
+/// a whitespace-only id is not a value.
 pub fn validated_option(
     network: String,
     asset: String,
@@ -179,9 +161,6 @@ pub fn validated_option(
     if network.trim().is_empty() {
         return Err(EntryDefect::EmptyNetwork);
     }
-    // asset and pay_to name where money comes from and goes to; a present-but-empty one advertises
-    // an option that sends money nowhere. Fail closed at startup, uniformly with network, rather
-    // than advertise it and rely on the facilitator to reject at settle time.
     if asset.trim().is_empty() {
         return Err(EntryDefect::EmptyField { field: EntryField::Asset });
     }
@@ -239,11 +218,10 @@ pub fn parse_accepts(
 pub const SINGLE_CHAIN_VARS: [&str; 4] =
     ["OBOLUS_NETWORK", "OBOLUS_ASSET", "OBOLUS_PAY_TO", "OBOLUS_PRICE"];
 
-/// Which of the [`SINGLE_CHAIN_VARS`] are present, given a presence probe. `main` passes
-/// `|k| std::env::var(k).is_ok()`; taking the probe as an argument keeps this pure and testable
-/// without mutating process-global environment state (which would race other tests). A non-empty
-/// result means `OBOLUS_ACCEPTS` and the single-chain vars were both set — the caller should refuse
-/// to start rather than silently ignore the latter.
+/// Which of the [`SINGLE_CHAIN_VARS`] are present, given a presence probe. Taking the probe as an
+/// argument keeps this testable without mutating process-global environment state; `main` passes
+/// `|k| std::env::var(k).is_ok()`. A non-empty result means both configuration forms were set, and
+/// the caller should refuse to start rather than silently ignore the inert one.
 pub fn superseded_single_chain_vars<F: Fn(&str) -> bool>(is_set: F) -> Vec<&'static str> {
     SINGLE_CHAIN_VARS.into_iter().filter(|&k| is_set(k)).collect()
 }

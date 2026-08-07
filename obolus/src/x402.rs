@@ -149,10 +149,9 @@ fn encode<T: Serialize>(value: &T) -> String {
 /// Decode a header value under any base64 alphabet a client might plausibly have used.
 ///
 /// We emit standard-padded, but accept url-safe and unpadded on the way in. Which variant a
-/// client's x402 library emits is not something we can pin from here, and rejecting a
-/// perfectly good payment over an alphabet choice would surface to the payer as *"your payment
-/// is invalid"* — an interop break wearing a payment rejection's clothes, and one we cannot
-/// discover until a real client shows up at A3.
+/// client's x402 library emits is not something we can pin from here, and rejecting a perfectly
+/// good payment over an alphabet choice would surface to the payer as *"your payment is invalid"* —
+/// an interop break wearing a payment rejection's clothes.
 ///
 /// Being liberal here is safe precisely because this layer is pure transport: we never hash,
 /// sign, or compare the *encoded* form, so there is no canonicalisation to attack. Each
@@ -316,9 +315,6 @@ mod tests {
 
     #[test]
     fn accepts_url_safe_and_unpadded_alphabets() {
-        // Which alphabet a client's x402 library emits is not something we can pin from here,
-        // and refusing a well-formed payment over that choice would reach the payer as "your
-        // payment is invalid" — an interop break wearing a payment rejection's clothes.
         let payload = PaymentPayload {
             x402_version: X402_VERSION,
             scheme: SCHEME_EXACT.to_string(),
@@ -403,7 +399,6 @@ mod tests {
 
     #[test]
     fn offering_all_advertises_every_option() {
-        // The multi-chain shape: a 402 that lists more than one way to pay, order preserved.
         let a = requirements();
         let mut b = requirements();
         b.network = "test-network-b-not-a-real-caip2".to_string();
