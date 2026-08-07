@@ -5,10 +5,14 @@
 //! signature, over this authorization, recover to this address?* — which is the question an x402
 //! facilitator answers on the `/verify` path.
 //!
-//! It is deliberately **not** a dependency of the Obolus gateway binary. Obolus delegates
-//! verification to a facilitator and never inspects a signature itself; pulling secp256k1 into the
-//! shipped binary's graph to serve a development stub would widen that binary's attack surface for
-//! something it does not do.
+//! It is deliberately **not** a dependency of the `server` binary. That gateway delegates
+//! verification to a facilitator and never inspects a signature itself, so pulling secp256k1 into its
+//! graph would widen the shipped artifact's attack surface for something it does not do.
+//!
+//! The rule is scoped to `server`, not to this crate's consumers in general — it is about what the
+//! gateway's graph contains, not about who may verify. A binary whose job *is* to inspect signatures
+//! links this crate by design: a development seller that checks payments offline, so an x402 client
+//! can be tested against a counterparty that fails on command, is the intended second consumer.
 
 use sha3::{Digest, Keccak256};
 
