@@ -242,7 +242,7 @@
         <div class="role">Seller</div>
         <h3>Resource server</h3>
         <p>Owns something worth paying for and refuses to serve it unpaid. Issues the <code>402</code>, states its price, and hands verification and settlement to someone else. Needs no chain access and no private key.</p>
-        <span class="who">Obolus (fronting Ollama / vLLM); Venice; other x402-priced APIs</span>
+        <span class="who">Obolus (fronting Ollama / vLLM); other x402-priced APIs</span>
       </div>
       <div class="actor fac">
         <div class="role">Settlement</div>
@@ -452,7 +452,7 @@ SVM   SPL TransferChecked, fixed instruction layout
 
     <div class="callout">
       <h3>What discovery changes strategically</h3>
-      <p>Once prices are published ahead of the request, an agent with a budget can comparison-shop, and a seller's price becomes visible next to its rivals'. That is a market forming on top of a payment protocol — and it is the mechanism that makes agent-run budgets meaningful rather than decorative, because an agent can now choose to spend less instead of merely refusing to spend more.</p>
+      <p>Once prices are published ahead of the request, an agent with a budget can comparison-shop, and a seller's price becomes visible next to others'. That is a market forming on top of a payment protocol — and it is the mechanism that makes agent-run budgets meaningful rather than decorative, because an agent can now choose to spend less instead of merely refusing to spend more.</p>
     </div>
   </section>
 
@@ -483,7 +483,6 @@ SVM   SPL TransferChecked, fixed instruction layout
         <div class="lbl">Sellers — price requests, stay keyless</div>
         <div class="row">
           <span class="chip us">Obolus → Ollama / vLLM</span>
-          <span class="chip">Venice</span>
           <span class="chip">other x402-priced APIs</span>
         </div>
       </div>
