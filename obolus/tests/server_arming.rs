@@ -358,9 +358,9 @@ impl Run {
 
 /// Write a fixture file for the child to read and hand back its path.
 ///
-/// Under Bazel `TEST_TMPDIR` is the per-test scratch directory that the runner owns and cleans up;
-/// `temp_dir()` is the fallback for a plain `cargo`-style run, which this repo does not use but
-/// which should not silently write somewhere surprising either.
+/// Under Bazel `TEST_TMPDIR` is the per-test scratch directory that the runner owns and cleans up.
+/// Cargo has no equivalent, so a cargo run falls back to `temp_dir()` — shared, and not cleaned up
+/// for us, which is why every caller passes a distinct name.
 fn temp_file(name: &str, contents: &str) -> String {
     let dir = std::env::var("TEST_TMPDIR")
         .map(std::path::PathBuf::from)
@@ -372,8 +372,18 @@ fn temp_file(name: &str, contents: &str) -> String {
 
 /// Run the real server binary to completion with `vars` applied over a fixed, valid baseline.
 fn run(vars: &[(&str, &str)]) -> Run {
+    // Both halves of the dual build, because both are supposed to pass. Bazel passes the path
+    // through the rule's `env`; cargo sets `CARGO_BIN_EXE_<bin>` at compile time. `option_env!`
+    // rather than `env!` because the latter is a compile error under Bazel, where cargo's variable
+    // does not exist. The explicit variable wins where both are available, so pointing this suite at
+    // some other build of the binary stays possible.
     let bin = std::env::var("OBOLUS_SERVER_BIN")
-        .expect("OBOLUS_SERVER_BIN must be set by the BUILD rule's env (see BUILD.bazel)");
+        .ok()
+        .or_else(|| option_env!("CARGO_BIN_EXE_obolus").map(str::to_string))
+        .expect(
+            "no obolus server binary to run: OBOLUS_SERVER_BIN is unset (Bazel sets it from the \
+             rule's env — see BUILD.bazel) and this was not built by cargo either",
+        );
 
     // Occupy a loopback port and hand it to the child so that bind — the last statement of
     // startup — always fails. See the module docs.

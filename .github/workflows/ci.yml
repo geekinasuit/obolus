@@ -55,3 +55,22 @@ jobs:
       # is the gate that decides a merge; anything touching external reality runs outside it.
       - name: Test
         run: bazel test //...
+
+  cargo:
+    name: cargo test --workspace --locked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The other half of the dual build. Bazel above is canonical and cargo is the ergonomic path,
+      # but AGENTS.md names both as merge gates, so both run here rather than one of them running
+      # only on whichever machine a contributor happens to use. Both resolve their dependencies from
+      # the same Cargo.lock, so a dependency-level disagreement between them is a real defect.
+      #
+      # The toolchains are deliberately NOT pinned together: MODULE.bazel fixes Rust 1.90.0, and this
+      # job takes whatever stable the runner ships. Pinning a second version here would only prove
+      # the pin agrees with itself. The cost of that choice is worth stating plainly — a failure here
+      # that the Bazel job does not see may be a compiler difference rather than a defect, because
+      # `--locked` holds the dependency graph fixed and says nothing about the compiler.
+      - name: Test
+        run: cargo test --workspace --locked
