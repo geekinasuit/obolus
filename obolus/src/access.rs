@@ -252,7 +252,7 @@ impl PublicKeyTokenVerifier {
                 None => "key".to_string(),
             };
             // A set holding one key twice is a rotation that is not happening, and the banner would
-            // announce it as one — the specific lie D4 exists to prevent. Compared as bytes with
+            // announce it as one. Compared as bytes with
             // whitespace removed rather than as parsed keys, because `DecodingKey` is opaque and has
             // no equality: that catches the same file named twice and the same key pasted twice
             // under different line endings, and misses a re-encoding that changes the base64 itself.
@@ -362,12 +362,12 @@ enum Audience {
 struct Claims {
     exp: usize,
     iss: String,
-    /// Typed, and load-bearing rather than documentation. The library's own audience arm fires
-    /// only on an `aud` it could parse, so with no expected audience configured a token carrying
-    /// `{"aud": 12345}` or `{"aud": {..}}` was **honoured** while `{"aud": "the-wiki"}` was
-    /// refused — measured, not inferred. That made "unset refuses any token carrying `aud`" true
-    /// of the well-formed shapes only, which is the wrong half to be true. Declaring the type
-    /// rejects the rest here, so the property holds for every `aud` a token can carry *a value in*.
+    /// Typed, and load-bearing rather than documentation. The library's own audience arm fires only
+    /// on an `aud` it can parse, so without this type and with no expected audience configured, a
+    /// token carrying `{"aud": 12345}` or `{"aud": {..}}` is **honoured** while `{"aud": "the-wiki"}`
+    /// is refused — making "unset refuses any token carrying `aud`" true of the well-formed shapes
+    /// only, which is the wrong half to be true. Declaring the type rejects the rest here, so the
+    /// property holds for every `aud` a token can carry *a value in*.
     ///
     /// The one shape it does not cover is `"aud": null`, which `Option` resolves to `None` without
     /// consulting `Audience` — so in the unset posture such a token is honoured. That is correct
@@ -413,10 +413,10 @@ impl TokenVerifier for PublicKeyTokenVerifier {
     /// The startup line, rendered from the `Validation` that `verify` hands to the library — not
     /// from the arguments `new` was called with.
     ///
-    /// The difference is the whole fix. While `main` formatted this line from its own locals, an
-    /// instance could announce `audience obolus-prod` while its `Validation` enforced no audience
-    /// at all: measured, with both test targets green. Every value below comes from a field
-    /// `jsonwebtoken::decode` consults, so a posture that is not enforced cannot be announced.
+    /// The difference is the whole point: a line formatted from `main`'s own locals can announce
+    /// `audience obolus-prod` while the `Validation` enforces no audience at all, with both test
+    /// targets green. Every value below comes from a field `jsonwebtoken::decode` consults, so a
+    /// posture that is not enforced cannot be announced.
     ///
     /// The two "not a setting" strings are unreachable through [`PublicKeyTokenVerifier::new`],
     /// which is why they say so: no operator input produces them, only an edit that decouples the
@@ -497,17 +497,14 @@ fn describe(err: &jsonwebtoken::errors::Error, audience_enforced: bool) -> Strin
 /// Whether a rejection says anything beyond "not this key".
 ///
 /// A token can be signed by at most one key in a set — `with_keys` refuses to arm the same material
-/// twice — so at most one key can get past the signature to judge the claims, which makes a
-/// non-signature error, where one exists, the only rejection that came from the key which actually
-/// signed. The rest contribute `InvalidSignature`, restating the question. So there is no tie to
-/// break and no ordering to prefer: keep the one that names a cause. Errors raised before any
+/// twice — so a non-signature error, where one exists, is the only rejection that came from the key
+/// which actually signed; the rest contribute `InvalidSignature`, restating the question. There is no
+/// tie to break and no ordering to prefer: keep the one that names a cause. Errors raised before any
 /// signature is checked — a pinned-algorithm mismatch, a token too malformed to split — come out of
 /// every key alike, and the first is as good as the last.
 ///
-/// The conclusion does not actually rest on that uniqueness. A duplicate slipping past the arming
-/// check (re-encoded, so the bytes differ) would put two keys past the signature, and they would
-/// report the *same* claim error, since they agree on the token. Uniqueness makes the rule easy to
-/// state; identical errors make it true either way.
+/// The rule survives a re-encoded duplicate slipping past the arming check: two keys past the
+/// signature agree on the token, so they report the *same* claim error.
 fn names_a_cause(err: &jsonwebtoken::errors::Error) -> bool {
     !matches!(err.kind(), jsonwebtoken::errors::ErrorKind::InvalidSignature)
 }
