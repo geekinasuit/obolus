@@ -2,6 +2,7 @@
 resolver = "2"
 
 members = [
+    "devseller",
     "eip3009",
     "obolus",
 ]

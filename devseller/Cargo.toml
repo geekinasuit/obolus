@@ -1,0 +1,25 @@
+[package]
+# Package name = binary name, so `cargo build` and the released asset agree without a rename step.
+name = "obolus-devseller"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+# A package of its own rather than a second binary inside `obolus`, because cargo dependencies are
+# declared per PACKAGE, not per binary: an `eip3009` entry under `obolus` would put a signing path
+# in `obolus`'s own `server` binary, which is exactly what that crate's invariants forbid. Bazel's
+# per-target `deps` would have expressed it, cargo cannot, and the two builds must not disagree.
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+eip3009 = { path = "../eip3009" }
+obolus = { path = "../obolus" }
+# `serde_json` without `serde`: nothing here derives, so the derive crate would be a dependency this
+# package does not use — and one BUILD.bazel does not list, which is the kind of quiet divergence
+# between the two builds that this package's whole layout exists to prevent.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+http-body-util = "0.1"

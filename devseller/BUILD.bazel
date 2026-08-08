@@ -1,0 +1,48 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
+
+# A package of its own rather than a second binary under //obolus, because the dual build has to
+# agree: cargo declares dependencies per PACKAGE, so an `eip3009` entry in //obolus's Cargo.toml
+# would put a signature-verification path in //obolus:server's cargo graph — the one thing
+# eip3009/BUILD.bazel's own comment says it must not be. Bazel's per-target `deps` could have
+# expressed it; cargo cannot, and a rule that holds under only one of the two builds is not a rule.
+rust_binary(
+    name = "obolus-devseller",
+    srcs = glob(["src/**/*.rs"]),
+    # The published x402 authorization vector, compiled in by the KAT tests below. An explicit file
+    # rather than a glob, for the reason //eip3009 gives: a glob that silently matched nothing
+    # would leave the fixture-driven tests passing with no fixture to drive them.
+    compile_data = ["//eip3009:fixtures/x402-authorization.json"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//eip3009",
+        "//obolus",
+        "@crates//:anyhow",
+        "@crates//:axum",
+        "@crates//:serde_json",
+        "@crates//:thiserror",
+        "@crates//:tokio",
+    ],
+)
+
+# The unit suite, including the known-answer tests that drive the decoder from the published
+# vector. `crate = ":obolus-devseller"` recompiles the binary with `--test`, which is the only way
+# to reach `#[cfg(test)]` modules inside a binary crate.
+rust_test(
+    name = "devseller_test",
+    compile_data = ["//eip3009:fixtures/x402-authorization.json"],
+    crate = ":obolus-devseller",
+    deps = ["@crates//:http-body-util"],
+)
+
+# The startup guards' CALL SITE. `devseller_test` above cannot cover them: they are statements in
+# `main`, so deleting the placeholder refusal — or moving either guard below the advertisement
+# banner — compiles and leaves that suite fully green. This target runs the real binary and reads
+# its behaviour off stderr, which is the only vantage point from which "the guard runs, and runs
+# before anything is advertised" is checkable. Std-only: no new crate deps. See the test's module
+# docs for why it terminates and why it is hermetic.
+rust_test(
+    name = "devseller_guards_test",
+    srcs = ["tests/guards.rs"],
+    data = [":obolus-devseller"],
+    env = {"OBOLUS_DEVSELLER_BIN": "$(rootpath :obolus-devseller)"},
+)

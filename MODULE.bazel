@@ -22,6 +22,7 @@ crate.from_cargo(
     cargo_lockfile = "//:Cargo.lock",
     manifests = [
         "//:Cargo.toml",
+        "//devseller:Cargo.toml",
         "//eip3009:Cargo.toml",
         "//obolus:Cargo.toml",
     ],
