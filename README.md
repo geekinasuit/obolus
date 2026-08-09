@@ -26,7 +26,7 @@ because there is no signing path to misuse.
 | | |
 |---|---|
 | **Shipped (A0–A2)** | 402 challenge, `X-PAYMENT` / `X-PAYMENT-RESPONSE` codec, the `Facilitator` and `Upstream` seams, the fakes, the wired gateway |
-| **Shipped (A3 rewire)** | The real HTTP clients wired into the `server` binary: `DelegatedFacilitator` (delegates `/verify` + `/settle` to a facilitator you point it at) and `OllamaUpstream` (proxies a real Ollama). The fakes are now `#[cfg(test)]`-only, so no shipped binary can select "accept every payment + real model". Live-path hardening addressed: upstream head deadline (OBOL-002 item 1), settle deadline derived from `maxTimeoutSeconds` (item 4), pooled-retry double-settle disabled (item 6) |
+| **Shipped (A3 rewire)** | The real HTTP clients wired into the `obolus` binary: `DelegatedFacilitator` (delegates `/verify` + `/settle` to a facilitator you point it at) and `OllamaUpstream` (proxies a real Ollama). The fakes are now `#[cfg(test)]`-only, so no shipped binary can select "accept every payment + real model". Live-path hardening addressed: upstream head deadline (OBOL-002 item 1), settle deadline derived from `maxTimeoutSeconds` (item 4), pooled-retry double-settle disabled (item 6) |
 | **Next (A3 e2e + fast-follows)** | The post-merge **cron** that settles a real testnet payment against a third-party facilitator (touches the network, so cron-only, never per-PR). Plus the remaining OBOL-002 fast-follows: output/generation caps (item 2), settle-failure body drain/abort (item 3), and the 4xx-verdict contract confirmation (item 5, observable only against a live facilitator) |
 | **Later (Phase B)** | A self-settling facilitator that verifies and submits on-chain itself — additive behind the same seam, gated separately |
 
@@ -42,7 +42,7 @@ without crypto, and A1's types are built to preserve it.
 | `obolus/src/facilitator.rs` | The `Facilitator` seam + `DelegatedFacilitator` (real HTTP) + the test-only `FakeFacilitator` |
 | `obolus/src/upstream.rs` | The `Upstream` seam + `OllamaUpstream` (real HTTP proxy) + the test-only `FakeUpstream` |
 | `obolus/src/gateway.rs` | Route wiring, and the decision of *when we charge* |
-| `obolus/src/main.rs` | The `server` binary, wired to the real facilitator + Ollama upstream (env-configured); testnet-by-construction |
+| `obolus/src/main.rs` | The `obolus` binary, wired to the real facilitator + Ollama upstream (env-configured); testnet-by-construction |
 | `docs/x402-ecosystem.html` | **Orientation:** what x402 is, who the participants are, the Bazaar discovery layer, and where Obolus sits on the rail. Start here if the protocol is new to you — this README assumes it |
 
 ## Build and test
@@ -62,7 +62,7 @@ do not delete the test target without a replacement.
 ## Run it locally
 
 ```bash
-OBOLUS_FACILITATOR_URL=http://127.0.0.1:8404/facilitator bazel run //obolus:server
+OBOLUS_FACILITATOR_URL=http://127.0.0.1:8404/facilitator bazel run //obolus:obolus
 ```
 
 Listens on `127.0.0.1:8403` (deliberately not 8402, which x402 client-side tooling tends to bind).
@@ -216,7 +216,7 @@ direction: an operator whose `OBOLUS_NETWORK` never reached the process would re
 that their configuration had taken effect.
 
 All four lines are checked against the real binary by `obolus/tests/server_arming.rs`, which runs the
-`server` target rather than calling the guard directly — `src/main.rs` is compiled by no other test
+`obolus` target rather than calling the guard directly — `src/main.rs` is compiled by no other test
 target, so the guard's call site would otherwise be untested. That file also drives the
 `OBOLUS_ACCEPTS` branch, not only the single-chain one: the supersession bail, a placeholder among
 real entries, and a mainnet id hidden between two testnets.
@@ -379,7 +379,7 @@ distinction between token-holders. See OBOL-007.
 ## The fake is never a gate
 
 `FakeFacilitator` accepts payments it never examined; `FakeUpstream` serves canned bytes. Both are
-now `#[cfg(test)]`-only — the `server` binary compiles the library without `cfg(test)`, so they are
+now `#[cfg(test)]`-only — the `obolus` binary compiles the library without `cfg(test)`, so they are
 physically absent from every shipped artifact and no configuration path can select "accept every
 payment and serve the real model." They exist to drive the gateway's control flow in tests, and
 nothing more.

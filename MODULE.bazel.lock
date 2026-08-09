@@ -219,8 +219,8 @@
         "usagesDigest": "ZFczeKb9JmuTj0M6dO+Xlxv2gixmzLQUYZLYY7e9dyU=",
         "recordedFileInputs": {
           "@@//Cargo.lock": "e96a0b43a50f2b739ee3d6b57e0e93db0deeac28ecc768f700e7642732ead9bb",
-          "@@//Cargo.toml": "d0888dd20868a75a8a142b91aafc9c46e1439852559bd37a8bb56547a7f9f0e2",
-          "@@//devseller/Cargo.toml": "1737e5566e1d75f8b287d6184c4e3280868af7929284a04c6160034dd84358f4",
+          "@@//Cargo.toml": "bf347c22a2ccffde8580d53873a2e62605269c283b02ba84c2d60d83765d6f1e",
+          "@@//devseller/Cargo.toml": "e02849e814502abb6b0e3e590c662c0a0f9810cdbf81640de533223f4ec66817",
           "@@//eip3009/Cargo.toml": "7bf2025dce137089a109177104b86f17ecc402a96ed33cc2390fb1d74694b497",
           "@@//obolus/Cargo.toml": "2619e6ab57a5e3f508bc60996516e962fd64cd0c7ac0f15dda263406cd7619bf"
         },

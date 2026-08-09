@@ -1,0 +1,227 @@
+name: Release
+
+# Publishes the binaries. Two entry points, deliberately:
+#
+#   - a push to `main` cuts an immutable pre-release tagged `main-<sha>`, so every merged change has
+#     downloadable bytes without anyone copying a file by hand. Pre-release, so the repository's
+#     front page keeps pointing at the newest real version rather than at whatever landed last.
+#   - a `v*` tag cuts the real thing.
+#
+# There is deliberately no `pull_request` trigger. This repository is public, so a pull request
+# carries code from someone we do not know; a workflow that both runs a stranger's patch and holds a
+# `contents: write` token is how a release gets replaced by whoever opened the PR. Every trigger
+# below is reachable only by someone who already has write access.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+# Read-only by default. Exactly one job below widens this, and only to `contents: write`.
+permissions:
+  contents: read
+
+# Two merges landing together produce two distinct `main-<sha>` tags, so they cannot collide — but
+# they are serialised anyway rather than cancelled, because a cancelled run can leave a release
+# created with only part of its assets attached.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One job per target, and each builds natively — no cross-compilation. That is not just
+      # simpler: a natively-built artifact is produced on the same machine that just ran the test
+      # suite, so what ships is what was tested. A cross-built macOS binary would be an artifact no
+      # test on this repository had ever executed, which is the wrong property for a payment
+      # gateway. x86_64 macOS is deliberately absent — GitHub retires that image after macOS 15.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            arch_pattern: 'Mach-O.*arm64'
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            arch_pattern: 'ELF.*x86-64'
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            arch_pattern: 'ELF.*aarch64'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      # The whole suite, under the SAME configuration the artifacts are built with — which is what
+      # makes "the thing shipped is the thing tested" literal here rather than approximate.
+      # `//obolus:server_arming_test` takes the binary as a data dependency, so the process it runs
+      # is the same action output the Build step publishes, not a second compilation that happens to
+      # agree. That guard is the only vantage point from which "the arming check runs, and runs
+      # before anything is advertised" is checkable at all.
+      - name: Test
+        run: bazel test --config=release //...
+
+      # `--config=release` is defined in .bazelrc, not spelled out here, so
+      # `bazel build --config=release //obolus` reproduces the published binary for anyone — the
+      # build is not knowable only by reading CI.
+      - name: Build
+        run: bazel build --config=release //obolus //devseller:obolus-devseller
+
+      # `cquery --output=files` rather than a hardcoded `bazel-bin/…` path: that convenience symlink
+      # points at whichever configuration built last, so it would silently hand over a default-mode
+      # binary if anything ever built without `--config=release` first. cquery answers for the
+      # configuration actually asked about.
+      - name: Stage assets
+        run: |
+          mkdir -p dist
+          cp "$(bazel cquery --config=release //obolus --output=files)" "dist/obolus-${{ matrix.target }}"
+          cp "$(bazel cquery --config=release //devseller:obolus-devseller --output=files)" "dist/obolus-devseller-${{ matrix.target }}"
+          chmod +w dist/*
+
+      # Bazel builds for the host, so no flag in the build itself would catch a matrix row whose
+      # runner and triple disagree — it would publish the wrong architecture under the right name,
+      # and nothing before a user's failed execution would say so. Checking the produced file rather
+      # than the build configuration catches that, on the bytes that actually ship.
+      - name: Verify each artifact matches the label it ships under
+        run: |
+          file dist/*
+          file "dist/obolus-${{ matrix.target }}" | grep -qE '${{ matrix.arch_pattern }}'
+          file "dist/obolus-devseller-${{ matrix.target }}" | grep -qE '${{ matrix.arch_pattern }}'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: obolus-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # The only elevated job in this file, and it builds nothing — it just attaches what the matrix
+    # produced. Keeping the write token out of the jobs that compile code means a dependency's build
+    # script never runs in a step that could rewrite a release.
+    #
+    # Naming `permissions` at job level sets every scope not listed here to `none`, so `actions: read`
+    # is spelled out rather than assumed: same-run artifact downloads happen to use the runner's own
+    # token today, and a workflow that depends on that staying true would fail here — in the one job
+    # holding a write token, on a path that cannot be exercised before merge.
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      # Checksums are computed here rather than on each build runner, so that they cover the bytes
+      # actually about to be published rather than bytes that were correct before transport — a hash
+      # taken before an upload attests to something other than what a downloader receives. Doing it
+      # in one place on one OS also avoids depending on which hashing tool each runner image ships,
+      # which differs between macOS and Linux and is not a thing this workflow should have to track.
+      #
+      # The sidecar is written in `sha256sum` format, so a downloader verifies with
+      # `sha256sum -c obolus-<target>.sha256` and needs nothing from us to do it.
+      - name: Collect and checksum
+        working-directory: staging
+        run: |
+          mkdir -p ../dist
+          find . -type f -exec mv {} ../dist/ \;
+          cd ../dist
+          for f in *; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Resolve release identity
+        id: id
+        env:
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "${REF#refs/tags/}" != "$REF" ]; then
+            echo "tag=${REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=" >> "$GITHUB_OUTPUT"
+            echo "title=${REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=main-$(echo "$SHA" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+            echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"
+            echo "title=main @ $(echo "$SHA" | cut -c1-12)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The release page is where the dangerous mistake gets made. Two binaries ship here and one of
+      # them can be configured to accept every payment presented to it; a stranger reading this page
+      # has none of the context that makes that obviously a test tool. Asset names alone are one
+      # hyphen apart, so the notes have to carry the distinction too.
+      - name: Compose notes
+        env:
+          TAG: ${{ steps.id.outputs.tag }}
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Which binary do I want?
+
+          **`obolus-<target>` — the gateway.** This is the one you deploy. It takes payment for a
+          request before it forwards that request upstream.
+
+          **`obolus-devseller-<target>` — NOT a gateway. Do not deploy this.** It is a seller that
+          can be configured to fail on command, so that people writing x402 *clients* have something
+          to test against: real providers do not fail to order.
+
+          What makes it safe to publish is enforced at startup, not left to the reader:
+
+          - It settles nothing. Its receipts are synthetic, so no money moves whatever you configure.
+          - It refuses to start on any network that is not a testnet, and the arming override that
+            exists elsewhere is refused here rather than honoured.
+          - It binds to `127.0.0.1` by default, and the genuinely dangerous combination — a
+            reachable address, plus accept-everything mode, plus a real upstream — is refused
+            outright, because that is an unauthenticated open proxy to somebody's inference
+            endpoint. Reach it from a device with a port forward rather than a wider bind.
+
+          ## Verifying a download
+
+          Each asset has a `.sha256` sidecar in `sha256sum` format:
+
+          ```
+          sha256sum -c obolus-aarch64-apple-darwin.sha256
+          chmod +x obolus-aarch64-apple-darwin
+          ```
+
+          A downloaded asset does not carry an executable bit — GitHub release downloads never do —
+          so `chmod +x` is expected, not a sign anything is wrong.
+
+          ## Build
+
+          Built from this commit with `bazel build --config=release`, natively on each target's own
+          architecture. The test suite ran on the same machine under the same configuration, and the
+          startup-guard test takes the binary as a dependency, so the process it exercised is the
+          artifact attached here rather than a separate build of the same source.
+
+          Arithmetic overflow panics rather than wrapping. `cargo build --release` reproduces the
+          same behaviour for anyone who would rather not install Bazel.
+          NOTES
+          echo "Notes composed for $TAG"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job deliberately does not check out the repository — it compiles nothing and only
+          # needs the artifacts. That leaves `gh` with no git remote to infer the repository from,
+          # so it is named explicitly rather than implied.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.id.outputs.tag }}
+          TITLE: ${{ steps.id.outputs.title }}
+          PRERELEASE: ${{ steps.id.outputs.prerelease }}
+        run: |
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "$TITLE" \
+            --notes-file notes.md \
+            $PRERELEASE \
+            dist/*

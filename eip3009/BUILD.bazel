@@ -5,7 +5,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 # under //devseller would let one drift while both stayed green.
 exports_files(["fixtures/x402-authorization.json"])
 
-# Deliberately NOT a dependency of //obolus:server. The gateway delegates verification to a
+# Deliberately NOT a dependency of //obolus:obolus. The gateway delegates verification to a
 # facilitator and never inspects a signature; this crate exists for the development seller
 # (OBOL-018) and for anything else that needs to check an EIP-3009 authorization offline.
 rust_library(

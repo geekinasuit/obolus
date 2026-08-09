@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 # A package of its own rather than a second binary inside `obolus`, because cargo dependencies are
 # declared per PACKAGE, not per binary: an `eip3009` entry under `obolus` would put a signing path
-# in `obolus`'s own `server` binary, which is exactly what that crate's invariants forbid. Bazel's
+# in `obolus`'s own `obolus` binary, which is exactly what that crate's invariants forbid. Bazel's
 # per-target `deps` would have expressed it, cargo cannot, and the two builds must not disagree.
 [dependencies]
 anyhow = "1"

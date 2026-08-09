@@ -7,7 +7,7 @@
 //! is identical across all three — that is the entire point of the seam.
 
 use std::future::Future;
-// Used only by the test-only fakes below and the test module; gated so the `server` binary,
+// Used only by the test-only fakes below and the test module; gated so the `obolus` binary,
 // compiled without `cfg(test)`, carries neither the imports nor the fakes that need them.
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -99,7 +99,7 @@ pub enum FakeOutcome {
 /// Note that it does not inspect `payment` at all — it *cannot*, because Phase A keeps the
 /// payload opaque. It exists to drive the gateway's control flow, not to judge payments.
 ///
-/// Gated to `cfg(test)`: the `server` binary compiles the library without `cfg(test)`, so this
+/// Gated to `cfg(test)`: the `obolus` binary compiles the library without `cfg(test)`, so this
 /// accept-anything facilitator is physically absent from it (OBOL-001) — no configuration path
 /// can select it, because it does not exist to select. The compiler is the enforcement.
 #[cfg(test)]
