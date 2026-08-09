@@ -56,6 +56,44 @@ jobs:
       - name: Test
         run: bazel test //...
 
+  # The same canonical build, on the other platform this repository publishes for. `release.yml`'s
+  # publish job is `needs: build`, so one red matrix row skips it and that commit publishes nothing.
+  # Today that is discoverable only after the merge; this job surfaces the same break on the pull
+  # request.
+  #
+  # Default configuration rather than `--config=release`, deliberately, and the difference cuts both
+  # ways. At `opt-level=0` rustc enables debug assertions and overflow checks follow them, so the
+  # arithmetic behaviour the release config sets explicitly is already exercised here — but at
+  # `opt-level=3` debug assertions default off, so third-party `debug_assert!`s that run here are
+  # compiled out of what ships. No configuration of this job reaches what the release does *after*
+  # building, either: `cquery`, `cp` and a `file` check are shell against platform tools, which no
+  # test target reaches. Closing that gap means running the release matrix before merge, which
+  # `release.yml`'s trigger comment argues against.
+  #
+  # Linux arm64 is the release matrix's third runner and is not duplicated here. A broken row costs
+  # the same whichever row it is, so this is a judgement about likelihood, not cost: with this job
+  # CI covers (x86_64, Linux) and — `macos-latest` being Apple Silicon — (aarch64, Darwin). The one
+  # ungated row is aarch64 Linux, whose residual risk is the interaction of an architecture this job
+  # exercises with an OS the job above already does.
+  bazel-macos:
+    name: bazel test //... (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          # The action's cache key carries the platform, so this shares the `CI` cache name with the
+          # job above without sharing its contents. At the version pinned above the key carries
+          # platform only, not architecture — which costs nothing here, where the two jobs differ by
+          # platform. Later versions key on both, so re-read this when the pin moves.
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      - name: Test
+        run: bazel test //...
+
   cargo:
     name: cargo test --workspace --locked
     runs-on: ubuntu-latest
