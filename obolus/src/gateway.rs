@@ -99,7 +99,7 @@ impl<F: Facilitator, U: Upstream> Gateway<F, U> {
     /// **That guarantee does not extend to arming, and the asymmetry is deliberate — read it before
     /// relying on the paragraph above.** This constructor does *not* check that the advertised
     /// networks are testnet. That guard is [`arming::check_arming`](crate::arming::check_arming)
-    /// (OBOL-004), and it is applied by the `server` binary at startup, not here. So a caller
+    /// (OBOL-004), and it is applied by the `obolus` binary at startup, not here. So a caller
     /// constructing a `Gateway` directly — the A3 real-facilitator integration tests, a second
     /// binary, an external crate — gets the uniqueness invariant and **not** the arming one, and
     /// must run `check_arming` itself or it will advertise whatever it was handed. Whether that

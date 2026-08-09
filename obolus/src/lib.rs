@@ -17,7 +17,7 @@
 //! what Obolus can *do*. The other half of the posture is what it *advertises*, since a 402 challenge
 //! is what a real client pays against — [`arming`] supplies the check for that, but note precisely
 //! what that means: it is a **check this library offers, not an invariant this library enforces**.
-//! `Gateway::new` does not call it. The `server` binary does, at startup, before constructing the
+//! `Gateway::new` does not call it. The `obolus` binary does, at startup, before constructing the
 //! gateway. A different consumer of this library could build a `Gateway` advertising anything at all
 //! (see OBOL-008 on whether that should be closed structurally).
 

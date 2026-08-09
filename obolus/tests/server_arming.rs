@@ -1,4 +1,4 @@
-//! `main`'s own behaviour exercised through the real `server` binary — the arming guard (OBOL-004)
+//! `main`'s own behaviour exercised through the real `obolus` binary — the arming guard (OBOL-004)
 //! and the bearer-token path's configuration and wiring (OBOL-007).
 //!
 //! # Why this exists as an exec test

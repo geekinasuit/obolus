@@ -14,12 +14,19 @@ Obolus is an **x402 (HTTP-402) payment-gated serving gateway** — a toll booth 
 agentic service. It answers an unpaid request with a real 402 challenge, takes a per-request USDC
 micropayment, and grants passage to the model behind it.
 
-Two crates:
+Three crates:
 
 | Path | Crate | What it is |
 |---|---|---|
-| `obolus/` | `obolus` | The gateway: protocol edges, the `Facilitator` and `Upstream` seams, the arming guard, the `server` binary |
+| `obolus/` | `obolus` | The gateway: protocol edges, the `Facilitator` and `Upstream` seams, the arming guard, the `obolus` binary |
 | `eip3009/` | `eip3009` | Offline EIP-3009 / EIP-712 authorization verification, driven by published known-answer vectors |
+| `devseller/` | `obolus-devseller` | A seller to test an x402 *client* against: real challenges, offline verification, and failure on command. Settles nothing, refuses any non-testnet network, binds loopback |
+
+`devseller/` is a package of its own rather than a second binary under `obolus/` because cargo
+declares dependencies per package: an `eip3009` entry in `obolus/Cargo.toml` would put a
+signature-verification path in the gateway's own graph, which is precisely what the invariants below
+forbid. Bazel's per-target `deps` could have expressed it; cargo cannot, and a rule that holds under
+only one of the two builds is not a rule.
 
 The repository root is a virtual Cargo workspace — it carries no package of its own, only the
 member list and the shared dependency versions.
@@ -38,6 +45,17 @@ cargo test --workspace --locked
 
 Both must pass. `Cargo.lock` is the single source of truth for versions — `MODULE.bazel` resolves
 third-party crates from the same manifests, so the two builds cannot silently diverge.
+
+Published artifacts are built with the `release` config, which is defined in `.bazelrc` rather than
+in CI so that anyone can reproduce a released binary:
+
+```bash
+bazel build --config=release //obolus
+```
+
+It sets optimisation on and keeps overflow checks on — separate knobs, so an optimised binary need
+not give up the arithmetic that panics rather than wrapping. `Cargo.toml`'s `[profile.release]`
+carries the same overflow setting, so `cargo build --release` agrees.
 
 Every test is hermetic: no network, no chain, no model. That is deliberate, and it is the only CI
 that gates a merge. Anything that touches external reality — a real testnet settle against a
@@ -70,7 +88,7 @@ something else better.
   on-chain submission — so the binary is not mainnet-capable by construction, because there is no
   signing path to misuse. The payment payload is opaque: we decode the envelope and forward the
   inner authorization untouched.
-- **`eip3009` is deliberately not a dependency of `//obolus:server`.** It exists for offline verification
+- **`eip3009` is deliberately not a dependency of `//obolus:obolus`.** It exists for offline verification
   and development stubs. Wiring it into the gateway would quietly give the binary a crypto path.
 - **The fakes are `#[cfg(test)]`-only.** `FakeFacilitator` accepts payments it never examined and
   `FakeUpstream` serves canned bytes. They are physically absent from every shipped artifact, so no

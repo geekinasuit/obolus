@@ -9,7 +9,7 @@
 //! purpose — see [`crate::gateway`] for why that split decides when we charge.
 
 use std::future::Future;
-// Used only by the test-only fake below; gated so the `server` binary carries neither.
+// Used only by the test-only fake below; gated so the `obolus` binary carries neither.
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
@@ -50,7 +50,7 @@ pub trait Upstream: Send + Sync + 'static {
 /// Its body is a real multi-chunk stream rather than one buffered blob, so tests exercise the
 /// gateway's streaming path instead of quietly proving that a one-chunk response works.
 ///
-/// Gated to `cfg(test)`: the `server` binary compiles the library without `cfg(test)`, so this
+/// Gated to `cfg(test)`: the `obolus` binary compiles the library without `cfg(test)`, so this
 /// fake cannot be wired into a shipped gateway (OBOL-001) — the compiler enforces it.
 #[cfg(test)]
 pub struct FakeUpstream {
@@ -81,7 +81,7 @@ impl UpstreamCalls {
 }
 
 /// The content type a well-behaved streaming model sends. Used only by the test-only
-/// [`FakeUpstream`], so it is gated to `cfg(test)` and never compiled into the `server` binary.
+/// [`FakeUpstream`], so it is gated to `cfg(test)` and never compiled into the `obolus` binary.
 #[cfg(test)]
 const EVENT_STREAM: &str = "text/event-stream";
 

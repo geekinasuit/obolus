@@ -3,11 +3,15 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 # The protocol + gateway live in a library so they can be unit-tested (and, later, reused by
 # the A3 real-facilitator integration tests). The binary is a thin main.
 rust_library(
-    name = "obolus",
+    name = "lib",
     srcs = glob(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
+    # The TARGET is `lib` so that `obolus` is free for the binary below — `bazel build //obolus` then
+    # produces a file called `obolus`, which is the name it ships under. The CRATE is still `obolus`,
+    # so every `use obolus::…` is untouched and this rename reaches no Rust source.
+    crate_name = "obolus",
     visibility = ["//visibility:public"],
     deps = [
         "@crates//:axum",
@@ -27,18 +31,21 @@ rust_library(
 # this must not be deleted without a replacement, or the build goes red on purpose.
 rust_test(
     name = "obolus_test",
-    crate = ":obolus",
+    crate = ":lib",
     deps = [
         "@crates//:ring",
         "@crates//:tower",
     ],
 )
 
+# Named for the file it produces, matching both the cargo binary and the published release asset, so
+# no step anywhere renames it. A rename is the one place the gateway and the dev seller could be
+# swapped while every name still looks right.
 rust_binary(
-    name = "server",
+    name = "obolus",
     srcs = ["src/main.rs"],
     deps = [
-        ":obolus",
+        ":lib",
         "@crates//:anyhow",
         "@crates//:axum",
         "@crates//:tokio",
@@ -48,12 +55,12 @@ rust_binary(
 # The arming guard's CALL SITE (OBOL-004). `obolus_test` above cannot cover it: it compiles
 # `crate = ":obolus"`, and src/main.rs is excluded from that library's glob — so main is compiled
 # by no test target and the only call to `check_arming` is unexercised. This target runs the real
-# `server` binary and reads startup behaviour off its stderr, which is the only vantage point from
+# `obolus` binary and reads startup behaviour off its stderr, which is the only vantage point from
 # which "the guard runs, and runs before anything is advertised" is checkable. Std-only: no new
 # crate deps. See the test's module docs for why it terminates and why it is hermetic.
 rust_test(
     name = "server_arming_test",
     srcs = ["tests/server_arming.rs"],
-    data = [":server"],
-    env = {"OBOLUS_SERVER_BIN": "$(rootpath :server)"},
+    data = [":obolus"],
+    env = {"OBOLUS_SERVER_BIN": "$(rootpath :obolus)"},
 )

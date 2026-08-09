@@ -282,7 +282,7 @@ pub fn is_provably_testnet(network: &str) -> bool {
 ///
 /// # Who calls this
 ///
-/// The `server` binary, at startup. [`Gateway::new`](crate::gateway::Gateway::new) does **not** — it
+/// The `obolus` binary, at startup. [`Gateway::new`](crate::gateway::Gateway::new) does **not** — it
 /// enforces `(scheme, network)` uniqueness and nothing about testnet-ness, so a caller constructing a
 /// `Gateway` directly gets that invariant and not this one, and must run this function itself.
 /// Whether that asymmetry should be closed structurally is OBOL-008.

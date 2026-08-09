@@ -2,7 +2,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 # A package of its own rather than a second binary under //obolus, because the dual build has to
 # agree: cargo declares dependencies per PACKAGE, so an `eip3009` entry in //obolus's Cargo.toml
-# would put a signature-verification path in //obolus:server's cargo graph — the one thing
+# would put a signature-verification path in //obolus:obolus's cargo graph — the one thing
 # eip3009/BUILD.bazel's own comment says it must not be. Bazel's per-target `deps` could have
 # expressed it; cargo cannot, and a rule that holds under only one of the two builds is not a rule.
 rust_binary(
@@ -15,7 +15,7 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//eip3009",
-        "//obolus",
+        "//obolus:lib",
         "@crates//:anyhow",
         "@crates//:axum",
         "@crates//:serde_json",

@@ -3,3 +3,20 @@
 
 # Per-user local overrides (gitignored). Optional — an absent file is fine.
 try-import %workspace%/user.bazelrc
+
+# How published artifacts are built. Optimised, but with arithmetic that still fails loudly:
+# `overflow-checks` is a knob separate from `debug-assertions` and from optimisation level, so the
+# apparent trade — ship an unoptimised binary, or lose overflow panics — is not a real one. This is a
+# payment gateway, and an amount that silently wraps is a wrong answer that survives, where a panic
+# is a request that dies.
+#
+# The flag reaches every Rustc action in the target configuration, third-party crates included.
+# Exec-configuration actions (build scripts, proc-macros) do not receive it and do not need it: they
+# run at build time and none of their code reaches the artifact.
+#
+# Living here rather than in the workflow means `bazel build --config=release //obolus` reproduces
+# the published binary, instead of the incantation being knowable only by reading CI. Cargo.toml
+# carries the same setting in `[profile.release]`, so the two builds agree on arithmetic. See
+# OBOL-025.
+build:release --compilation_mode=opt
+build:release --@rules_rust//rust/settings:extra_rustc_flags=-Coverflow-checks=on

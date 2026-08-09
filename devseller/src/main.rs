@@ -6,8 +6,8 @@
 //! real facilitator on a real testnet cannot be asked to reject the next payment, or to time out
 //! settlement on an authorization it has already accepted.
 //!
-//! So this binary is that seller. It stands up the same [`obolus`] gateway `server` does, over a
-//! facilitator that verifies payments offline and settles nothing.
+//! So this binary is that seller. It stands up the same [`obolus`] gateway the real binary does,
+//! over a facilitator that verifies payments offline and settles nothing.
 //!
 //! # This settles no money, which is why it refuses to look as though it might
 //!
@@ -15,12 +15,12 @@
 //! behind it was served for free — and startup therefore refuses two things outright, with no
 //! override:
 //!
-//! - **any network it cannot prove is testnet.** `server` has `OBOLUS_ALLOW_MAINNET` for the
+//! - **any network it cannot prove is testnet.** `obolus` has `OBOLUS_ALLOW_MAINNET` for the
 //!   operator who genuinely means it. This binary has no such flag: a gateway that hands out real
 //!   inference for a payment it never collects has no business advertising a chain where the
 //!   payment could have been real.
 //! - **the built-in placeholder network.** `obolus::arming::is_provably_testnet` admits it through
-//!   a clause of its own, so the check above passes it — and `server` boots on it deliberately, as
+//!   a clause of its own, so the check above passes it — and `obolus` boots on it deliberately, as
 //!   the un-configured state. Here it is useless in both directions: no client can pay a challenge
 //!   on a network no chain matches, and offline verification cannot even *run*, because the
 //!   placeholder carries no `eip155:` chain id to build an EIP-712 domain from. A harness that
@@ -54,17 +54,17 @@ use crate::config::{VerifyMode, TOKEN_NAME_VAR, TOKEN_VERSION_VAR};
 use crate::upstream::DevUpstream;
 use crate::verify::TokenDomain;
 
-/// Deliberately neither 8402 (which x402 client tooling tends to bind) nor 8403 (`server`), so a
+/// Deliberately neither 8402 (which x402 client tooling tends to bind) nor 8403 (`obolus`), so a
 /// development seller and a real gateway can run side by side without either moving.
 const DEFAULT_ADDR: &str = "127.0.0.1:8404";
 
-/// Placeholders matching `server`'s, so an operator who copies a configuration between the two
+/// Placeholders matching `obolus`'s, so an operator who copies a configuration between the two
 /// sees the same values mean the same things. Both are refused here before they can be advertised.
 const PLACEHOLDER_PAY_TO: &str = "0xTEST-PAY-TO-ADDRESS-NOT-REAL";
 const PLACEHOLDER_ASSET: &str = "0xTEST-ASSET-ADDRESS-NOT-REAL";
 
 /// The acknowledgement that turns the open-proxy refusal off. Exactly the string `"1"`, matching
-/// `OBOLUS_ALLOW_MAINNET`'s convention in `server` — the safe direction for a typo.
+/// `OBOLUS_ALLOW_MAINNET`'s convention in `obolus` — the safe direction for a typo.
 const ALLOW_OPEN_PROXY_VAR: &str = "OBOLUS_DEV_ALLOW_OPEN_PROXY";
 
 /// What `--help` prints.
@@ -208,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
         max_timeout_seconds: 60,
     };
 
-    // The same two configuration doors `server` offers, through the same shared checks, so a
+    // The same two configuration doors `obolus` offers, through the same shared checks, so a
     // configuration that works against one works against the other.
     let requirements: Vec<PaymentRequirements> = match std::env::var("OBOLUS_ACCEPTS") {
         Ok(raw) if raw.trim().is_empty() => anyhow::bail!(
@@ -240,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- guards, all of them before anything is advertised -----------------------------------
     //
-    // Same ordering rule as `server`'s: a refused configuration must never first tell the operator
+    // Same ordering rule as `obolus`'s: a refused configuration must never first tell the operator
     // it is advertising payment options. `tests/guards.rs` checks the ordering by
     // running this binary, because exit status cannot see it — a gateway that refuses too late
     // still exits non-zero, having already advertised.

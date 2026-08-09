@@ -12,7 +12,7 @@
 //! network; there is no mainnet signing path in this crate.
 //!
 //! The Phase-A fakes are absent from this binary on purpose. They are `#[cfg(test)]`-only, so the
-//! `server` target — which compiles the library without `cfg(test)` — physically cannot build an
+//! `obolus` target — which compiles the library without `cfg(test)` — physically cannot build an
 //! accept-every-payment facilitator or a pretend upstream into a shipped artifact (OBOL-001). The
 //! compiler is the guarantee, not a code review.
 
