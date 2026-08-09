@@ -21,9 +21,17 @@ on:
 permissions:
   contents: read
 
-# Two merges landing together produce two distinct `main-<sha>` tags, so they cannot collide — but
-# they are serialised anyway rather than cancelled, because a cancelled run can leave a release
-# created with only part of its assets attached.
+# Two merges landing together produce two distinct `main-<sha>` tags, so they cannot collide. They
+# are serialised anyway, because a run cancelled midway can leave a release created with only part
+# of its assets attached.
+#
+# Know the limit of that before relying on it. `cancel-in-progress: false` protects the run already
+# going, but gives it no queue of useful depth behind it: by default the group holds exactly one
+# waiting run, and GitHub cancels that pending run when a newer one is queued. So a third merge
+# arriving while a release is still running evicts the second, and that commit gets no pre-release.
+# The depth is a setting rather than a fixed property of the group, which is where to look if that
+# becomes a problem. A commit with no assets is therefore not on its own evidence that something
+# broke — the run list is what separates the two, with an evicted run shown as cancelled.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
