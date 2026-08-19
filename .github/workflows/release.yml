@@ -25,16 +25,29 @@ permissions:
 # are serialised anyway, because a run cancelled midway can leave a release created with only part
 # of its assets attached.
 #
-# Know the limit of that before relying on it. `cancel-in-progress: false` protects the run already
-# going, but gives it no queue of useful depth behind it: by default the group holds exactly one
-# waiting run, and GitHub cancels that pending run when a newer one is queued. So a third merge
-# arriving while a release is still running evicts the second, and that commit gets no pre-release.
-# The depth is a setting rather than a fixed property of the group, which is where to look if that
-# becomes a problem. A commit with no assets is therefore not on its own evidence that something
-# broke — the run list is what separates the two, with an evicted run shown as cancelled.
+# `queue: max` is why every merged commit gets its release. The default is `queue: single`, which
+# holds exactly ONE pending run and cancels it when a newer one queues — so under the default a third
+# merge arriving mid-release evicts the second, and that commit publishes nothing. Nothing fails; the
+# artifact is simply absent, which is indistinguishable from a broken build until you open the run
+# list, where an evicted run shows as cancelled. `max` holds up to 100 pending runs instead, drained
+# first-in-first-out by when each began WAITING on the group rather than when it was dispatched — and
+# GitHub does not guarantee even that, so nothing here should lean on the order.
+#
+# The two keys below are a pair: `queue: max` with `cancel-in-progress: true` is a workflow validation
+# error. The hazard is INVERTING that `false`, not deleting it — `false` is also the default, so `max`
+# stays legal without the line. It stays because it states the serialisation intent above.
+#
+# The trade, so `max` is not read as strictly better: it costs latency long before it costs anything
+# else. A fresh merge now waits behind everything already queued, and three or four merges is enough
+# for that — `single` would have kept the newest one and dropped a middle one instead. The hundred
+# belongs to the other inversion: once the queue saturates, `max` cancels new arrivals, so what gets
+# shed is the NEWEST commit. That bound this repository's merge rate cannot approach — and it is a
+# bound, not "unlimited". Releases cut from a `v*` tag sit outside all of this: `group:` keys on
+# `github.ref`, so each tag gets its own group and never queues behind main's pre-releases.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build:
