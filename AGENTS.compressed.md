@@ -18,10 +18,15 @@ Cargo.lock=single source of truth for versions; MODULE.bazel resolves crates fro
 every test hermetic(no network|chain|model)=the ONLY merge gate; external reality(real testnet settle vs 3rd-party facilitator)=out-of-band so its flakiness can't block pipeline
 
 §PUBLIC [repo is PUBLIC — these are not style preferences]
-working notes stay out: research|plans|tickets|handoffs kept OUTSIDE this repo
-  thoughts/ gitignored AND enforced by `no-stray-notes` CI job [ignore alone defeated by git add -f]
+tickets|research|plans = GitHub issues ON THIS REPO [part of the project, not a private layer beside it→anyone reads the reasoning behind a change w/o other access]
+  cite as GitHub does: `#42` auto-links; `fixes #42` in a PR really closes the issue on merge
+  `OBOL-NNN` still THROUGHOUT the tree from the tracker predating this — NOT only `//` comments: `#` comments in build files | a string the shipped gateway PRINTS at startup | README incl. headings AND anchor links; `git grep -niE 'OBOL-[0-9]+' -- :/` = the complete list [EVERY flag load-bearing: no `-E`→`+` is LITERAL→matches NOTHING, zero not fewer, so a broken check reads CLEAN; no `:/`→searches cwd DOWN not root; no `-i`→misses README's LOWERCASED anchor links, which break the moment you rewrite the headings they target]; write no new ones
+  filing = PUBLIC+PERMANENT, edit history included; an issue body can't be quietly taken back
+anything that CANNOT be a public issue stays OUT of the repo ENTIRELY: session handoffs | research depending on infra not published here | plans that would leak something
+  →untracked thoughts dir; gitignored AND enforced by `no-stray-notes` CI job [ignore alone defeated by git add -f]
   that job ALSO rejects REFERENCES to those paths [link to a file not here = broken reference for anyone reading the code]
-cite tickets by ID alone(OBOL-004), NEVER a path [IDs stable+meaningful; paths are what the guard rejects]
+  CAN'T TELL WHICH SIDE → keep it OUT [an issue can't be unfiled; moving a note IN later costs nothing]
+write issues+PRs for BOTH audiences(agents+humans read them; padding serves neither): what changed+why, enough for a reader to act on, stop; NO throat-clearing|ceremonial sections|flourish; COMPLETE > SHORT
 public depends only on public: no internal/private repo dep; no sideways reach into sibling project; needed internal code→publish or reimplement first
 CI on GitHub-hosted runners ONLY; NEVER runs-on:self-hosted [public repo→PR runs stranger's code; self-hosted not isolated enough]; workflow token read-only
 
@@ -48,5 +53,5 @@ execute exactly one branch(first match wins, then stop):
   ~/.geekinasuit/agents/public/AGENTS.compressed.md → read+follow
   ~/.geekinasuit/agents/public/AGENTS.md → read+follow
   else → skip; done
-NOTHING here depends on that layer: §BUILD+§PUBLIC+§INVARIANTS complete standalone; a contributor who never heard of it can build/test/change correctly. chain adds HOUSE STYLE not project rules.
-public geekinasuit norms intended to be published separately later so this chain resolves for everyone, not only inside the fleet
+NOTHING here depends on that layer: §BUILD+§PUBLIC+§INVARIANTS complete standalone; a contributor who never heard of it can build/test/change correctly. chain adds HOUSE STYLE not project rules — agents on that layer file §PUBLIC's issues through their own `tickets.main.kts` front end; everyone else uses the GitHub web UI or `gh issue create` to the same effect.
+the 2 `~/.geekinasuit/` branches are NOT a fleet detail: `~/.geekinasuit/agents/public/` = where geekinasuit's OPEN-SOURCE prompt files are meant to live on ANYONE's machine → use them, put them there, chain resolves for you too. publishing that set = separate work → the branches can currently come up empty for everyone outside

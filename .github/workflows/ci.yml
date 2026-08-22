@@ -18,9 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Working notes are kept outside this repository. .gitignore keeps them out by default; this
-      # job is what makes that load-bearing, since an ignore rule is silently defeated by
-      # `git add -f`.
+      # Content that cannot be a public issue — session handoffs and the like — is kept outside this
+      # repository. .gitignore keeps it out by default; this job is what makes that load-bearing,
+      # since an ignore rule is silently defeated by `git add -f`.
       - name: Reject committed notes
         run: |
           if git ls-files | grep -E '(^|/)thoughts/'; then
@@ -30,11 +30,14 @@ jobs:
           echo "No note files tracked."
 
       # The subtler case: a path that is not in this repository but is still linked to. Such a link
-      # is a broken reference for anyone reading the code.
+      # is a broken reference for anyone reading the code. The pattern covers the whole directory
+      # rather than one subtree of it, and requires a character after the slash so that naming the
+      # directory itself — as AGENTS.md does — stays allowed. It is a reference *into* it that
+      # breaks.
       - name: Reject references to absent note paths
         run: |
-          if git grep -nE '(\.\./)*thoughts/shared/' -- . ':!.github/workflows/ci.yml' ':!.gitignore'; then
-            echo "::error::Source refers to a path that is not in this repository. Reference the ticket ID alone instead."
+          if git grep -nE '(\.\./)*thoughts/[A-Za-z0-9_.-]' -- . ':!.github/workflows/ci.yml' ':!.gitignore'; then
+            echo "::error::Source refers to a path that is not in this repository. Cite the GitHub issue (#N) instead, or drop the reference entirely — content that cannot be public does not become an issue."
             exit 1
           fi
           echo "No references to absent note paths."
