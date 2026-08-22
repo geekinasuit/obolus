@@ -63,14 +63,32 @@ third-party facilitator — runs out of band, so its flakiness cannot block the 
 
 ## Rules specific to this repository
 
-**This repository is public.** Four things follow, and none of them are style preferences.
+**This repository is public.** Five things follow, and none of them are style preferences.
 
-- **Working notes stay out.** Research, plans, tickets and handoffs are kept outside this
-  repository. `thoughts/` is gitignored here *and* enforced by the `no-stray-notes` CI job, because
-  an ignore rule alone is defeated by `git add -f`. That job also rejects **references** to those
-  paths: a link to a file that is not here is a broken reference for anyone reading the code.
-- **Cite tickets by ID alone.** `OBOL-004`, never a path to a ticket file. IDs are stable and
-  meaningful; paths are not, and paths are what the CI guard rejects.
+- **Tickets, research and plans are GitHub issues on this repository.** They are part of the
+  project rather than a private layer beside it, so anyone can read the reasoning behind a change
+  without needing access to anything else. Cite them the way GitHub does: `#42` auto-links, and
+  `fixes #42` in a pull request really does close the issue on merge. `OBOL-NNN` still appears
+  throughout the tree — not only in `//` comments, but in `#` comments in the build files, in a
+  string the shipped gateway prints at startup, and across the README including its headings and
+  its anchor links — from the tracker that predates this;
+  `git grep -niE 'OBOL-[0-9]+' -- :/` is the complete list, and every flag in it is load-bearing.
+  Without `-E` the `+` is a literal and the pattern matches nothing at all — zero, not fewer, so the
+  check reads clean exactly when it is broken. Without `:/` the search starts at your working
+  directory rather than the root. Without `-i` it misses the README's lowercased anchor links, which
+  break the moment you rewrite the headings they point at. Do not write new ones. Filing is public and
+  permanent, edit history included; an issue body is not something you can quietly take back.
+- **Anything that cannot be a public issue stays out of the repository entirely.** Session
+  handoffs, research that depends on infrastructure not published here, plans that would leak
+  something. Those belong in an untracked `thoughts/` directory, which is gitignored *and* enforced
+  by the `no-stray-notes` CI job, because an ignore rule alone is defeated by `git add -f`. That
+  job also rejects **references** to those paths: a link to a file that is not here is a broken
+  reference for anyone reading the code. When you cannot tell which side something falls on, keep it
+  out — an issue cannot be unfiled, and moving a note in later costs nothing.
+- **Write issues and pull requests for both audiences.** Agents and humans both read them, and
+  padding serves neither. State what changed and why, give a reader enough to act on, and stop —
+  no throat-clearing, no ceremonial sections, no flourish. Being complete matters more than being
+  short.
 - **Public depends only on public.** No dependency on any internal or private repository, and no
   reaching sideways into a sibling project. If something here needs a piece of internal code, the
   piece has to be published first or reimplemented.
@@ -131,6 +149,9 @@ Execute exactly one branch; first match wins, then stop:
 
 **Nothing in this repository depends on that layer.** Everything above is complete on its own, and a
 contributor who has never heard of it can build, test, and change this project correctly. The chain
-adds house style, not project rules. Public norms for geekinasuit projects are intended to be
-published separately later, so that this chain resolves for everyone rather than only inside the
-fleet.
+adds house style, not project rules — agents on that layer file the issues above through their own
+`tickets.main.kts` front end, and everyone else uses the GitHub web UI or `gh issue create` to the
+same effect. The two `~/.geekinasuit/` branches are not a fleet detail: that directory is where
+geekinasuit's open-source prompt files are meant to live on anyone's machine, so if you use them,
+put them there and this chain resolves for you too. Publishing that set is separate work, which is
+why the branches can currently come up empty for everyone outside.
