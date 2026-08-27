@@ -384,7 +384,7 @@ physically absent from every shipped artifact and no configuration path can sele
 payment and serve the real model." They exist to drive the gateway's control flow in tests, and
 nothing more.
 
-We author both the client signer (STORY-056) and this verifier, so "my fake accepted my payment"
+We author both the client signer and this verifier, so "my fake accepted my payment"
 is worth nothing as evidence — a shared misunderstanding of the EIP-712 domain separator or the
 `transferWithAuthorization` struct hash makes both sides agree with each other while a real
 facilitator still rejects. The load-bearing checks are deliberately outside our own authorship:

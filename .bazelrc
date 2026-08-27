@@ -16,7 +16,6 @@ try-import %workspace%/user.bazelrc
 #
 # Living here rather than in the workflow means `bazel build --config=release //obolus` reproduces
 # the published binary, instead of the incantation being knowable only by reading CI. Cargo.toml
-# carries the same setting in `[profile.release]`, so the two builds agree on arithmetic. See
-# OBOL-025.
+# carries the same setting in `[profile.release]`, so the two builds agree on arithmetic.
 build:release --compilation_mode=opt
 build:release --@rules_rust//rust/settings:extra_rustc_flags=-Coverflow-checks=on
