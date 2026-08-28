@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn a_misconfigured_token_domain_rejects_and_says_so() {
         // The failure mode this binary is most likely to hand someone: `name` and `version` are
-        // configuration (OBOL-019), and a wrong one makes every correct signature fail to recover.
+        // configuration (#13), and a wrong one makes every correct signature fail to recover.
         // The rejection has to be traceable to the domain or the client author debugs their signer
         // for an afternoon.
         let facilitator = DevFacilitator::new(

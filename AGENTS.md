@@ -67,17 +67,15 @@ third-party facilitator — runs out of band, so its flakiness cannot block the 
 
 - **Tickets, research and plans are GitHub issues on this repository.** They are part of the
   project rather than a private layer beside it, so anyone can read the reasoning behind a change
-  without needing access to anything else. Cite them the way GitHub does: `#42` auto-links, and
-  `fixes #42` in a pull request really does close the issue on merge. `OBOL-NNN` still appears
-  throughout the tree — not only in `//` comments, but in `#` comments in the build files, in a
-  string the shipped gateway prints at startup, and across the README including its headings and
-  its anchor links — from the tracker that predates this;
-  `git grep -niE 'OBOL-[0-9]+' -- :/` is the complete list, and every flag in it is load-bearing.
-  Without `-E` the `+` is a literal and the pattern matches nothing at all — zero, not fewer, so the
-  check reads clean exactly when it is broken. Without `:/` the search starts at your working
-  directory rather than the root. Without `-i` it misses the README's lowercased anchor links, which
-  break the moment you rewrite the headings they point at. Do not write new ones. Filing is public and
-  permanent, edit history included; an issue body is not something you can quietly take back.
+  without needing access to anything else. Cite them as `#42`, and `fixes #42` in a pull request
+  really does close the issue on merge. GitHub renders that short form as a link only in
+  conversations — issues, pull requests, commit messages — and explicitly not in the files of a
+  repository, so the citation takes two forms here. In `README.md`, read on the web by people who
+  have no checkout, write a full Markdown link. In source comments write the bare `#42`: it does
+  not render, but a contributor reading the file has the repository in front of them and there is
+  only one tracker it can mean. Never cite `OBOL-NNN` — those are the retired private tracker's
+  ids, and nothing in this repository resolves them. Filing is public and permanent, edit history
+  included; an issue body is not something you can quietly take back.
 - **Anything that cannot be a public issue stays out of the repository entirely.** Session
   handoffs, research that depends on infrastructure not published here, plans that would leak
   something. Those belong in an untracked `thoughts/` directory, which is gitignored *and* enforced

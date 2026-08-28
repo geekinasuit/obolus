@@ -84,7 +84,7 @@ impl PaymentRequired {
     ///
     /// Order is preserved: the first entry is the gateway's preferred option, but `accepts` is a
     /// menu and the client may pick any of them. This is how one gateway advertises several chains
-    /// (e.g. Base *and* Solana) in a single 402 — the client chooses which to pay (OBOL-003).
+    /// (e.g. Base *and* Solana) in a single 402 — the client chooses which to pay.
     pub fn offering_all(accepts: Vec<PaymentRequirements>) -> Self {
         Self { x402_version: X402_VERSION, accepts, error: None }
     }

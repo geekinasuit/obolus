@@ -1,4 +1,4 @@
-//! The startup arming guard: refuse to advertise a network we cannot prove is testnet (OBOL-004).
+//! The startup arming guard: refuse to advertise a network we cannot prove is testnet.
 //!
 //! Obolus never signs anything — it issues a 402 challenge and delegates verify/settle to a
 //! facilitator. But **the challenge it advertises is the real-money trigger**: a cooperating client
@@ -28,9 +28,9 @@
 //! Network ids are compared verbatim — no trimming, no case folding — so that what this guard checks
 //! is byte-identical to what the gateway advertises. A case- or whitespace-variant of a testnet id
 //! is therefore *not* on the allowlist and fails closed, which is the safe direction. Normalising
-//! input is OBOL-005's job, upstream at
-//! [`config::validated_option`](crate::config::validated_option) — the single per-option seam
-//! **both** configuration forms go through, so canonicalising there cannot leave one path raw.
+//! input belongs upstream at [`config::validated_option`](crate::config::validated_option), the
+//! single per-option seam **both** configuration forms go through, so canonicalising there cannot
+//! leave one path raw (#14).
 //!
 //! # Diagnosis is not admission
 //!
@@ -79,7 +79,7 @@ pub const PINNED_ON: &str = "2026-07-29";
 /// existing identifier* at a different chain, this list keeps asserting the old truth and the guard
 /// keeps admitting the id. A rename or a new chain shows up as a diff against the source; a silently
 /// reassigned reference does not, and fail-closed cannot help because the id still matches.
-/// Re-reading the source is the only detection — mechanised by OBOL-009.
+/// Re-reading the source is the only detection — mechanised by #29.
 pub const TESTNET_NETWORKS: &[&str] = &[
     // EVM (eip155:<chain id>)
     "eip155:84532",  // Base Sepolia
@@ -176,8 +176,8 @@ fn is_non_ascii(network: &str) -> bool {
 /// [`near_miss`] cannot help — a short name is not a whitespace- or case-variant of any CAIP-2 id.
 ///
 /// Structural, not a lookup table: a CAIP-2 id is `namespace:reference`, so no colon means not
-/// CAIP-2. A short-name→CAIP-2 mapping would be a second thing to keep in sync with x402, and is
-/// OBOL-005's business anyway.
+/// CAIP-2. A short-name→CAIP-2 mapping would be a second thing to keep in sync with x402, and
+/// belongs to the canonicalisation work anyway (#14).
 ///
 /// **Three deliberate non-firings**, each because the short-name story would be *false* for it: a
 /// malformed CAIP-2 attempt (`eip155:`, `:84532`) has a colon and the generic text is not misleading
@@ -196,7 +196,7 @@ fn is_not_caip2(network: &str) -> bool {
 /// **Unreachable from `main`, and kept anyway.** Both configuration paths go through
 /// [`validated_option`](crate::config::validated_option), which rejects an empty network with the
 /// same `trim().is_empty()` test. This clause is for [`check_arming`]'s *other* callers — it is
-/// `pub`, `Gateway::new` deliberately does not call it (OBOL-008), and a library consumer assembling
+/// `pub`, `Gateway::new` deliberately does not call it (#27), and a library consumer assembling
 /// requirements by hand gets no upstream validation at all. A diagnosis that is only correct because
 /// of what some other module happens to check is not a property of this one.
 fn is_empty_value(network: &str) -> bool {
@@ -273,11 +273,11 @@ pub fn is_provably_testnet(network: &str) -> bool {
 ///
 /// The guard's promise is "no network Obolus advertises is unproven", and it can only keep that
 /// promise over what it is handed. Today one gateway advertises one set. If Obolus later routes to
-/// several upstreams with per-route pricing (OBOL-006), each route's requirements must reach this
+/// several upstreams with per-route pricing (#32), each route's requirements must reach this
 /// function — the union of everything advertised, not a default set with per-route overrides applied
 /// afterwards. A route whose price is patched in after the check is a route the guard never saw.
 ///
-/// A bearer-token path that skips payment entirely (OBOL-007) needs nothing here: it advertises no
+/// A bearer-token path that skips payment entirely (#33) needs nothing here: it advertises no
 /// challenge, so there is nothing to prove testnet. The guard stays at startup either way.
 ///
 /// # Who calls this
@@ -285,7 +285,7 @@ pub fn is_provably_testnet(network: &str) -> bool {
 /// The `obolus` binary, at startup. [`Gateway::new`](crate::gateway::Gateway::new) does **not** — it
 /// enforces `(scheme, network)` uniqueness and nothing about testnet-ness, so a caller constructing a
 /// `Gateway` directly gets that invariant and not this one, and must run this function itself.
-/// Whether that asymmetry should be closed structurally is OBOL-008.
+/// Whether that asymmetry should be closed structurally is #27.
 pub fn check_arming(
     requirements: &[PaymentRequirements],
     armed: bool,
@@ -335,7 +335,7 @@ pub fn check_arming(
 /// Nothing enforces that an armed caller calls this — a struct field would not either, since a field
 /// can be ignored as easily as a function. What holds it is
 /// `an_armed_gateway_diagnoses_a_dead_entry_among_a_real_mainnet`, which runs the binary with exactly
-/// that array. Closing it structurally is OBOL-008.
+/// that array. Closing it structurally is #27.
 ///
 /// # Why by kind, and not by offender
 ///
@@ -627,7 +627,7 @@ mod tests {
     /// test passes, and a real XDC *mainnet* id boots un-armed. Every near-miss pair lives on one
     /// source row, so the adjacency that makes a slip realistic is what makes it correlated.
     /// **Re-reading the primary source stays mandatory; a green suite is not a verification of this
-    /// data.** Mechanising that re-read is OBOL-009. The testnet half is the better-attested one —
+    /// data.** Mechanising that re-read is #29. The testnet half is the better-attested one —
     /// three readers agree on all 16 ids byte-for-byte, every near-miss pair on the correct side — and
     /// it is the half that actually gates the guard.
     ///
@@ -686,7 +686,7 @@ mod tests {
         // The transcribed oracle caught exactly that case, because its rows came from the x402 page
         // rather than from this list; the six rows the rescope dropped were decorrelated by *time* as
         // well, written before anyone knew which testnet would later need a twin. The signal that
-        // closes this has to come from outside the file — OBOL-009's mechanised re-fetch-and-diff.
+        // closes this has to come from outside the file — a mechanised re-fetch-and-diff (#29).
         // Until it lands, **adding a chain here means reading the source twice, once per column.**
         assert_eq!(
             MAINNET_NETWORKS.len(),
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn a_case_variant_of_a_testnet_id_is_not_recognised() {
         // PINNED CURRENT BEHAVIOUR, not a wish. The comparison is byte-exact, so a case-variant
-        // CAIP-2 namespace fails closed — safe, but not friendly. When OBOL-005 lands namespace-aware
+        // CAIP-2 namespace fails closed — safe, but not friendly. When #14 lands namespace-aware
         // canonicalization at `config::validated_option`, the canonical id reaches this guard and this
         // assertion should be UPDATED as an intentional consequence, not read as a regression. Verify
         // that update on **both** configuration paths; the shared per-option seam covers them by

@@ -1,7 +1,7 @@
 //! Turning a multi-chain gateway configuration into the payment options a gateway advertises.
 //!
 //! A [`crate::gateway::Gateway`] can advertise several ways to pay at once — one per
-//! `(scheme, network)`, e.g. Base and Solana (OBOL-003). This module parses the operator-facing
+//! `(scheme, network)`, e.g. Base and Solana. This module parses the operator-facing
 //! `OBOLUS_ACCEPTS` form — a JSON array of per-chain entries — into [`PaymentRequirements`],
 //! folding in the gateway-wide fields and validating each amount.
 //!
@@ -143,7 +143,7 @@ pub enum EntryDefect {
 /// Build one advertised payment option, applying the validation **both** configuration forms owe.
 ///
 /// This is the single per-option seam: every field an operator can set arrives here, from either
-/// door, before it can become something a client pays against. So OBOL-005's CAIP-2 canonicalisation
+/// door, before it can become something a client pays against. So CAIP-2 canonicalisation (#14)
 /// belongs here, not in [`parse_accepts`] — landing it there would canonicalise the multi-chain path
 /// and leave the default single-chain one raw.
 ///

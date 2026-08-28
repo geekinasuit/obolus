@@ -23,7 +23,7 @@
 //! four are already in the payment requirements — `verifyingContract` *is* the advertised asset,
 //! and `chainId` is the CAIP-2 network's reference. The other two are properties of the token
 //! contract that nothing in an x402 challenge carries, and the specification does not say where to
-//! get them (OBOL-019). So they are configuration here, and every rejection renders the domain it
+//! get them (#13). So they are configuration here, and every rejection renders the domain it
 //! used: a misconfigured `name` produces a signature that does not recover, and "bad signature"
 //! with no domain printed is precisely the dead end this crate exists to help someone out of.
 
@@ -128,7 +128,7 @@ pub enum VerifyError {
         "signature does not recover to the authorizing party.\n  authorization.from: {expected}\n  \
          recovered:          {recovered}\n  verified under EIP-712 domain: {domain}\n  If the \
          payer signed correctly, the domain above is wrong — name and version are properties of \
-         the token contract that no x402 challenge carries (OBOL-019). Set OBOLUS_DEV_TOKEN_NAME \
+         the token contract that no x402 challenge carries. Set OBOLUS_DEV_TOKEN_NAME \
          and OBOLUS_DEV_TOKEN_VERSION to match the contract the payer signed against."
     )]
     NotRecovered { expected: String, recovered: String, domain: String },
@@ -493,7 +493,7 @@ mod kat_tests {
     }
 
     /// The rejection has to name the domain it used, because a `name`/`version` mismatch is
-    /// invisible from the payer's side and is the likeliest cause of a failure here (OBOL-019).
+    /// invisible from the payer's side and is the likeliest cause of a failure here (#13).
     #[test]
     fn a_failed_recovery_names_the_domain_it_verified_under() {
         let doc = fixture();

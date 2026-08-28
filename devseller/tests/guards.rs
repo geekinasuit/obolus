@@ -842,7 +842,7 @@ fn an_unknown_behaviour_mode_refuses_and_names_the_choices() {
 }
 
 /// The banner has to say which token domain it is verifying under, because x402 does not carry
-/// `name`/`version` (OBOL-019) and a wrong one rejects every correctly-signed payment with a
+/// `name`/`version` (#13) and a wrong one rejects every correctly-signed payment with a
 /// message about signature recovery. The payer cannot see it from their side at all.
 #[test]
 fn the_startup_banner_names_the_eip712_token_domain() {

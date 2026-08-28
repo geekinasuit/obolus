@@ -398,7 +398,7 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("obolus-devseller: behaviour -> {dev}");
     eprintln!("obolus-devseller: upstream -> {}", upstream::describe(&upstream, upstream_url.as_deref()));
     if dev.verify == VerifyMode::Verify {
-        // The two fields no x402 challenge carries (OBOL-019). Printed unconditionally under
+        // The two fields no x402 challenge carries (#13). Printed unconditionally under
         // `verify` because a wrong one rejects every correct signature, and the payer cannot see
         // it from their side.
         eprintln!(

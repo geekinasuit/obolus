@@ -52,7 +52,7 @@ rust_binary(
     ],
 )
 
-# The arming guard's CALL SITE (OBOL-004). `obolus_test` above cannot cover it: it compiles
+# The arming guard's CALL SITE. `obolus_test` above cannot cover it: it compiles
 # `crate = ":obolus"`, and src/main.rs is excluded from that library's glob — so main is compiled
 # by no test target and the only call to `check_arming` is unexercised. This target runs the real
 # `obolus` binary and reads startup behaviour off its stderr, which is the only vantage point from

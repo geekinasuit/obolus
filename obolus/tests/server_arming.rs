@@ -1,5 +1,5 @@
-//! `main`'s own behaviour exercised through the real `obolus` binary — the arming guard (OBOL-004)
-//! and the bearer-token path's configuration and wiring (OBOL-007).
+//! `main`'s own behaviour exercised through the real `obolus` binary — the arming guard
+//! and the bearer-token path's configuration and wiring (#33).
 //!
 //! # Why this exists as an exec test
 //!
@@ -223,7 +223,7 @@ const ACCEPTS_MAINNET_PLUS_PLACEHOLDER: &str = r#"[
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
 ]"#;
 
-/// The bearer-token path's startup line (OBOL-007). Asserted present by the positive case below and
+/// The bearer-token path's startup line (#33). Asserted present by the positive case below and
 /// absent by every token refusal, so — as with [`SHORT_NAME_CLAUSE`] — the two directions share one
 /// needle and the negatives cannot rot into always-true while the positive keeps this honest.
 ///
@@ -755,11 +755,11 @@ fn an_armed_all_testnet_gateway_says_the_flag_changed_nothing() {
     run.must_not_say("MAINNET ARMED");
 }
 
-// ---- the bearer-token path's call site (OBOL-007) ------------------------------------------------
+// ---- the bearer-token path's call site (#33) -----------------------------------------------------
 //
 // Same argument as the arming guard's, one feature later: `access.rs` is unit-tested to death and
 // none of it says whether `main` wires any of it up. These are the only tests that compile-and-run
-// the OBOL-007 half of `main` at all.
+// the bearer-token half of `main` at all.
 //
 // The path below is deliberately unreadable in the first four: all three configuration guards run
 // before `std::fs::read`, so a path that cannot exist still reaches every one of them, and a test
