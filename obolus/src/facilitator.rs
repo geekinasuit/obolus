@@ -100,7 +100,7 @@ pub enum FakeOutcome {
 /// payload opaque. It exists to drive the gateway's control flow, not to judge payments.
 ///
 /// Gated to `cfg(test)`: the `obolus` binary compiles the library without `cfg(test)`, so this
-/// accept-anything facilitator is physically absent from it (OBOL-001) — no configuration path
+/// accept-anything facilitator is physically absent from it (#17) — no configuration path
 /// can select it, because it does not exist to select. The compiler is the enforcement.
 #[cfg(test)]
 pub struct FakeFacilitator {
@@ -373,7 +373,7 @@ impl DelegatedFacilitator {
             settle_url: format!("{base}/settle"),
             // A pooled connection that fails the instant we hand it a request would, by default, be
             // silently retried — re-sending POST /settle and risking a double settlement. Disable
-            // the retry so the failure surfaces as `Unavailable` instead (see OBOL-002).
+            // the retry so the failure surfaces as `Unavailable` instead (see #31).
             client: Client::builder(TokioExecutor::new())
                 .retry_canceled_requests(false)
                 .build_http::<Full<Bytes>>(),
@@ -533,7 +533,7 @@ impl Facilitator for DelegatedFacilitator {
             // KNOWN GAP — `errorReason == "duplicate_settlement"` means this authorization already
             // settled on a prior call, so money *did* move; neither 402 nor 502 is right for it. Its
             // real handling is the A3 payment-keyed idempotency cache short-circuiting it to the
-            // cached receipt, and the fail-open-vs-terminal policy is Christian's call (OBOL-001).
+            // cached receipt, and the fail-open-vs-terminal policy is Christian's call (#17).
             // Until that lands it folds into this default; it is deliberately not special-cased.
             Some(false) => Err(FacilitatorError::Rejected(reject_reason(
                 parsed.error_reason.as_deref(),
@@ -867,7 +867,7 @@ mod delegated_tests {
     async fn settle_duplicate_settlement_folds_into_rejected_for_now() {
         // Pins the CURRENT behavior and its comment: `duplicate_settlement` is not special-cased in
         // Phase A — its real handling (serve the cached receipt) is the A3 idempotency cache, and
-        // the fail-open-vs-terminal policy is Christian's call (OBOL-001).
+        // the fail-open-vs-terminal policy is Christian's call (#17).
         let body = r#"{"success":false,"errorReason":"duplicate_settlement","transaction":"","network":"base-sepolia"}"#;
         let (base, _c) = serve(unused(), Canned::ok(body)).await;
         let err = DelegatedFacilitator::new(base)

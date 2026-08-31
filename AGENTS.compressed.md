@@ -19,8 +19,9 @@ every test hermetic(no network|chain|model)=the ONLY merge gate; external realit
 
 §PUBLIC [repo is PUBLIC — these are not style preferences]
 tickets|research|plans = GitHub issues ON THIS REPO [part of the project, not a private layer beside it→anyone reads the reasoning behind a change w/o other access]
-  cite as GitHub does: `#42` auto-links; `fixes #42` in a PR really closes the issue on merge
-  `OBOL-NNN` still THROUGHOUT the tree from the tracker predating this — NOT only `//` comments: `#` comments in build files | a string the shipped gateway PRINTS at startup | README incl. headings AND anchor links; `git grep -niE 'OBOL-[0-9]+' -- :/` = the complete list [EVERY flag load-bearing: no `-E`→`+` is LITERAL→matches NOTHING, zero not fewer, so a broken check reads CLEAN; no `:/`→searches cwd DOWN not root; no `-i`→misses README's LOWERCASED anchor links, which break the moment you rewrite the headings they target]; write no new ones
+  cite as `#42`; `fixes #42` in a PR really closes the issue on merge
+  `#42` RENDERS AS A LINK ONLY IN CONVERSATIONS(issues|PRs|commit msgs), NOT in a repo's FILES → 2 forms here: README(read on the web w/o a checkout)=full Markdown link | source comments=bare `#42`(doesn't render, but the reader has the repo + there's one tracker it can mean)
+  NEVER cite `OBOL-NNN` = the retired private tracker's ids; nothing here resolves them
   filing = PUBLIC+PERMANENT, edit history included; an issue body can't be quietly taken back
 anything that CANNOT be a public issue stays OUT of the repo ENTIRELY: session handoffs | research depending on infra not published here | plans that would leak something
   →untracked thoughts dir; gitignored AND enforced by `no-stray-notes` CI job [ignore alone defeated by git add -f]

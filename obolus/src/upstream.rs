@@ -51,7 +51,7 @@ pub trait Upstream: Send + Sync + 'static {
 /// gateway's streaming path instead of quietly proving that a one-chunk response works.
 ///
 /// Gated to `cfg(test)`: the `obolus` binary compiles the library without `cfg(test)`, so this
-/// fake cannot be wired into a shipped gateway (OBOL-001) — the compiler enforces it.
+/// fake cannot be wired into a shipped gateway (#17) — the compiler enforces it.
 #[cfg(test)]
 pub struct FakeUpstream {
     status: StatusCode,

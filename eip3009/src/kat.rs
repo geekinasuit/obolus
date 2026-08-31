@@ -218,7 +218,7 @@ fn declared_fields(type_string: &str) -> Vec<(&str, &str)> {
 /// `transfer_struct_hash` must encode its fields in the order and with the types the EIP-3009 type
 /// string declares.
 ///
-/// No published constant exists to check this hash against — that is exactly what OBOL-019 is
+/// No published constant exists to check this hash against — that is exactly what #13 is
 /// about — so this deliberately does not pin a hash the author computed. Instead it rebuilds
 /// `encodeData` straight from the *published* type string, whose own bytes are pinned by
 /// [`typehashes_match_published_constants`], and requires the implementation to agree with it.
@@ -317,7 +317,7 @@ fn every_authorization_field_changes_the_struct_hash() {
 /// The x402 specification's published payload must verify against the Base Sepolia USDC domain.
 ///
 /// The spec publishes the signature and every authorization field but **no** EIP-712 domain, so
-/// this vector was unusable as published (OBOL-019). The domain below was not found by searching:
+/// this vector was unusable as published (#13). The domain below was not found by searching:
 /// it is the single candidate stated in advance — Circle's published Base Sepolia USDC address,
 /// that chain's id, and the FiatTokenV2 name and version — and one trial either matches or does
 /// not.

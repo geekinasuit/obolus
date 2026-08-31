@@ -78,8 +78,7 @@ pub enum GatewayError {
 /// A payment-gated route in front of one upstream service.
 ///
 /// It can advertise several ways to pay at once — one entry per `(scheme, network)`, e.g. Base and
-/// Solana — and settles each request against whichever advertised option the client actually paid
-/// (OBOL-003).
+/// Solana — and settles each request against whichever advertised option the client actually paid.
 pub struct Gateway<F: Facilitator, U: Upstream> {
     facilitator: F,
     upstream: U,
@@ -98,12 +97,12 @@ impl<F: Facilitator, U: Upstream> Gateway<F, U> {
     ///
     /// **That guarantee does not extend to arming, and the asymmetry is deliberate — read it before
     /// relying on the paragraph above.** This constructor does *not* check that the advertised
-    /// networks are testnet. That guard is [`arming::check_arming`](crate::arming::check_arming)
-    /// (OBOL-004), and it is applied by the `obolus` binary at startup, not here. So a caller
+    /// networks are testnet. That guard is [`arming::check_arming`](crate::arming::check_arming),
+    /// and it is applied by the `obolus` binary at startup, not here. So a caller
     /// constructing a `Gateway` directly — the A3 real-facilitator integration tests, a second
     /// binary, an external crate — gets the uniqueness invariant and **not** the arming one, and
     /// must run `check_arming` itself or it will advertise whatever it was handed. Whether that
-    /// should be closed structurally is OBOL-008.
+    /// should be closed structurally is #27.
     pub fn new(
         facilitator: F,
         upstream: U,
@@ -671,7 +670,7 @@ mod tests {
         assert_eq!(body, FakeUpstream::streamed_text(), "the answer itself is untouched");
     }
 
-    // --- multi-chain: many advertised options, client picks one (OBOL-003) -----------------------
+    // --- multi-chain: many advertised options, client picks one ----------------------------------
 
     /// A second advertised option on a DISTINCT network, with its own asset and pay-to, so a test
     /// can tell *which* option the gateway settled against — not merely that it settled.
@@ -871,7 +870,7 @@ mod tests {
         assert!(matches!(err, GatewayError::DuplicateOption { .. }), "got {err:?}");
     }
 
-    // ---- the access branch (OBOL-007) ----
+    // ---- the access branch (#33) ----
     //
     // Every negative case asserts 402 **and** that the upstream was never reached. The status
     // alone cannot tell "refused the token" from "reached the upstream and something else went

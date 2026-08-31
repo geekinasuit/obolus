@@ -1,7 +1,7 @@
 //! The Obolus server binary — wired to a real facilitator and a real Ollama upstream.
 //!
 //! This is live-capable, and testnet-by-construction *unless an operator explicitly arms it*:
-//! startup refuses to advertise any network it cannot prove is testnet (OBOL-004, see
+//! startup refuses to advertise any network it cannot prove is testnet (see
 //! [`obolus::arming`]), and `OBOLUS_ALLOW_MAINNET=1` is the only way past that refusal. Stating the
 //! posture unconditionally would make this doc false on exactly the instance where it matters most.
 //!
@@ -13,7 +13,7 @@
 //!
 //! The Phase-A fakes are absent from this binary on purpose. They are `#[cfg(test)]`-only, so the
 //! `obolus` target — which compiles the library without `cfg(test)` — physically cannot build an
-//! accept-every-payment facilitator or a pretend upstream into a shipped artifact (OBOL-001). The
+//! accept-every-payment facilitator or a pretend upstream into a shipped artifact (#17). The
 //! compiler is the guarantee, not a code review.
 
 use std::net::SocketAddr;
@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
         max_timeout_seconds,
     };
 
-    // One Obolus can advertise several chains at once (OBOL-003). `OBOLUS_ACCEPTS`, when set, is a
+    // One Obolus can advertise several chains at once. `OBOLUS_ACCEPTS`, when set, is a
     // JSON array of `{network, asset, payTo, maxAmountRequired}` — the client picks one from the 402
     // and pays it. Unset, we build the single option from OBOLUS_NETWORK / OBOLUS_ASSET /
     // OBOLUS_PAY_TO / OBOLUS_PRICE. The `(scheme, network)` uniqueness of the resulting set is
@@ -252,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Obolus holds no key, but the 402 challenge it advertises IS the real-money trigger: a
     // cooperating client reads (network, asset, pay-to) out of it and pays against it. So the guard
-    // sits on the advertisement (OBOL-004). Fail-closed against a pinned testnet allowlist — a
+    // sits on the advertisement. Fail-closed against a pinned testnet allowlist — a
     // mainnet id, a typo, or a testnet x402 added after this build all refuse to boot unarmed.
     //
     // Before the banner block below, deliberately: a refused configuration must never first print
@@ -376,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
         // guard on this line rather than an else-branch carrying both cases.
         eprintln!(
             "obolus: testnet-by-construction — every advertised network is on the pinned \
-             testnet allowlist (OBOL-004)."
+             testnet allowlist."
         );
     }
 
@@ -451,7 +451,7 @@ async fn main() -> anyhow::Result<()> {
             (Err(_), Err(_)) => None,
         };
 
-    // The token path (OBOL-007). No key configured means no token path at all: every caller pays,
+    // The token path (#33). No key configured means no token path at all: every caller pays,
     // which is both the previous behaviour and the fail-closed direction to default to.
     let token: Option<TokenPath> = match key_source {
         None => {

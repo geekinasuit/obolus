@@ -4,10 +4,10 @@
   "source": {
     "document": "x402 specification, `exact` scheme (EVM)",
     "retrieved": "2026-08-05",
-    "note": "The `from` address also appears in serving/obolus/src/facilitator.rs's SPEC_VERIFY_* / SPEC_SETTLE_* fixtures, transcribed from the same specification."
+    "note": "The `from` address also appears in obolus/src/facilitator.rs's SPEC_VERIFY_* / SPEC_SETTLE_* fixtures, transcribed from the same specification."
   },
   "domain_provenance": {
-    "problem": "The x402 specification publishes this signature and every authorization field but NO EIP-712 domain — not the name, version, chainId or verifyingContract. As published, the payload is unverifiable: no domain means no separator, no digest, and nothing to check the signature against. That gap is OBOL-019.",
+    "problem": "The x402 specification publishes this signature and every authorization field but NO EIP-712 domain — not the name, version, chainId or verifyingContract. As published, the payload is unverifiable: no domain means no separator, no digest, and nothing to check the signature against. That gap is https://github.com/geekinasuit/obolus/issues/13.",
     "how_it_was_closed": "By one trial, not a search. A single candidate domain was stated in advance — Circle's published Base Sepolia USDC contract address, that chain's id, and the FiatTokenV2 name and version — and tested once. It recovered the payload's `from` address exactly.",
     "why_one_match_settles_it": "A wrong domain produces a different digest and therefore an essentially random recovered address. Agreeing with `from` on all 160 bits is not something a wrong guess does. The published signature is itself the attestation: it can only have been produced over this domain.",
     "why_this_is_not_curve_fitting": "The distinction is pre-registration, not luck. Searching candidate domains until one verifies would eventually match something and prove nothing, because the test would have been fitted to pass. One candidate, named before the run, either matches or does not.",

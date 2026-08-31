@@ -7,7 +7,7 @@ AI or agentic service: it answers an unpaid request with a real HTTP 402 challen
 per-request USDC micropayment, and grants passage to the model behind it. The first service it
 guards is local **Ollama** inference.
 
-Tracked as **OBOL-001**.
+Tracked as [#17](https://github.com/geekinasuit/obolus/issues/17).
 
 ## Standing alone
 
@@ -26,8 +26,8 @@ because there is no signing path to misuse.
 | | |
 |---|---|
 | **Shipped (A0–A2)** | 402 challenge, `X-PAYMENT` / `X-PAYMENT-RESPONSE` codec, the `Facilitator` and `Upstream` seams, the fakes, the wired gateway |
-| **Shipped (A3 rewire)** | The real HTTP clients wired into the `obolus` binary: `DelegatedFacilitator` (delegates `/verify` + `/settle` to a facilitator you point it at) and `OllamaUpstream` (proxies a real Ollama). The fakes are now `#[cfg(test)]`-only, so no shipped binary can select "accept every payment + real model". Live-path hardening addressed: upstream head deadline (OBOL-002 item 1), settle deadline derived from `maxTimeoutSeconds` (item 4), pooled-retry double-settle disabled (item 6) |
-| **Next (A3 e2e + fast-follows)** | The post-merge **cron** that settles a real testnet payment against a third-party facilitator (touches the network, so cron-only, never per-PR). Plus the remaining OBOL-002 fast-follows: output/generation caps (item 2), settle-failure body drain/abort (item 3), and the 4xx-verdict contract confirmation (item 5, observable only against a live facilitator) |
+| **Shipped (A3 rewire)** | The real HTTP clients wired into the `obolus` binary: `DelegatedFacilitator` (delegates `/verify` + `/settle` to a facilitator you point it at) and `OllamaUpstream` (proxies a real Ollama). The fakes are now `#[cfg(test)]`-only, so no shipped binary can select "accept every payment + real model". Live-path hardening addressed: upstream head deadline ([#31](https://github.com/geekinasuit/obolus/issues/31) item 1), settle deadline derived from `maxTimeoutSeconds` (item 4), pooled-retry double-settle disabled (item 6) |
+| **Next (A3 e2e + fast-follows)** | The post-merge **cron** that settles a real testnet payment against a third-party facilitator (touches the network, so cron-only, never per-PR). Plus the remaining [#31](https://github.com/geekinasuit/obolus/issues/31) fast-follows: output/generation caps (item 2), settle-failure body drain/abort (item 3), and — both answerable only on the first live round-trip — the 4xx-verdict contract confirmation (item 5) and whether the upstream head deadline can outlast the advertised payment window (item 7) |
 | **Later (Phase B)** | A self-settling facilitator that verifies and submits on-chain itself — additive behind the same seam, gated separately |
 
 The payment payload is **opaque** to Phase A: we decode the envelope (version / scheme /
@@ -96,9 +96,9 @@ Configuration is by environment variable:
 | `OBOLUS_PAY_TO` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_ASSET` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_DESCRIPTION` | `One inference request` | Free text shown in the challenge. |
-| `OBOLUS_ALLOW_MAINNET` | unset | **Arming flag.** Unset, Obolus refuses to start if **any** advertised `network` is not on its pinned testnet allowlist — a mainnet id, a typo, or a testnet x402 added after this build. Set to exactly `1` to advertise one anyway; the startup log then carries a `*** MAINNET ARMED ***` banner naming every unproven network. Anything other than `1` (`true`, `yes`, empty) does **not** arm — the safe direction for a typo. See [Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network-obol-004). |
-| `OBOLUS_ACCEPTS` | unset | **Multi-chain override.** A JSON array of `{"network","asset","payTo","maxAmountRequired"}` objects — one per chain — advertised together in a single 402; the client picks one to pay. When set it **supersedes** the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` vars — and setting both at once is a **startup error** (the single-chain values would be inert, so the server refuses rather than advertise a config you did not intend). At most one entry per `(scheme, network)`; see [Advertising more than one chain](#advertising-more-than-one-chain-obol-003). |
-| `OBOLUS_TOKEN_PUBKEY_FILE` | unset | **Turns the bearer-token path on.** Path to an Ed25519 **public** key in PEM (`openssl pkey -pubout`). Unset, there is no token path at all and every caller pays — the previous behaviour. Set, a caller presenting a token this key verifies is served without paying; everyone else still gets the 402. A file that is missing or is not an Ed25519 public key is a startup error, not a per-request one — and so is setting this to an empty string, which would otherwise ask for a token path while naming no key to build one from. See [Serving without payment](#serving-without-payment-obol-007). |
+| `OBOLUS_ALLOW_MAINNET` | unset | **Arming flag.** Unset, Obolus refuses to start if **any** advertised `network` is not on its pinned testnet allowlist — a mainnet id, a typo, or a testnet x402 added after this build. Set to exactly `1` to advertise one anyway; the startup log then carries a `*** MAINNET ARMED ***` banner naming every unproven network. Anything other than `1` (`true`, `yes`, empty) does **not** arm — the safe direction for a typo. See [Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network). |
+| `OBOLUS_ACCEPTS` | unset | **Multi-chain override.** A JSON array of `{"network","asset","payTo","maxAmountRequired"}` objects — one per chain — advertised together in a single 402; the client picks one to pay. When set it **supersedes** the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` vars — and setting both at once is a **startup error** (the single-chain values would be inert, so the server refuses rather than advertise a config you did not intend). At most one entry per `(scheme, network)`; see [Advertising more than one chain](#advertising-more-than-one-chain). |
+| `OBOLUS_TOKEN_PUBKEY_FILE` | unset | **Turns the bearer-token path on.** Path to an Ed25519 **public** key in PEM (`openssl pkey -pubout`). Unset, there is no token path at all and every caller pays — the previous behaviour. Set, a caller presenting a token this key verifies is served without paying; everyone else still gets the 402. A file that is missing or is not an Ed25519 public key is a startup error, not a per-request one — and so is setting this to an empty string, which would otherwise ask for a token path while naming no key to build one from. See [Serving without payment](#serving-without-payment). |
 | `OBOLUS_TOKEN_KEYS` | unset | **The multi-key form, for rotation.** A JSON array of `{"kid": "...", "file": "..."}` objects; `kid` is optional. Supersedes `OBOLUS_TOKEN_PUBKEY_FILE`, and setting **both is a startup error** — the superseded one would sit inert, and an inert *verifying* key says nothing until a token signed with it is refused. A token naming a `kid` is checked against that key first, but a `kid` that matches nothing (or is absent) does not reject the token: it is checked against the rest of the set. At most 8 keys, no `kid` repeated, no key armed twice, every named file readable — each a startup error naming the offending entry. Set-but-empty (or whitespace-only) is its own startup error rather than the both-set one, since an array that arrived empty configures nothing. See [Rotating the signing key](#rotating-the-signing-key). |
 | `OBOLUS_TOKEN_ISSUER` | **required with the keys** | The exact `iss` every honoured token must carry. Not optional and has no default: a signing key usually belongs to an identity provider rather than to one service, so with nothing to check `iss` against, every token that key has ever minted — for any audience — would buy inference here. Setting the key without this, or setting it empty, is a startup error — as is setting **this** without the key, which would otherwise be a silent no-op that 402s every caller while looking configured. |
 | `OBOLUS_TOKEN_AUDIENCE` | unset | The `aud` an honoured token must carry. Set it and `aud` is both **checked and required**. **Leave it unset and a token carrying *any* `aud` is refused** — which is most IdP-issued tokens, so this is the setting to reach for when a token that should work does not. Refusing is deliberate rather than an oversight: `aud` names the service a token was minted for, and a verifier with no expected audience cannot tell "minted for us" from "minted for the wiki". Set-but-empty is a startup error, and so is setting it without `OBOLUS_TOKEN_KEYS` or `OBOLUS_TOKEN_PUBKEY_FILE`. |
@@ -125,7 +125,7 @@ empty value takes the multi-chain door and configures nothing, while still super
 single-chain variable — so the refusal says exactly that and tells you to unset it, rather than
 handing you a JSON parser error about column 1 for a value you never meant to be JSON.
 
-## Refusing to advertise an unproven network (OBOL-004)
+## Refusing to advertise an unproven network
 
 Obolus holds no key and signs nothing. But the 402 challenge it emits **is** the real-money trigger:
 a cooperating client reads `(network, asset, pay-to)` out of it and pays against that. So "can this
@@ -153,8 +153,9 @@ network not on it refuses to boot unless `OBOLUS_ALLOW_MAINNET=1`.
 - **Comparison is byte-exact.** What the guard checks must be byte-identical to what the gateway
   advertises, or there is a gap between the verified state and the served one. A case- or
   whitespace-variant of a testnet id is therefore *not* recognised and fails closed. Normalising it
-  is OBOL-005's job, and it belongs upstream in `config::validated_option` — the single per-option
-  seam **both** configuration forms go through — so the *stored* string becomes the canonical one.
+  belongs upstream in `config::validated_option` ([#14](https://github.com/geekinasuit/obolus/issues/14))
+  — the single per-option seam **both** configuration forms go through — so the *stored* string
+  becomes the canonical one.
   Not in `parse_accepts`: that is one of the two sites that build a payment option, and the other
   (the single-chain arm of `main`, which this README's own quickstart uses) would have been left
   raw.
@@ -237,7 +238,7 @@ Note the scope of that sentence: it is about what the **guard** can prove, not a
 only an empty network, so the value is advertised and matched verbatim like any other. An operator who
 arms past this refusal has a live rail, not a dead one.
 
-## Advertising more than one chain (OBOL-003)
+## Advertising more than one chain
 
 A single Obolus can offer several chains at once — for example Base and Solana. Set `OBOLUS_ACCEPTS`
 to a JSON array with one object per chain:
@@ -286,9 +287,10 @@ startup error, naming the ignored vars — a gateway that silently advertises a 
 its operator configured is exactly the surprise to fail loudly on. It stays
 **testnet-by-construction** the same way the single-chain vars do — Obolus has no signing path, so it
 can advertise a challenge but never move funds itself. (A startup guard that refuses to *advertise* a
-non-testnet network unless explicitly armed is tracked separately as OBOL-004.)
+non-testnet network unless explicitly armed is a separate protection — see
+[Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network).)
 
-## Serving without payment (OBOL-007)
+## Serving without payment
 
 Payment is not the only reason to serve a request. An operator running Obolus in front of their own
 model wants their own clients served directly, and wants strangers to pay — so Obolus takes a bearer
@@ -374,7 +376,7 @@ mint nothing. The Phase-A "holds no credential" posture is about key custody and
 intact.
 
 Not in this slice: revocation, token minting, per-token rate limits or accounting, and any
-distinction between token-holders. See OBOL-007.
+distinction between token-holders. See [#33](https://github.com/geekinasuit/obolus/issues/33).
 
 ## The fake is never a gate
 

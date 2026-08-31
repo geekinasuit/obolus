@@ -19,7 +19,7 @@
 //! what that means: it is a **check this library offers, not an invariant this library enforces**.
 //! `Gateway::new` does not call it. The `obolus` binary does, at startup, before constructing the
 //! gateway. A different consumer of this library could build a `Gateway` advertising anything at all
-//! (see OBOL-008 on whether that should be closed structurally).
+//! (see #27 on whether that should be closed structurally).
 
 pub mod access;
 pub mod arming;
