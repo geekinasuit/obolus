@@ -37,7 +37,7 @@ jobs:
       - name: Reject references to absent note paths
         run: |
           if git grep -nE '(\.\./)*thoughts/[A-Za-z0-9_.-]' -- . ':!.github/workflows/ci.yml' ':!.gitignore'; then
-            echo "::error::Source refers to a path that is not in this repository. Cite the GitHub issue (#N) instead, or drop the reference entirely — content that cannot be public does not become an issue."
+            echo "::error::Source refers to a path that is not in this repository. Cite the GitHub issue instead — AGENTS.md gives the citation form for the kind of file you are in — or drop the reference entirely; content that cannot be public does not become an issue."
             exit 1
           fi
           echo "No references to absent note paths."
