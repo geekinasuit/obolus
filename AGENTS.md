@@ -70,12 +70,17 @@ third-party facilitator — runs out of band, so its flakiness cannot block the 
   without needing access to anything else. Cite them as `#42`, and `fixes #42` in a pull request
   really does close the issue on merge. GitHub renders that short form as a link only in
   conversations — issues, pull requests, commit messages — and explicitly not in the files of a
-  repository, so the citation takes two forms here. In `README.md`, read on the web by people who
-  have no checkout, write a full Markdown link. In source comments write the bare `#42`: it does
-  not render, but a contributor reading the file has the repository in front of them and there is
-  only one tracker it can mean. Never cite `OBOL-NNN` — those are the retired private tracker's
-  ids, and nothing in this repository resolves them. Filing is public and permanent, edit history
-  included; an issue body is not something you can quietly take back.
+  repository, so which form to write depends on two things about where it will be read: whether the
+  reader has this repository, and whether the text gets rendered. Prose rendered on the web —
+  `README.md` and everything under `docs/` — takes a full link. Source comments take the bare
+  `#42`: nothing renders it, but a contributor reading the file has the repository in front of them
+  and there is only one tracker it can mean. Anything that is neither — a fixture a second
+  implementer reads without building this repository, a string a running binary prints — takes the
+  full URL written out, or no citation at all. A Markdown heading takes no citation either: its
+  text becomes the anchor, so an id embedded there ends up in every link that points at it. Never
+  cite `OBOL-NNN` — those are the retired private tracker's ids, and nothing in this repository
+  resolves them. Filing is public and permanent, edit history included; an issue body is not
+  something you can quietly take back.
 - **Anything that cannot be a public issue stays out of the repository entirely.** Session
   handoffs, research that depends on infrastructure not published here, plans that would leak
   something. Those belong in an untracked `thoughts/` directory, which is gitignored *and* enforced

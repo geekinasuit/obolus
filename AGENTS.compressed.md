@@ -20,7 +20,7 @@ every test hermetic(no network|chain|model)=the ONLY merge gate; external realit
 §PUBLIC [repo is PUBLIC — these are not style preferences]
 tickets|research|plans = GitHub issues ON THIS REPO [part of the project, not a private layer beside it→anyone reads the reasoning behind a change w/o other access]
   cite as `#42`; `fixes #42` in a PR really closes the issue on merge
-  `#42` RENDERS AS A LINK ONLY IN CONVERSATIONS(issues|PRs|commit msgs), NOT in a repo's FILES → 2 forms here: README(read on the web w/o a checkout)=full Markdown link | source comments=bare `#42`(doesn't render, but the reader has the repo + there's one tracker it can mean)
+  `#42` RENDERS AS A LINK ONLY IN CONVERSATIONS(issues|PRs|commit msgs), NOT in a repo's FILES → form depends on 2 things about WHERE IT'S READ: does the reader have this repo + does the text RENDER. prose rendered on the web(`/README.md` + everything under docs/)=full link | source comments=bare `#42`(nothing renders it, but the reader has the repo + there's one tracker it can mean) | NEITHER(a fixture a 2nd implementer reads w/o building this repo, a string a running binary prints)=full URL written out or NO citation | MARKDOWN HEADING=no citation(text becomes the anchor→an id there lands in every link pointing at it)
   NEVER cite `OBOL-NNN` = the retired private tracker's ids; nothing here resolves them
   filing = PUBLIC+PERMANENT, edit history included; an issue body can't be quietly taken back
 anything that CANNOT be a public issue stays OUT of the repo ENTIRELY: session handoffs | research depending on infra not published here | plans that would leak something
