@@ -267,6 +267,24 @@ async fn main() -> anyhow::Result<()> {
     let armed = std::env::var("OBOLUS_ALLOW_MAINNET").as_deref() == Ok("1");
     let unproven_networks = check_arming(&requirements, armed)?;
 
+    // The second check on the advertised option set, beside the first because they read the same
+    // value: `new` rejects an empty set, and two options sharing (scheme, network) — a pair no
+    // payment envelope can tell apart, so the second entry is unreachable and a payment matching it
+    // could be settled against the wrong asset.
+    //
+    // Here rather than at the wiring site below, for the reason the guard above is here: a
+    // configuration this process is about to refuse must not first be advertised. Past this point
+    // the banner block prints the option set *and*, on the all-testnet path, the line saying every
+    // advertised network is on the allowlist — an all-clear for a startup that never happens.
+    // `a_duplicate_option_refuses_before_advertising_anything` in tests/server_arming.rs runs this
+    // binary and fails if the call moves below it.
+    //
+    // The clone is what the constructor's ownership costs. The banner reports what was configured
+    // and `new` takes the vector, so the two cannot be the same value — but they cannot drift
+    // either: the copy is taken here and neither side is mutated afterwards.
+    let gateway = Gateway::new(facilitator, upstream, requirements.clone())
+        .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
+
     // "starting on", not "listening on" — the bind is ~100 lines below and every check between here
     // and there can still refuse. A posture line an operator trusts must be true *where it is
     // printed*, and "listening" was false on every failed bind (port in use, privileged port, an
@@ -528,13 +546,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // `new` rejects an empty option set or two options sharing (scheme, network) — a
-    // misconfiguration that would otherwise settle the wrong asset. Fail here, at startup.
-    let access = Access::new(
-        Gateway::new(facilitator, upstream, requirements)
-            .map_err(|e| anyhow::anyhow!("payment options: {e}"))?,
-        token,
-    );
+    let access = Access::new(gateway, token);
 
     // Read off the access surface, not off the configuration that built it — and printed before
     // `router` consumes it. This file is compiled by no test target, so anything keyed on a local

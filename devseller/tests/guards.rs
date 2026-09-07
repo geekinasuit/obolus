@@ -88,6 +88,15 @@ const SYNTHETIC_ASSET: &str = "0x0000000000000000000000000000000000000000";
 /// the wrong one of the pair would still pass every assertion here.
 const SYNTHETIC_PAY_TO: &str = "0x000000000000000000000000000000000000dead";
 
+/// A second syntactically valid asset, for the one fixture that needs two *distinct* assets on a
+/// single network. Same disclaimer as [`SYNTHETIC_ASSET`]: parseable, not plausible.
+///
+/// Distinct from both of its neighbours on purpose. A duplicate-option fixture whose two entries
+/// matched in every field would also be refused, but by a check that could be comparing whole
+/// entries rather than `(scheme, network)` — and the whole point of that refusal is that the pair is
+/// indistinguishable on the envelope *despite* naming different assets.
+const SECOND_SYNTHETIC_ASSET: &str = "0x000000000000000000000000000000000000beef";
+
 /// The built-in `payTo`, which `obolus` boots on and this binary refuses. Not an address at all, so
 /// the refusal is about being unpayable rather than about being the wrong recipient.
 const PLACEHOLDER_PAY_TO: &str = "0xTEST-PAY-TO-ADDRESS-NOT-REAL";
@@ -178,6 +187,22 @@ impl Run {
     /// which is how it terminated at all).
     fn must_have_got_past_startup(&self) {
         self.must_say(PAST_STARTUP);
+    }
+
+    /// The advertised option set was refused: the binary bailed for the stated reason, and
+    /// advertised nothing on the way.
+    ///
+    /// Deliberately **not** [`Self::must_have_refused_during_startup`]. That one asserts the absence
+    /// of [`PAST_STARTUP`], which `main` prints as soon as the guard block passes — and the payment
+    /// options are constructed after that line, because the constructor consumes the upstream and
+    /// the token domain that the announcements in between still have to report. Reusing that helper
+    /// would assert something false by construction. What distinguishes this refusal is the bail
+    /// plus the absence of [`ADVERTISEMENT_LINE`]: the process aborted, and never claimed to be
+    /// advertising anything first.
+    fn must_have_refused_the_option_set(&self, because: &str) {
+        self.must_say(BAILED);
+        self.must_say(because);
+        self.must_not_say(ADVERTISEMENT_LINE);
     }
 }
 
@@ -433,6 +458,32 @@ fn a_mainnet_hidden_among_testnets_refuses_to_start() {
 
     run.must_say("not on Obolus's pinned testnet allowlist");
     run.must_have_refused_during_startup();
+}
+
+/// Two entries on one network, which `Gateway::new` refuses: a payment envelope carries only
+/// `(scheme, network)`, so the second entry is unreachable and a payment matching the pair could be
+/// settled against the wrong asset.
+///
+/// This is the fixture that can see where the constructor sits. Every other refusal in this file is
+/// reached from the guard block, which is above the banner either way — so all of them hold with
+/// `Gateway::new` on either side of it. This is the one configuration that passes every guard and is
+/// rejected by the constructor, which makes it the only test here that fails if the call moves back
+/// below the advertisement.
+#[test]
+fn a_duplicate_option_refuses_before_advertising_anything() {
+    let accepts = format!(
+        r#"[
+            {{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
+             "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}},
+            {{"network":"{TESTNET}","asset":"{SECOND_SYNTHETIC_ASSET}",
+             "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}}
+        ]"#
+    );
+    let run = run_accepts(&accepts);
+
+    // The refusal's own wording carries no `(s)`, unlike [`ADVERTISEMENT_LINE`] — so the positive
+    // and the negative inside the assertion cannot be satisfied by the same line.
+    run.must_have_refused_the_option_set("duplicate payment option");
 }
 
 /// The override `obolus` has and this binary deliberately does not.

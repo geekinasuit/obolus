@@ -415,6 +415,27 @@ async fn main() -> anyhow::Result<()> {
              that address."
         );
     }
+
+    // The last configuration check, and the one that cannot sit in the guard block above: it
+    // consumes the upstream and the token domain, both of which the lines between there and here
+    // still have to report. `new` rejects an empty option set, and two options sharing
+    // (scheme, network) — a pair no payment envelope can tell apart, so the second entry is
+    // unreachable and a payment matching it could be settled against the wrong asset.
+    //
+    // Above the banner rather than below it, for the reason that block states: a configuration this
+    // process is about to refuse must never first be announced as one it is advertising.
+    // `a_duplicate_option_refuses_before_advertising_anything` in tests/guards.rs runs this binary
+    // and fails if the call moves past the banner.
+    //
+    // The clone is what the constructor's ownership costs — it takes the vector, and the banner
+    // below reports what was configured. Neither copy is mutated afterwards, so they cannot drift.
+    let gateway = Gateway::new(
+        facilitator::DevFacilitator::new(dev.verify, dev.settle, token),
+        upstream,
+        requirements.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
+
     eprintln!("obolus-devseller: advertising {} payment option(s):", requirements.len());
     for r in &requirements {
         eprintln!(
@@ -422,13 +443,6 @@ async fn main() -> anyhow::Result<()> {
             r.network, r.asset, r.pay_to, r.max_amount_required
         );
     }
-
-    let gateway = Gateway::new(
-        facilitator::DevFacilitator::new(dev.verify, dev.settle, token),
-        upstream,
-        requirements,
-    )
-    .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
 
     // No token path: this binary's whole purpose is exercising the *payment* path, and a bearer
     // token is the way to skip it.
