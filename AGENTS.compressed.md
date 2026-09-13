@@ -31,13 +31,19 @@ write issues+PRs for BOTH audiences(agents+humans read them; padding serves neit
 public depends only on public: no internal/private repo dep; no sideways reach into sibling project; needed internal code→publish or reimplement first
 CI on GitHub-hosted runners ONLY; NEVER runs-on:self-hosted [public repo→PR runs stranger's code; self-hosted not isolated enough]; workflow token read-only
 
-§INVARIANTS [load-bearing; each test-enforced; each easy to break while improving something else]
-no cryptography in gateway crate: Phase A delegates verify+settle to facilitator behind Facilitator seam; no sig checking|key handling|on-chain submission
+§INVARIANTS [load-bearing; each easy to break while improving something else; NOT all held the same way→each entry ends w/ HELD: how, so a reader assuming a test exists doesn't go looking]
+no PAYMENT cryptography in gateway crate: Phase A delegates verify+settle to facilitator behind Facilitator seam; nothing checks a payment sig|holds a payment key|submits to a chain
   ∴ not mainnet-capable BY CONSTRUCTION(no signing path to misuse); payment payload OPAQUE(decode envelope, forward inner authorization untouched)
+  bearer-token path OUTSIDE this rule on purpose: verifies operator-issued access tokens w/ jsonwebtoken against public keys(check a sig, can't mint one), reaches no chain
+  HELD: not checked directly — next entry closes the one route a payment verifier already has; a new|hand-rolled one would pass
 eip3009 deliberately NOT a dep of //obolus:obolus [exists for offline verification+dev stubs; wiring it in = quietly giving the binary a crypto path]
+  HELD: CI — a step in each of the bazel+cargo jobs fails the build if the crate enters the gateway's dep graph under that build; guard names eip3009, does NOT stop a sig crate added directly
 fakes are #[cfg(test)]-only: FakeFacilitator accepts unexamined payments, FakeUpstream serves canned bytes; physically absent from shipped artifacts→no config selects "accept every payment + serve real model"
+  HELD: by the compiler, not checked — attribute keeps them out of a non-test build by construction; nothing fails if it's removed
 arming-guard allowlist = TRANSCRIPTION of upstream source, not curated list; x402 adds a testnet→add to TESTNET_NETWORKS in obolus/src/arming.rs as reviewed code change; NEVER work around w/ OBOLUS_ALLOW_MAINNET [operator setting flag as routine ceremony has already lost the protection]
+  HELD: not checked — server_arming_test proves the guard fires, not that the list matches upstream; #29 tracks making staleness mechanical
 nothing we author decides whether a signer is correct [we'd author both sides→shared EIP-712 domain-separator misunderstanding makes both agree while real facilitator rejects]; load-bearing checks OUTSIDE our authorship: published KAT vectors + real testnet settle vs 3rd-party facilitator
+  HELD: in part, by design — vectors run in eip3009_test; testnet settle deliberately outside the merge gate(a hermetic gate can't contain it)
 
 §DOCS
 two-form: <name>.md(human) + <name>.compressed.md(token-efficient, lossless); agents prefer compressed

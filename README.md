@@ -19,9 +19,9 @@ Two rules apply to every change here:
 ## Status: Phase A, and what that means
 
 Phase A speaks the protocol and **delegates** verification and settlement to a facilitator
-behind the `Facilitator` seam. There is **no cryptography in this crate** — no signature
-checking, no key handling, no on-chain submission. It is not mainnet-capable by construction,
-because there is no signing path to misuse.
+behind the `Facilitator` seam. There is **no payment cryptography in this crate** — it checks no payment
+signature, holds no payment key, and makes no on-chain submission. It is not mainnet-capable by
+construction, because there is no signing path to misuse.
 
 | | |
 |---|---|
