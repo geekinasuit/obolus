@@ -154,6 +154,20 @@ const ACCEPTS_ONE_TESTNET: &str = r#"[
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
 ]"#;
 
+/// Two entries sharing one network — the misconfiguration `Gateway::new` refuses, because a payment
+/// envelope carries only `(scheme, network)` and the pair cannot be told apart when a payment
+/// arrives.
+///
+/// The two assets differ deliberately. Entries identical in every field would also be refused, but
+/// by a check that could be comparing whole entries; the claim is that the pair is indistinguishable
+/// on the envelope *despite* naming different assets.
+const ACCEPTS_DUPLICATE_NETWORK: &str = r#"[
+    {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"},
+    {"network":"eip155:84532","asset":"0xSECOND-TEST-ASSET-ADDRESS-NOT-REAL",
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
+]"#;
+
 /// A perfectly good Base Sepolia entry *plus* one naming the built-in placeholder. The only way an
 /// operator reaches `UNCONFIGURED NETWORK`'s third enumerated state.
 const ACCEPTS_TESTNET_PLUS_PLACEHOLDER: &str = r#"[
@@ -456,6 +470,27 @@ fn a_refusal_never_advertises_anything_first() {
 
     run.must_not_say(ADVERTISEMENT_LINE);
     run.must_not_say("MAINNET ARMED");
+    run.must_not_say(ALL_CLEAR_CLAIM);
+}
+
+/// The same claim for the *other* refusal that inspects the advertised option set.
+///
+/// `check_arming` above and `Gateway::new` here are the two checks that read `requirements`, and the
+/// test above pins only the first. No other test in this file builds an option set the constructor
+/// rejects, so with that coverage alone the constructor can sit anywhere — below the banner
+/// included — and the whole suite stays green.
+#[test]
+fn a_duplicate_option_refuses_before_advertising_anything() {
+    let run = run(&[("OBOLUS_ACCEPTS", ACCEPTS_DUPLICATE_NETWORK)]);
+
+    // `duplicate payment option` carries no `(s)`, so it cannot satisfy the [`ADVERTISEMENT_LINE`]
+    // absence asserted below — the same needle-collision hazard that constant documents.
+    run.must_say("duplicate payment option");
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+    // The all-clear is the sharper half of the claim on this fixture. Every advertised network here
+    // *is* on the allowlist, so the posture line is the one thing a refused run could still print
+    // truthfully — and printing it for a startup that does not happen is what the ordering prevents.
     run.must_not_say(ALL_CLEAR_CLAIM);
 }
 
