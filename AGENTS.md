@@ -101,27 +101,41 @@ third-party facilitator — runs out of band, so its flakiness cannot block the 
 
 ## Invariants worth knowing before you change things
 
-These are load-bearing. Each one is enforced by a test, and each is easy to break while making
-something else better.
+These are load-bearing, and each is easy to break while making something else better. They are not
+all held the same way, so each entry ends by saying how it is held — a reader who assumes a test
+exists should not have to go looking for one.
 
-- **No cryptography in the gateway crate.** Phase A delegates verification and settlement to a
-  facilitator behind the `Facilitator` seam. There is no signature checking, no key handling, and no
-  on-chain submission — so the binary is not mainnet-capable by construction, because there is no
-  signing path to misuse. The payment payload is opaque: we decode the envelope and forward the
-  inner authorization untouched.
+- **No payment cryptography in the gateway crate.** Phase A delegates verification and settlement
+  to a facilitator behind the `Facilitator` seam. Nothing in the gateway checks a payment
+  signature, holds a payment key, or submits to a chain — so the binary is not mainnet-capable by
+  construction, because there is no signing path to misuse. The payment payload is opaque: we
+  decode the envelope and forward the inner authorization untouched. The bearer-token path is
+  outside this rule on purpose: it verifies operator-issued access tokens with `jsonwebtoken`,
+  against public keys that check a signature but cannot mint one, and it reaches no chain. *Not checked directly.* The next entry closes the
+  one route a payment verifier already has into this crate; a new one, or a hand-rolled one, would
+  pass.
 - **`eip3009` is deliberately not a dependency of `//obolus:obolus`.** It exists for offline verification
   and development stubs. Wiring it into the gateway would quietly give the binary a crypto path.
+  *Checked in CI.* A step in each of the `bazel` and `cargo` jobs fails the build if the crate
+  enters the gateway's dependency graph under that build. The guard names `eip3009`; it does not
+  stop a signature crate being added directly.
 - **The fakes are `#[cfg(test)]`-only.** `FakeFacilitator` accepts payments it never examined and
   `FakeUpstream` serves canned bytes. They are physically absent from every shipped artifact, so no
-  configuration can select "accept every payment and serve the real model."
+  configuration can select "accept every payment and serve the real model." *Held by the compiler,
+  not checked.* The attribute keeps them out of a non-test build by construction, but nothing fails
+  if the attribute is removed.
 - **The arming guard's allowlist is a transcription of an upstream source**, not a curated list.
   When x402 adds a testnet, add it to `TESTNET_NETWORKS` in `obolus/src/arming.rs` as a reviewed code
   change — never work around it with `OBOLUS_ALLOW_MAINNET`. An operator who sets that flag as
-  routine ceremony has already lost the protection it exists to provide.
+  routine ceremony has already lost the protection it exists to provide. *Not checked.*
+  `server_arming_test` proves the guard fires, not that the list still matches upstream; #29
+  tracks making staleness mechanical.
 - **Nothing we author decides whether a signer is correct.** We would author both sides of any
   self-check, so a shared misunderstanding of the EIP-712 domain separator would make both agree
   while a real facilitator still rejects. The load-bearing checks are outside our authorship:
   published known-answer vectors, and a real testnet settle against a third-party facilitator.
+  *Checked in part, by design.* The vectors run in `eip3009_test`; the testnet settle is
+  deliberately outside the merge gate, since a hermetic gate cannot contain it.
 
 ## Documentation convention
 

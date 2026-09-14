@@ -6,7 +6,7 @@
 //! facilitator answers on the `/verify` path.
 //!
 //! It is deliberately **not** a dependency of the `obolus` binary. That gateway delegates
-//! verification to a facilitator and never inspects a signature itself, so pulling secp256k1 into its
+//! verification to a facilitator and never inspects a payment signature itself, so pulling secp256k1 into its
 //! graph would widen the shipped artifact's attack surface for something it does not do.
 //!
 //! The rule is scoped to that binary, not to this crate's consumers in general — it is about what the

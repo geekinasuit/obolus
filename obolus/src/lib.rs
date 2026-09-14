@@ -9,9 +9,9 @@
 //!
 //! This crate currently implements Phase A: it speaks the protocol and **delegates** payment
 //! verification and settlement to a facilitator behind the [`facilitator::Facilitator`] seam.
-//! It contains no cryptography of its own — no signature checking, no key handling, no
-//! on-chain submission. Phase B adds a self-settling facilitator behind that same seam without
-//! touching the gateway.
+//! It contains no payment cryptography of its own — it checks no payment signature, holds no
+//! payment key, and makes no on-chain submission. Phase B adds a self-settling facilitator behind
+//! that same seam without touching the gateway.
 //!
 //! Nothing here is mainnet-capable by construction: there is no signing path to misuse. That covers
 //! what Obolus can *do*. The other half of the posture is what it *advertises*, since a 402 challenge

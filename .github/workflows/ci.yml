@@ -54,6 +54,29 @@ jobs:
           disk-cache: ${{ github.workflow }}
           repository-cache: true
 
+      # AGENTS.md's invariant that `eip3009` is not a dependency of the gateway binary. Two places
+      # said so in prose and nothing checked it: a `deps` entry compiles clean and passes every gate,
+      # which is how the gateway would acquire a signature verifier without anyone deciding to give
+      # it one. Before the test step, so a violation costs seconds rather than a suite. Not repeated
+      # in the macOS job: the dependency graph does not vary by platform.
+      #
+      # The pass condition is empty output, not exit status. `somepath` exits 0 and prints nothing
+      # when there is no path — but it also exits non-zero for a query it could not load at all, and
+      # a mistyped label must fail loudly rather than read as clean. This is the Bazel half; the
+      # cargo job below carries the other, and both must hold.
+      - name: eip3009 is not a gateway dependency
+        run: |
+          if ! bazel query 'somepath(//obolus:obolus, //eip3009)' > "$RUNNER_TEMP/somepath.txt"; then
+            echo "::error::Could not evaluate the dependency query; check the target labels."
+            exit 1
+          fi
+          if [ -s "$RUNNER_TEMP/somepath.txt" ]; then
+            cat "$RUNNER_TEMP/somepath.txt"
+            echo "::error::eip3009 has entered //obolus:obolus's dependency graph. The gateway delegates verification to a facilitator and carries no payment crypto — see AGENTS.md."
+            exit 1
+          fi
+          echo "No path from //obolus:obolus to //eip3009."
+
       # The canonical build. Every test here is hermetic — no network, no chain, no model — so this
       # is the gate that decides a merge; anything touching external reality runs outside it.
       - name: Test
@@ -102,6 +125,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # The cargo half of the `eip3009` invariant the bazel job checks above, and the half that
+      # matters more: cargo declares dependencies per package, so an `eip3009` entry in
+      # obolus/Cargo.toml would put signature verification in the gateway's own graph — the
+      # constraint that forced the dev seller into its own package rather than a second binary
+      # beside the gateway. `--edges normal` keeps only normal dependencies — it excludes both dev-
+      # and build-dependencies, neither of which ships in the gateway binary. `cargo tree` also resolves
+      # for the host target only; the bazel `somepath` query above is configuration-agnostic and sees
+      # every `select()` branch, so together the two halves also cover a dependency a target-gated `cfg`
+      # would hide from this one.
+      #
+      # The probe and the match are separate steps, as in the bazel job: piped straight into grep, a
+      # `cargo tree` that cannot run — a stale lockfile, say — hands grep nothing, the pipeline fails,
+      # the `if` is false, and the step reports a clean tree. And the match is "grep found it", not a
+      # count: `grep -c` exits non-zero on a count of zero, which is the passing case. The pattern anchors
+      # on a dependency node — line start or a space, then `eip3009 v<version>` — so it matches the crate
+      # where `cargo tree` lists it, not the string `eip3009` in the checkout path the tool prints on its
+      # root line.
+      - name: eip3009 is not a gateway dependency
+        run: |
+          if ! cargo tree --package obolus --edges normal --locked > "$RUNNER_TEMP/obolus-tree.txt"; then
+            echo "::error::Could not build the obolus dependency tree; is Cargo.lock current?"
+            exit 1
+          fi
+          if grep -E '(^|[[:space:]])eip3009 v[0-9]' "$RUNNER_TEMP/obolus-tree.txt"; then
+            echo "::error::eip3009 has entered the obolus package's dependency graph. The gateway delegates verification to a facilitator and carries no payment crypto — see AGENTS.md."
+            exit 1
+          fi
+          echo "obolus's normal dependency graph is free of eip3009."
 
       # The other half of the dual build. Bazel above is canonical and cargo is the ergonomic path,
       # but AGENTS.md names both as merge gates, so both run here rather than one of them running
