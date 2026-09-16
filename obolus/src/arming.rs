@@ -256,8 +256,10 @@ pub struct NotProvablyTestnet {
     /// emitted, never the first that matches — they overlap in both directions (a trailing U+00A0 is
     /// both a near-miss and non-ASCII; a short name with a homoglyph is both non-CAIP-2 and
     /// non-ASCII) and each names a different thing to fix. Suppressing later kinds is an easy defect
-    /// to reintroduce, so [`diagnose`] runs independent passes and both overlap directions have
-    /// regression tests.
+    /// to reintroduce, so [`diagnose`] runs independent passes, and each overlap direction has a
+    /// regression test that names it: `a_non_ascii_space_is_both_a_near_miss_and_escaped` for the
+    /// near-miss/non-ASCII direction, `a_short_name_carrying_a_homoglyph_gets_both_clauses` for the
+    /// non-CAIP-2/non-ASCII one. Both assert two clauses fire on a single offender.
     pub diagnosis: String,
 }
 
@@ -627,7 +629,11 @@ pub fn check_arming(
 ///
 /// Grouping by kind also makes the clauses structurally un-collapsible: independent passes over the
 /// offender list cannot express a suppressing chain, because there is no chain to shorten. The
-/// overlap tests below remain, because a structure can be rewritten back.
+/// overlap tests remain, because a structure can be rewritten back:
+/// `a_non_ascii_space_is_both_a_near_miss_and_escaped` and
+/// `a_short_name_carrying_a_homoglyph_gets_both_clauses` each assert two clauses fire on one
+/// offender, and `a_placeholder_variant_emits_both_its_clauses_and_no_false_one` covers the
+/// placeholder/non-ASCII direction.
 ///
 /// # Order
 ///
