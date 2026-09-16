@@ -7,8 +7,10 @@
 //! them mutated `arming.rs`. That proves the *function* and says nothing about the *call site* —
 //! and the call site is where this guard can actually be defeated. `src/main.rs` is excluded from
 //! the `obolus` library glob and is compiled by no other test target, so nothing else covers it:
-//! arming every advertised id unconditionally, swapping `?` for `unwrap_or_default()`, or moving `check_arming`
-//! below `Gateway::new` all compile and leave the library suite fully green.
+//! arming every advertised id unconditionally, or placing the guard below the banner block, both
+//! compile and leave the library suite fully green. (Moving it below `Gateway::new` no longer
+//! does: the constructor takes the guard's witness type, so that ordering is the compiler's to
+//! hold. What is advertised *before* the constructor — the banner — is still this file's.)
 //!
 //! So these tests run the shipped binary and read its behaviour off stderr and its exit status.
 //! That is the only vantage point from which "the guard runs, and runs *before* the gateway
@@ -514,9 +516,10 @@ fn an_unarmed_mainnet_network_refuses_to_start() {
 #[test]
 fn a_refusal_never_advertises_anything_first() {
     // The ordering claim in main's comment, checked rather than asserted. If `check_arming` moved
-    // below the banner block — or below `Gateway::new` — the process would still exit non-zero,
-    // so exit status alone cannot see this. What distinguishes the two is whether a gateway that
-    // is about to abort first told the operator it was advertising payment options.
+    // below the banner block the process would still exit non-zero, so exit status alone cannot
+    // see this. (Below `Gateway::new` it cannot move: the constructor takes the guard's witness.)
+    // What distinguishes the two is whether a gateway that is about to abort first told the
+    // operator it was advertising payment options.
     let run = run(&[("OBOLUS_NETWORK", MAINNET)]);
 
     // Positive first, deliberately. The three absences below are the actual claim, but absences
@@ -533,9 +536,10 @@ fn a_refusal_never_advertises_anything_first() {
 /// The same claim for the *other* refusal that inspects the advertised option set.
 ///
 /// `check_arming` above and `Gateway::new` here are the two checks that read `requirements`, and the
-/// test above pins only the first. No other test in this file builds an option set the constructor
-/// rejects, so with that coverage alone the constructor can sit anywhere — below the banner
-/// included — and the whole suite stays green.
+/// test above pins only the first. The type keeps the constructor *after* the guard, but says nothing
+/// about the banner: no other test in this file builds an option set the constructor rejects, so
+/// with that coverage alone the constructor can sit below the banner and the whole suite stays
+/// green.
 #[test]
 fn a_duplicate_option_refuses_before_advertising_anything() {
     let run = run(&[("OBOLUS_ACCEPTS", ACCEPTS_DUPLICATE_NETWORK)]);

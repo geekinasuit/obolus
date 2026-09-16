@@ -5,7 +5,10 @@
 //! Every guard in `main` is unreachable from a unit test: `src/main.rs` is the binary's crate root,
 //! and the checks it performs are statements in `main` rather than functions anything else calls.
 //! Deleting the placeholder refusal, handing `check_arming` every advertised id as armed, or moving
-//! either below the advertisement banner all compile and leave the 30-test unit suite fully green.
+//! either below the advertisement banner all compile and leave the unit suite fully green.
+//! (Building the gateway *without* the guard does not compile — `Gateway::new` takes the guard's
+//! witness type — but the banner is printed before the constructor, and that ordering is this
+//! file's to hold.)
 //!
 //! So these tests run the shipped binary and read its behaviour off stderr. That is the only
 //! vantage point from which "the guard runs, and runs *before* anything is advertised" is a

@@ -265,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
     // network not on the pinned testnet allowlist. The refusal's own remedy is written for
     // `obolus` and offers the arming value; here that instruction leads only to the refusal above,
     // so the text says so before the operator tries it.
-    check_arming(&requirements, &[]).map_err(|e| {
+    let armed_requirements = check_arming(&requirements, &[]).map_err(|e| {
         anyhow::anyhow!(
             "{e}\nobolus-devseller has no arming override, so that remedy does not exist here: the \
              only fix is a network on the pinned testnet allowlist."
@@ -438,12 +438,13 @@ async fn main() -> anyhow::Result<()> {
     // `a_duplicate_option_refuses_before_advertising_anything` in tests/guards.rs runs this binary
     // and fails if the call moves past the banner.
     //
-    // The clone is what the constructor's ownership costs — it takes the vector, and the banner
-    // below reports what was configured. Neither copy is mutated afterwards, so they cannot drift.
+    // `new` takes the arming guard's witness, which holds its own copy of the option set; the
+    // banner below reports `requirements`. Neither is mutated after the guard ran, so they cannot
+    // drift.
     let gateway = Gateway::new(
         facilitator::DevFacilitator::new(dev.verify, dev.settle, token),
         upstream,
-        requirements.clone(),
+        armed_requirements,
     )
     .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
 

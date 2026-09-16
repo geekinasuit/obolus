@@ -208,10 +208,10 @@ fn is_not_caip2(network: &str) -> bool {
 ///
 /// **Unreachable from `main`, and kept anyway.** Both configuration paths go through
 /// [`validated_option`](crate::config::validated_option), which rejects an empty network with the
-/// same `trim().is_empty()` test. This clause is for [`check_arming`]'s *other* callers — it is
-/// `pub`, `Gateway::new` deliberately does not call it (#27), and a library consumer assembling
-/// requirements by hand gets no upstream validation at all. A diagnosis that is only correct because
-/// of what some other module happens to check is not a property of this one.
+/// same `trim().is_empty()` test. This clause is for [`check_arming`]'s *other* callers — every
+/// `Gateway` is built through it, and a library consumer assembling requirements by hand gets no
+/// upstream validation at all. A diagnosis that is only correct because of what some other module
+/// happens to check is not a property of this one.
 fn is_empty_value(network: &str) -> bool {
     network.trim().is_empty()
 }
@@ -446,21 +446,70 @@ pub fn is_provably_testnet(network: &str) -> bool {
     network == PLACEHOLDER_NETWORK || TESTNET_NETWORKS.contains(&network)
 }
 
+/// Payment options that have passed [`check_arming`] — the guard's witness, and the only thing
+/// [`Gateway::new`](crate::gateway::Gateway::new) accepts.
+///
+/// There is no other constructor. That is the whole point: a caller cannot build a `Gateway`
+/// advertising a network the guard never saw, whoever the caller is — the `obolus` binary, a test
+/// harness, an external crate. What the guard *admitted* is the caller's policy (everything
+/// provably testnet, or armed by name); that it ran is the type's.
+///
+/// Carries what the caller needs after the check so that nothing has to be recomputed or
+/// remembered: the unproven networks the arming value admitted, and their [`diagnose`]d
+/// explanation, so that an armed banner printed from this value cannot disclaim knowledge the
+/// guard already had.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArmedRequirements {
+    requirements: Vec<PaymentRequirements>,
+    unproven: Vec<String>,
+    diagnosis: String,
+}
+
+impl ArmedRequirements {
+    /// The checked option set, as it was handed to the guard — order and duplicates preserved
+    /// (`Gateway::new` is what rejects the latter).
+    pub fn requirements(&self) -> &[PaymentRequirements] {
+        &self.requirements
+    }
+
+    /// The advertised networks that are not provably testnet — distinct, in first-advertised
+    /// order, and every one of them named by the arming value, or this value would not exist.
+    /// Empty means nothing was armed and everything advertised is on the allowlist: the only
+    /// evidence on which a caller may claim testnet-by-construction.
+    pub fn unproven(&self) -> &[String] {
+        &self.unproven
+    }
+
+    /// [`diagnose`] of [`unproven`](Self::unproven): the per-kind explanation the refusal would
+    /// have printed, for the banner that advertises them anyway. Empty when nothing is unproven,
+    /// or when nothing about the unproven ids is diagnosable.
+    pub fn diagnosis(&self) -> &str {
+        &self.diagnosis
+    }
+
+    /// Give up the witness for the option set itself. For `Gateway::new`; a caller that wants the
+    /// list without consuming the proof has [`requirements`](Self::requirements).
+    pub fn into_requirements(self) -> Vec<PaymentRequirements> {
+        self.requirements
+    }
+}
+
 /// Check the assembled payment options before the gateway is built.
 ///
-/// `armed` is the set of network ids `OBOLUS_ALLOW_MAINNET` names (see [`parse_arming`]). Returns
-/// the networks that are **not** provably testnet — distinct, in first-advertised order:
+/// `armed` is the set of network ids `OBOLUS_ALLOW_MAINNET` names (see [`parse_arming`]). On
+/// success, returns the [`ArmedRequirements`] witness carrying the option set and the networks
+/// that are **not** provably testnet — distinct, in first-advertised order:
 ///
 /// - `armed` names something that is not an advertised unproven network → [`ArmingMismatch`],
 ///   naming each such id and why; the caller refuses to start. Checked first, so a value that is
 ///   wrong about itself is reported as that.
 /// - an unproven network is advertised that `armed` does not name → [`NotProvablyTestnet`], naming
 ///   every such network and none of the armed ones; the caller refuses to start.
-/// - otherwise → `Ok` with the unproven list, which is exactly the armed set, so the caller can
-///   print a banner that names what is unproven. `Ok(vec![])` therefore means nothing was armed and
-///   everything advertised is on the allowlist — the reason the caller must not print a *mainnet*
-///   banner on any evidence but this list. A banner that cries mainnet on an all-testnet gateway is
-///   a log line someone will trust during an incident.
+/// - otherwise → `Ok`, with the unproven list, which is exactly the armed set, so the caller can
+///   print a banner that names what is unproven. An empty list therefore means nothing was armed
+///   and everything advertised is on the allowlist — the reason the caller must not print a
+///   *mainnet* banner on any evidence but this list. A banner that cries mainnet on an all-testnet
+///   gateway is a log line someone will trust during an incident.
 ///
 /// The set is compared byte-exactly on both sides, so a typo in the arming value cannot widen it.
 ///
@@ -484,14 +533,15 @@ pub fn is_provably_testnet(network: &str) -> bool {
 ///
 /// # Who calls this
 ///
-/// The `obolus` binary, at startup. [`Gateway::new`](crate::gateway::Gateway::new) does **not** — it
-/// enforces `(scheme, network)` uniqueness and nothing about testnet-ness, so a caller constructing a
-/// `Gateway` directly gets that invariant and not this one, and must run this function itself.
-/// Whether that asymmetry should be closed structurally is #27.
+/// Whoever builds a `Gateway`: [`Gateway::new`](crate::gateway::Gateway::new) takes the
+/// [`ArmedRequirements`] this returns and nothing else, so the guard cannot be skipped. The `obolus`
+/// binary calls it at startup, before the option set is announced; `obolus-devseller` calls it with
+/// an empty arming set, since it has no override. The constructor still enforces `(scheme, network)`
+/// uniqueness itself — a correctness invariant with no override, unlike this one.
 pub fn check_arming(
     requirements: &[PaymentRequirements],
     armed: &[String],
-) -> Result<Vec<String>, ArmingRefusal> {
+) -> Result<ArmedRequirements, ArmingRefusal> {
     // Distinct, in first-advertised order. Two `OBOLUS_ACCEPTS` entries can name the same bad
     // network, and this guard runs before `Gateway::new`'s duplicate check would reject the pair —
     // so listing the id twice, with its whole diagnosis paragraph repeated byte-identically, is what
@@ -534,7 +584,8 @@ pub fn check_arming(
         let diagnosis = diagnose(&unnamed);
         return Err(NotProvablyTestnet { networks: unnamed, diagnosis, armed: armed.to_vec() }.into());
     }
-    Ok(unproven)
+    let diagnosis = if unproven.is_empty() { String::new() } else { diagnose(&unproven) };
+    Ok(ArmedRequirements { requirements: requirements.to_vec(), unproven, diagnosis })
 }
 
 /// Build the diagnosis for a set of unproven networks: one bullet per *kind* of defect, naming every
@@ -561,10 +612,11 @@ pub fn check_arming(
 /// purpose: a genuine mainnet can share the offender set, and for that one arming is the documented
 /// answer.
 ///
-/// Nothing enforces that an armed caller calls this — a struct field would not either, since a field
-/// can be ignored as easily as a function. What holds it is
+/// An armed caller does not call this itself: [`check_arming`] does, and the result travels in
+/// [`ArmedRequirements::diagnosis`] beside the list it explains. A caller can still ignore a field
+/// as easily as a function, so what holds the banner honest is
 /// `an_armed_gateway_diagnoses_a_dead_entry_among_a_real_mainnet`, which runs the binary with exactly
-/// that array. Closing it structurally is #27.
+/// that array.
 ///
 /// # Why by kind, and not by offender
 ///
@@ -1109,14 +1161,14 @@ mod tests {
 
     #[test]
     fn the_same_mainnet_network_starts_when_armed() {
-        let unproven = check_arming(&[req(BASE_MAINNET)], &[BASE_MAINNET.to_string()]).unwrap();
+        let unproven = check_arming(&[req(BASE_MAINNET)], &[BASE_MAINNET.to_string()]).unwrap().unproven().to_vec();
         // Reported back, not swallowed: the caller needs it to print an honest banner.
         assert_eq!(unproven, vec![BASE_MAINNET.to_string()]);
     }
 
     #[test]
     fn a_known_testnet_starts_unarmed() {
-        let unproven = check_arming(&[req("eip155:84532")], &[]).unwrap();
+        let unproven = check_arming(&[req("eip155:84532")], &[]).unwrap().unproven().to_vec();
         assert!(unproven.is_empty(), "Base Sepolia is on the allowlist, got {unproven:?}");
     }
 
@@ -1124,7 +1176,7 @@ mod tests {
     fn the_placeholder_default_starts_unarmed() {
         // An out-of-the-box Obolus must boot without arming anything — otherwise the first thing
         // every operator learns is how to set the mainnet flag.
-        let unproven = check_arming(&[req(PLACEHOLDER_NETWORK)], &[]).unwrap();
+        let unproven = check_arming(&[req(PLACEHOLDER_NETWORK)], &[]).unwrap().unproven().to_vec();
         assert!(unproven.is_empty(), "the default must not need arming, got {unproven:?}");
     }
 
@@ -1178,7 +1230,7 @@ mod tests {
     fn an_empty_requirement_set_is_not_this_guards_problem() {
         // `Gateway::new` already rejects an empty option set. The guard must not invent a second
         // opinion about it: nothing advertised is nothing unproven.
-        assert!(check_arming(&[], &[]).unwrap().is_empty());
+        assert!(check_arming(&[], &[]).unwrap().unproven().is_empty());
     }
 
     #[test]
@@ -1467,6 +1519,26 @@ mod tests {
         }
     }
 
+    // ── The witness ─────────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_witness_carries_the_checked_set_and_what_was_armed() {
+        // Order and duplicates preserved: the witness is the option set as handed over, and
+        // `Gateway::new` is what rejects a duplicate pair.
+        let reqs = [req("eip155:84532"), req(BASE_MAINNET), req("eip155:84532")];
+        let witness = check_arming(&reqs, &armed(&[BASE_MAINNET])).unwrap();
+        assert_eq!(witness.requirements(), &reqs[..]);
+        assert_eq!(witness.unproven(), &armed(&[BASE_MAINNET])[..]);
+        // The diagnosis is the one the refusal would have printed for the same ids.
+        assert_eq!(witness.diagnosis(), diagnose(&armed(&[BASE_MAINNET])));
+        assert_eq!(witness.clone().into_requirements(), reqs.to_vec());
+
+        // Nothing unproven, nothing to diagnose — not even the placeholder, which is admitted.
+        let clean = check_arming(&[req("eip155:84532"), req(PLACEHOLDER_NETWORK)], &[]).unwrap();
+        assert!(clean.unproven().is_empty());
+        assert_eq!(clean.diagnosis(), "");
+    }
+
     // ── Arming names its target ─────────────────────────────────────────────────────────────────
 
     #[test]
@@ -1556,7 +1628,7 @@ mod tests {
         assert!(!msg.contains("set OBOLUS_ALLOW_MAINNET to exactly"), "got: {msg}");
 
         // Naming both starts, and reports exactly the unproven pair in advertised order.
-        let both = check_arming(&reqs, &armed(&[ETH_MAINNET, BASE_MAINNET])).unwrap();
+        let both = check_arming(&reqs, &armed(&[ETH_MAINNET, BASE_MAINNET])).unwrap().unproven().to_vec();
         assert_eq!(both, armed(&[BASE_MAINNET, ETH_MAINNET]));
     }
 

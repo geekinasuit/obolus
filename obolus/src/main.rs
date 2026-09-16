@@ -25,7 +25,7 @@ use obolus::access::{
     parse_token_keys, PublicKeyTokenVerifier, TokenKeyEntry, TokenPath, SINGLE_KEY_VAR,
 };
 use obolus::arming::{
-    check_arming, diagnose, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
+    check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
     parse_accepts, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
@@ -289,7 +289,11 @@ async fn main() -> anyhow::Result<()> {
         })?),
     };
     let armed_for = parse_arming(raw_arming.as_deref())?;
-    let unproven_networks = check_arming(&requirements, &armed_for)?;
+    let armed_requirements = check_arming(&requirements, &armed_for)?;
+    // Read off the witness before it is consumed below. The diagnosis travels with the checked
+    // set so that the armed banner cannot disclaim knowledge this module has.
+    let unproven_networks = armed_requirements.unproven().to_vec();
+    let diagnosis = armed_requirements.diagnosis().to_string();
 
     // The second check on the advertised option set, beside the first because they read the same
     // value: `new` rejects an empty set, and two options sharing (scheme, network) — a pair no
@@ -303,10 +307,11 @@ async fn main() -> anyhow::Result<()> {
     // `a_duplicate_option_refuses_before_advertising_anything` in tests/server_arming.rs runs this
     // binary and fails if the call moves below it.
     //
-    // The clone is what the constructor's ownership costs. The banner reports what was configured
-    // and `new` takes the vector, so the two cannot be the same value — but they cannot drift
-    // either: the copy is taken here and neither side is mutated afterwards.
-    let gateway = Gateway::new(facilitator, upstream, requirements.clone())
+    // `new` takes the guard's witness, not the vector: the type is what makes "checked before
+    // advertised" a property of the constructor rather than of this file's ordering. The witness
+    // holds its own copy of the option set; `requirements` stays for the banner below, and neither
+    // is mutated after the guard ran, so they cannot drift.
+    let gateway = Gateway::new(facilitator, upstream, armed_requirements)
         .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
 
     // "starting on", not "listening on" — the bind is ~100 lines below and every check between here
@@ -368,7 +373,6 @@ async fn main() -> anyhow::Result<()> {
         // allowlist). `undiagnosed` splits the three reachable states on the data rather than on the
         // message, so the all-diagnosable case stops claiming a defect in "some of them" and stops
         // quantifying "for any it does not name" over an empty set.
-        let diagnosis = diagnose(&unproven_networks);
         let unexplained = undiagnosed(&unproven_networks);
         let cause = if unexplained.len() == unproven_networks.len() {
             "Each is a mainnet, a typo, or a testnet added to x402 after this build — Obolus cannot \
