@@ -1179,6 +1179,16 @@ mod tests {
     /// `eip155:43114` that are code, not the supported-network list. Skipping by a per-line fence
     /// toggle also keeps the ``` fences from breaking the per-line backtick parity. `<chainId>`-style
     /// format placeholders (any span with `<`/`>`) are dropped.
+    /// A CAIP-2 namespace is `[-a-z0-9]{3,8}` (per the CAIP-2 spec). Checking the shape keeps two
+    /// backtick spans on the page that happen to contain a colon out of the id set: `namespace:reference`
+    /// (the literal format template, namespace 9 chars) and `primary_fungible_store::transfer` (an Aptos
+    /// code symbol, `_` and over-length). Both would otherwise land in `untracked_on_page` and surface
+    /// to a maintainer as spurious "untracked networks" in the scheduled lane.
+    fn is_caip2_namespace(ns: &str) -> bool {
+        (3..=8).contains(&ns.len())
+            && ns.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+
     fn parse_source_caip2_ids(md: &str) -> Result<Vec<String>, SourceParseError> {
         if !md.contains("## Default Assets for Dollar-String Pricing") {
             return Err(SourceParseError::NoDefaultAssetsSection);
@@ -1204,7 +1214,7 @@ mod tests {
                     continue; // a `<chainId>` placeholder or a multi-token span, not a bare id
                 }
                 if let Some((ns, reference)) = span.split_once(':') {
-                    if !ns.is_empty() && !reference.is_empty() {
+                    if is_caip2_namespace(ns) && !reference.is_empty() {
                         ids.push(span.to_string());
                     }
                 }
@@ -1338,6 +1348,60 @@ mod tests {
                   | Chain | Token |\n| ----- | ----- |\n| Base | USDC |\n";
         let err = parse_source_caip2_ids(md).unwrap_err();
         assert_eq!(err, SourceParseError::NoNetworkIds);
+    }
+
+    #[test]
+    fn the_parser_excludes_colon_spans_that_are_not_caip2_ids() {
+        // Two backtick spans on the real page carry a colon but are not networks: the literal
+        // `namespace:reference` format template, and the Aptos code symbol
+        // `primary_fungible_store::transfer`. The CAIP-2 namespace-shape check keeps both out, so the
+        // scheduled lane's `untracked_on_page` report does not name them as spurious networks.
+        let md = "## Default Assets for Dollar-String Pricing\n\n\
+                  Format is `namespace:reference`; Aptos uses `primary_fungible_store::transfer`.\n\n\
+                  | Chain | CAIP-2 |\n| ----- | ------ |\n| Base | `eip155:8453` |\n";
+        let ids = parse_source_caip2_ids(md).expect("the real table row anchors a non-empty parse");
+        assert_eq!(ids, vec!["eip155:8453".to_string()], "only the real id survives the shape filter");
+    }
+
+    #[test]
+    #[ignore = "network: the scheduled staleness lane fetches the live page to $OBOLUS_X402_PAGE"]
+    fn the_admitted_lists_still_match_the_live_x402_source() {
+        // The out-of-file signal #29 is for: the same audit as `every_admitted_id_appears_in_the_pinned_
+        // x402_snapshot`, but against the LIVE page rather than the checked-in snapshot. `#[ignore]`d so
+        // it never runs in the hermetic merge gate (which forbids network); the scheduled workflow runs
+        // it with `--ignored`. Network stays OUT of Rust — the workflow curls the page to a file and
+        // passes the path in `OBOLUS_X402_PAGE`; this reads the file. Three outcomes, each distinct in
+        // the run's output: clean pass / a named DIVERGENCE (a dropped or renamed admitted id) / a
+        // PARSE FAULT (the page layout moved), the last never mistaken for the first.
+        let path = std::env::var("OBOLUS_X402_PAGE")
+            .expect("set OBOLUS_X402_PAGE to the path of the fetched x402 page");
+        let md = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read OBOLUS_X402_PAGE ({path}): {e}"));
+        let ids = match parse_source_caip2_ids(&md) {
+            Ok(ids) => ids,
+            Err(e) => panic!(
+                "PARSE FAULT reading the x402 source ({e:?}) — the page layout changed or the fetch \
+                 returned something else. This is NOT a divergence: re-read the source and update the \
+                 parser and the pinned snapshot. Fetched to: {path}"
+            ),
+        };
+        let audit = audit_against_source(&ids, &admitted_ids());
+        if !audit.untracked_on_page.is_empty() {
+            // Informational, never a failure: networks on the page obolus does not admit (curated-out,
+            // or newly added and awaiting a deliberate reviewed reconciliation).
+            eprintln!(
+                "INFO: {} id(s) on the x402 source that obolus does not admit: {:?}",
+                audit.untracked_on_page.len(),
+                audit.untracked_on_page,
+            );
+        }
+        assert!(
+            audit.missing_tracked.is_empty(),
+            "DIVERGENCE: these admitted ids are no longer on the live x402 source — a dropped or \
+             renamed chain. Reconcile TESTNET_NETWORKS / MAINNET_NETWORKS in a reviewed change (and \
+             refresh the pinned snapshot in the same PR): {:?}",
+            audit.missing_tracked,
+        );
     }
 
     #[test]
