@@ -12,6 +12,10 @@ rust_library(
     # produces a file called `obolus`, which is the name it ships under. The CRATE is still `obolus`,
     # so every `use obolus::…` is untouched and this rename reaches no Rust source.
     crate_name = "obolus",
+    # A `#[cfg(test)]` fidelity check `include_str!`s this verbatim x402-source snapshot at compile
+    # time; `obolus_test` recompiles these srcs with `--test`, so the file must be a compile input.
+    # It is unreferenced in the non-test build (the `include_str!` is cfg'd out) but harmless there.
+    compile_data = ["tests/fixtures/x402-network-support.md"],
     visibility = ["//visibility:public"],
     deps = [
         "@crates//:axum",

@@ -1121,6 +1121,225 @@ mod tests {
         }
     }
 
+    // ---- x402 source-audit mechanism (#29) ----------------------------------------------------
+    //
+    // The mainnet oracle above measures the two lists against EACH OTHER, and its own docs name the
+    // limit: both columns are one act of transcription, so their errors correlate, and a green suite
+    // is not a verification of the DATA. Closing that needs a signal from OUTSIDE the file — a re-read
+    // of the x402 source. These functions are that re-read's mechanism: pull the CAIP-2 ids out of the
+    // source, then diff the admitted lists against them. The source is NOT a machine-readable registry:
+    // it attests networks in at least three differently-shaped places — the "Default Assets" tables
+    // (chains with a default stablecoin), the "Network Identifiers" prose bullets, and per-facilitator
+    // support tables. XRPL, for one, has no default-asset row — its testnet id reaches the bullets and
+    // a facilitator table, its mainnet id the bullets alone. obolus's allowlist is sourced from all of
+    // them, so the parse reads the WHOLE document rather than one section.
+    //
+    // This PR lands the MECHANISM plus a hermetic check against a checked-in verbatim snapshot of the
+    // page; the scheduled lane that runs the same diff against the LIVE page is a follow-up (still
+    // #29). The check is a TRANSCRIPTION-FIDELITY test, not a classifier. The page carries no
+    // testnet/mainnet flag — only the row's NAME says which — and this module must not infer an
+    // environment from a name, which is the very heuristic the arming guard refuses. So it answers one
+    // question per tracked id: is it still on the page? A tracked id that VANISHED is a hard failure (a
+    // dropped or renamed chain); an id on the page obolus does not track is INFORMATIONAL (obolus
+    // admits a curated subset, so a newly-listed network is normal, not alarming). What presence
+    // CANNOT see is a column SWAP of a newly-added pair — both ids stay on the page — because catching
+    // that needs the page's name-encoded environment. Per-column human re-reading (see
+    // `MAINNET_NETWORKS`' docs) stays the mitigation for that one; naming the gap beats a name
+    // heuristic that would pass a swapped pair while claiming to cover it.
+
+    /// A verbatim capture of the x402 source, pinned so the fidelity check below is hermetic. Refresh
+    /// it in the same reviewed change that reconciles the allowlist to a source revision — never on
+    /// its own, or the check silently re-baselines to whatever the page says today.
+    const X402_SOURCE_SNAPSHOT: &str = include_str!("../tests/fixtures/x402-network-support.md");
+
+    /// The x402 source could not be parsed for a network list — distinct from "parsed, and diverged".
+    /// A scheduled lane must fail LOUDLY and DIFFERENTLY here: a layout change that yields zero ids
+    /// must never read as "every tracked id was removed", nor pass silently as "nothing diverged".
+    #[derive(Debug, PartialEq, Eq)]
+    enum SourceParseError {
+        /// The `## Default Assets …` header is gone — the page was restructured, or the fetch returned
+        /// something else entirely (an error page, a redirect body). Kept as a structural anchor: its
+        /// presence is how we prove we fetched the right document before trusting a "nothing missing".
+        NoDefaultAssetsSection,
+        /// The anchor is present but the document yields no CAIP-2-shaped ids at all — a layout the
+        /// extractor no longer recognizes. Zero ids from a page that should hold dozens is a parse
+        /// fault, not an empty allowlist.
+        NoNetworkIds,
+    }
+
+    /// Extract every CAIP-2 id (`namespace:reference`) written in backticks anywhere on the page.
+    ///
+    /// Reads the WHOLE document, not one section: the ids are scattered across the Default Assets
+    /// tables, the `## Network Identifiers` bullets, and the facilitator support tables (XRPL, for one,
+    /// appears only in the latter two). The `## Default Assets …` header is required first as a
+    /// structural anchor — its job is not "the section to parse" but "proof this is the x402 page and
+    /// not an error body", so a fetch that lost it fails as a parse fault rather than as an empty diff.
+    ///
+    /// Fenced code blocks are skipped: the "Runtime Registration" examples contain ids like
+    /// `eip155:43114` that are code, not the supported-network list. Skipping by a per-line fence
+    /// toggle also keeps the ``` fences from breaking the per-line backtick parity. `<chainId>`-style
+    /// format placeholders (any span with `<`/`>`) are dropped.
+    fn parse_source_caip2_ids(md: &str) -> Result<Vec<String>, SourceParseError> {
+        if !md.contains("## Default Assets for Dollar-String Pricing") {
+            return Err(SourceParseError::NoDefaultAssetsSection);
+        }
+        let mut ids = Vec::new();
+        let mut in_fence = false;
+        for line in md.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+            // Inline code does not span lines, so backtick parity is reliable per line: splitting on
+            // '`', the ODD-indexed spans are the backtick-fenced ones.
+            for (i, span) in line.split('`').enumerate() {
+                if i % 2 == 0 {
+                    continue;
+                }
+                let span = span.trim();
+                if span.contains('<') || span.contains('>') || span.contains(' ') {
+                    continue; // a `<chainId>` placeholder or a multi-token span, not a bare id
+                }
+                if let Some((ns, reference)) = span.split_once(':') {
+                    if !ns.is_empty() && !reference.is_empty() {
+                        ids.push(span.to_string());
+                    }
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Err(SourceParseError::NoNetworkIds);
+        }
+        Ok(ids)
+    }
+
+    /// The result of diffing the admitted lists against the source.
+    struct SourceAudit {
+        /// Admitted ids the source no longer lists — a hard failure (a dropped or renamed chain).
+        missing_tracked: Vec<String>,
+        /// Source ids obolus does not admit — informational (a curated-out network), never a failure.
+        untracked_on_page: Vec<String>,
+    }
+
+    fn audit_against_source(page_ids: &[String], tracked: &[&str]) -> SourceAudit {
+        let page: std::collections::BTreeSet<&str> = page_ids.iter().map(String::as_str).collect();
+        let tracked_set: std::collections::BTreeSet<&str> = tracked.iter().copied().collect();
+        SourceAudit {
+            missing_tracked: tracked_set
+                .iter()
+                .filter(|t| !page.contains(*t))
+                .map(|t| t.to_string())
+                .collect(),
+            untracked_on_page: page
+                .iter()
+                .filter(|p| !tracked_set.contains(*p))
+                .map(|p| p.to_string())
+                .collect(),
+        }
+    }
+
+    /// Every id obolus admits: the testnet allowlist plus its mainnet twin. `PLACEHOLDER_NETWORK` is
+    /// deliberately excluded — it is obolus-internal and never appears on the x402 page, so including
+    /// it would flag it as permanently "missing from the source".
+    fn admitted_ids() -> Vec<&'static str> {
+        TESTNET_NETWORKS.iter().chain(MAINNET_NETWORKS).copied().collect()
+    }
+
+    #[test]
+    fn the_source_parser_reads_ids_from_tables_and_from_prose_bullets() {
+        let ids = parse_source_caip2_ids(X402_SOURCE_SNAPSHOT).expect("snapshot has the anchor");
+        // Ids from a Default Assets table row parse.
+        assert!(ids.iter().any(|i| i == "eip155:84532"), "Base Sepolia (a table row) should parse");
+        assert!(ids.iter().any(|i| i == "cardano:preprod"), "Cardano Preprod (a table row) should parse");
+        // `xrpl:0` has NO default-asset row — it is attested ONLY in the `## Network Identifiers`
+        // bullet (its testnet twin `xrpl:1` also reaches a facilitator support table; the x402.org
+        // facilitator is testnet-only, so the mainnet id does not). obolus admits it, so the parser
+        // must read the whole page, not just the tables, or the fidelity check below false-positives.
+        assert!(ids.iter().any(|i| i == "xrpl:0"), "xrpl:0 (prose-only, no table row) should parse");
+        // Format placeholders like `solana:<genesisHash>` are not ids.
+        assert!(
+            !ids.iter().any(|i| i.contains('<') || i.contains("genesisHash")),
+            "a `<placeholder>` span must not be taken as an id",
+        );
+    }
+
+    #[test]
+    fn the_source_parser_skips_fenced_code_examples() {
+        // The "Runtime Registration" code fences contain ids like `eip155:43114` as code, not as the
+        // supported-network list. A fenced id must not enter the extracted set — and this pins the
+        // fence toggle so a later "simplification" that drops it fails loudly.
+        let md = "## Default Assets for Dollar-String Pricing\n\n\
+                  | Chain | CAIP-2 |\n| ----- | ------ |\n| Base | `eip155:8453` |\n\n\
+                  ```rust\nserver.register(`eip155:43114`);\n```\n";
+        let ids = parse_source_caip2_ids(md).expect("the real table row anchors a non-empty parse");
+        assert!(ids.contains(&"eip155:8453".to_string()), "the table id is read");
+        assert!(!ids.contains(&"eip155:43114".to_string()), "the fenced code id is skipped");
+    }
+
+    #[test]
+    fn every_admitted_id_appears_in_the_pinned_x402_snapshot() {
+        // The correlated-oracle gap the mainnet-twin docs name, closed against a SECOND artefact: the
+        // admitted lists are diffed not against each other but against a verbatim capture of the page.
+        // A digit slipped while transcribing TESTNET_NETWORKS surfaces here as an id the capture does
+        // not contain. This runs in the merge gate against the checked-in snapshot; the scheduled lane
+        // (#29 follow-up) runs the same diff against the live page.
+        let ids = parse_source_caip2_ids(X402_SOURCE_SNAPSHOT).expect("snapshot parses");
+        let audit = audit_against_source(&ids, &admitted_ids());
+        assert!(
+            audit.missing_tracked.is_empty(),
+            "these admitted ids are absent from the pinned x402 snapshot — a transcription slip, or a \
+             snapshot gone stale that must be refreshed in the reviewed change that reconciles the \
+             allowlist: {:?}",
+            audit.missing_tracked,
+        );
+    }
+
+    #[test]
+    fn a_tracked_id_absent_from_the_source_is_named_as_missing() {
+        // The source lists only Base Sepolia; obolus still admits Arbitrum Sepolia.
+        let page = ["eip155:84532".to_string()];
+        let audit = audit_against_source(&page, &["eip155:84532", "eip155:421614"]);
+        assert_eq!(
+            audit.missing_tracked,
+            vec!["eip155:421614".to_string()],
+            "an admitted id the source dropped must be reported by name",
+        );
+        assert!(audit.untracked_on_page.is_empty());
+    }
+
+    #[test]
+    fn an_untracked_source_id_is_informational_not_a_failure() {
+        // Sei Testnet is on the page; obolus does not admit it. That is a curated-out network, not a
+        // divergence — it must not fail the lane.
+        let page = ["eip155:84532".to_string(), "eip155:1328".to_string()];
+        let audit = audit_against_source(&page, &["eip155:84532"]);
+        assert!(audit.missing_tracked.is_empty(), "a curated-out network is not a divergence");
+        assert_eq!(audit.untracked_on_page, vec!["eip155:1328".to_string()]);
+    }
+
+    #[test]
+    fn a_source_without_the_default_assets_section_is_a_parse_fault() {
+        // The load-bearing three-outcome distinction: a fetch that returns an error page or a
+        // restructured doc must fail as "could not read the source", never as "every tracked id was
+        // removed" — which is what a naive "zero ids parsed" would look like to the diff.
+        let err = parse_source_caip2_ids("# Some other page\n\nNo tables here.\n").unwrap_err();
+        assert_eq!(err, SourceParseError::NoDefaultAssetsSection);
+    }
+
+    #[test]
+    fn an_anchored_page_with_no_ids_is_a_parse_fault_not_an_empty_diff() {
+        // The anchor is present but the document carries no CAIP-2-shaped id — a layout the extractor
+        // no longer recognizes. Zero ids from a page that should hold dozens is a fault, distinct from
+        // "every tracked id was removed", which is what a naive empty parse would look like to the diff.
+        let md = "## Default Assets for Dollar-String Pricing\n\n\
+                  | Chain | Token |\n| ----- | ----- |\n| Base | USDC |\n";
+        let err = parse_source_caip2_ids(md).unwrap_err();
+        assert_eq!(err, SourceParseError::NoNetworkIds);
+    }
+
     #[test]
     fn a_whitespace_variant_is_diagnosed_rather_than_blamed_on_mainnet() {
         // The commonest real config slip. Fail-closed is unchanged — what must change is that the
