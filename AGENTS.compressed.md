@@ -42,6 +42,8 @@ fakes are #[cfg(test)]-only: FakeFacilitator accepts unexamined payments, FakeUp
   HELD: by the compiler, not checked — attribute keeps them out of a non-test build by construction; nothing fails if it's removed
 arming-guard allowlist = TRANSCRIPTION of upstream source, not curated list; x402 adds a testnet→add to TESTNET_NETWORKS in obolus/src/arming.rs as reviewed code change; NEVER work around w/ OBOLUS_ALLOW_MAINNET [operator setting flag as routine ceremony has already lost the protection]
   HELD: not checked — server_arming_test proves the guard fires, not that the list matches upstream; #29 tracks making staleness mechanical
+Gateway CANNOT advertise a network the arming guard never admitted: Gateway::new takes ArmedRequirements, obtainable ONLY from a check_arming that returned Ok; consumer(obolus bin|test|external crate) cannot build a gateway around a requirement set the guard never saw, nor move the check after construction(nothing to construct with until it passed)
+  HELD: by the compiler — witness type has no public constructor; losing this takes REMOVING the parameter, not forgetting a call. #27
 nothing we author decides whether a signer is correct [we'd author both sides→shared EIP-712 domain-separator misunderstanding makes both agree while real facilitator rejects]; load-bearing checks OUTSIDE our authorship: published KAT vectors + real testnet settle vs 3rd-party facilitator
   HELD: in part, by design — vectors run in eip3009_test; testnet settle deliberately outside the merge gate(a hermetic gate can't contain it)
 

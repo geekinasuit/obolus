@@ -50,6 +50,7 @@ use axum::{Json, Router};
 use crate::access::{bearer_token, TokenPath};
 use crate::facilitator::{Facilitator, FacilitatorError};
 use crate::upstream::{Upstream, UpstreamResponse};
+use crate::arming::ArmedRequirements;
 use crate::x402::{self, PaymentPayload, PaymentRequired, PaymentRequirements, SettlementReceipt};
 
 /// Why a [`Gateway`] could not be built from a set of payment options.
@@ -95,19 +96,21 @@ impl<F: Facilitator, U: Upstream> Gateway<F, U> {
     /// settlement is impossible by construction, including for a future caller that builds a
     /// `Gateway` directly.
     ///
-    /// **That guarantee does not extend to arming, and the asymmetry is deliberate — read it before
-    /// relying on the paragraph above.** This constructor does *not* check that the advertised
-    /// networks are testnet. That guard is [`arming::check_arming`](crate::arming::check_arming),
-    /// and it is applied by the `obolus` binary at startup, not here. So a caller
-    /// constructing a `Gateway` directly — the A3 real-facilitator integration tests, a second
-    /// binary, an external crate — gets the uniqueness invariant and **not** the arming one, and
-    /// must run `check_arming` itself or it will advertise whatever it was handed. Whether that
-    /// should be closed structurally is #27.
+    /// The arming invariant is enforced by the *parameter type*: an [`ArmedRequirements`] can only
+    /// be obtained from [`arming::check_arming`](crate::arming::check_arming), so every option set
+    /// that reaches this constructor has passed the guard — either provably testnet, or armed by
+    /// name. A caller constructing a `Gateway` directly — the A3 real-facilitator integration
+    /// tests, a second binary, an external crate — cannot skip it; there is no other way to produce
+    /// the argument. The two invariants are held differently on purpose: uniqueness is a
+    /// correctness property with no override, checked here; arming is a deployment policy with a
+    /// deliberate, named override, decided by the caller and *witnessed* here by the type.
+    /// Neither reads the environment.
     pub fn new(
         facilitator: F,
         upstream: U,
-        requirements: Vec<PaymentRequirements>,
+        requirements: ArmedRequirements,
     ) -> Result<Self, GatewayError> {
+        let requirements = requirements.into_requirements();
         if requirements.is_empty() {
             return Err(GatewayError::NoPaymentOptions);
         }
@@ -330,6 +333,7 @@ mod tests {
     use crate::access::FakeTokenVerifier;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
     use crate::upstream::{FakeUpstream, UpstreamCalls};
+    use crate::arming::{check_arming, is_provably_testnet};
     use crate::x402::{PaymentPayload, SettlementReceipt, SCHEME_EXACT, X402_VERSION};
     use axum::body::Body;
     use axum::http::Request;
@@ -364,6 +368,23 @@ mod tests {
         }
     }
 
+    /// Pass `reqs` through the arming guard, arming by name every network it cannot prove testnet.
+    ///
+    /// This suite tests payment flow, not arming policy — the fixture networks are deliberately
+    /// not real CAIP-2 ids, so every one of them is unproven, and a `Gateway` cannot be built
+    /// without the guard's witness. Arming them all is the honest statement of what these tests
+    /// are about; the guard's own behaviour is `arming.rs`'s to test. Duplicate entries are kept
+    /// (`new` is what rejects them) and named once.
+    fn armed(reqs: Vec<PaymentRequirements>) -> ArmedRequirements {
+        let mut unproven: Vec<String> = Vec::new();
+        for r in &reqs {
+            if !is_provably_testnet(&r.network) && !unproven.contains(&r.network) {
+                unproven.push(r.network.clone());
+            }
+        }
+        check_arming(&reqs, &unproven).expect("arming every unproven fixture network by name")
+    }
+
     /// The wired router plus a handle on what the facilitator was actually asked to do.
     ///
     /// Needed because "we did not charge" is invisible in the response: a gateway that settled
@@ -371,7 +392,7 @@ mod tests {
     /// receipt header as one that correctly never charged.
     fn app_with(facilitator: FakeFacilitator, upstream: FakeUpstream) -> (Router, FakeCalls) {
         let calls = facilitator.calls();
-        let gateway = Gateway::new(facilitator, upstream, vec![requirements()]).unwrap();
+        let gateway = Gateway::new(facilitator, upstream, armed(vec![requirements()])).unwrap();
         (router(Access::new(gateway, None)), calls)
     }
 
@@ -390,7 +411,7 @@ mod tests {
     ) -> (Router, FakeCalls, UpstreamCalls) {
         let calls = facilitator.calls();
         let forwards = upstream.calls();
-        let gateway = Gateway::new(facilitator, upstream, vec![requirements()]).unwrap();
+        let gateway = Gateway::new(facilitator, upstream, armed(vec![requirements()])).unwrap();
         let token = TokenPath::new(Arc::new(verifier));
         (router(Access::new(gateway, Some(token))), calls, forwards)
     }
@@ -710,7 +731,8 @@ mod tests {
         let calls = facilitator.calls();
         (
             router(Access::new(
-                Gateway::new(facilitator, upstream, vec![requirements(), requirements_b()]).unwrap(),
+                Gateway::new(facilitator, upstream, armed(vec![requirements(), requirements_b()]))
+                    .unwrap(),
                 None,
             )),
             calls,
@@ -816,8 +838,12 @@ mod tests {
         let calls_holder = FakeFacilitator::accepting();
         let calls = calls_holder.calls();
         let app = router(Access::new(
-            Gateway::new(calls_holder, FakeUpstream::streaming(), vec![requirements_b(), short_name])
-                .unwrap(),
+            Gateway::new(
+                calls_holder,
+                FakeUpstream::streaming(),
+                armed(vec![requirements_b(), short_name]),
+            )
+            .unwrap(),
             None,
         ));
 
@@ -846,7 +872,7 @@ mod tests {
         // A gateway that accepts nothing can never be paid — refused at construction, not served as
         // a route that 402s forever. (`.err()` rather than `.unwrap_err()` because `Gateway` is not
         // `Debug`; the error type is.)
-        let err = Gateway::new(FakeFacilitator::accepting(), FakeUpstream::streaming(), vec![])
+        let err = Gateway::new(FakeFacilitator::accepting(), FakeUpstream::streaming(), armed(vec![]))
             .err()
             .expect("an empty option list must be rejected");
         assert!(matches!(err, GatewayError::NoPaymentOptions), "got {err:?}");
@@ -863,7 +889,7 @@ mod tests {
         let err = Gateway::new(
             FakeFacilitator::accepting(),
             FakeUpstream::streaming(),
-            vec![requirements(), dup],
+            armed(vec![requirements(), dup]),
         )
         .err()
         .expect("duplicate (scheme, network) must be rejected");
@@ -955,7 +981,8 @@ mod tests {
             let upstream = FakeUpstream::streaming();
             let forwards = upstream.calls();
             let gateway =
-                Gateway::new(FakeFacilitator::accepting(), upstream, vec![requirements()]).unwrap();
+                Gateway::new(FakeFacilitator::accepting(), upstream, armed(vec![requirements()]))
+                    .unwrap();
             (router(Access::new(gateway, None)), forwards)
         };
         let (status, _headers, _body) = send(app, tokened_request(HONOURED)).await;

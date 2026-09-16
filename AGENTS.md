@@ -132,6 +132,13 @@ exists should not have to go looking for one.
   routine ceremony has already lost the protection it exists to provide. *Not checked.*
   `server_arming_test` proves the guard fires, not that the list still matches upstream; #29
   tracks making staleness mechanical.
+- **A `Gateway` cannot advertise a network the arming guard never admitted.** `Gateway::new` takes
+  an `ArmedRequirements`, and the only way to obtain one is a `check_arming` that returned `Ok`. A
+  consumer of the library — the `obolus` binary, a test, an external crate — cannot build a gateway
+  around a requirement set the guard never saw, and cannot move the check after construction,
+  because there is nothing to construct with until the check has passed. *Held by the compiler.* The
+  witness type has no public constructor; losing this invariant takes removing the parameter, not
+  forgetting a call. #27.
 - **Nothing we author decides whether a signer is correct.** We would author both sides of any
   self-check, so a shared misunderstanding of the EIP-712 domain separator would make both agree
   while a real facilitator still rejects. The load-bearing checks are outside our authorship:
