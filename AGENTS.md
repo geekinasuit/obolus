@@ -86,8 +86,10 @@ third-party facilitator — runs out of band, so its flakiness cannot block the 
   something. Those belong in an untracked `thoughts/` directory, which is gitignored *and* enforced
   by the `no-stray-notes` CI job, because an ignore rule alone is defeated by `git add -f`. That
   job also rejects **references** to those paths: a link to a file that is not here is a broken
-  reference for anyone reading the code. When you cannot tell which side something falls on, keep it
-  out — an issue cannot be unfiled, and moving a note in later costs nothing.
+  reference for anyone reading the code. For the same reason it rejects references under
+  `serving/`, the private monorepo subtree this code was exported from — a path from that layout
+  resolves nowhere here. When you cannot tell which side something falls on, keep it out — an
+  issue cannot be unfiled, and moving a note in later costs nothing.
 - **Write issues and pull requests for both audiences.** Agents and humans both read them, and
   padding serves neither. State what changed and why, give a reader enough to act on, and stop —
   no throat-clearing, no ceremonial sections, no flourish. Being complete matters more than being

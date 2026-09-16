@@ -30,17 +30,23 @@ jobs:
           echo "No note files tracked."
 
       # The subtler case: a path that is not in this repository but is still linked to. Such a link
-      # is a broken reference for anyone reading the code. The pattern covers the whole directory
-      # rather than one subtree of it, and requires a character after the slash so that naming the
-      # directory itself — as AGENTS.md does — stays allowed. It is a reference *into* it that
-      # breaks.
-      - name: Reject references to absent note paths
+      # is a broken reference for anyone reading the code. Two prefixes are checked, both from the
+      # layout this code was exported from: `thoughts/`, the untracked notes directory, and
+      # `serving/`, the monorepo subtree the crates lived under. A deny-list of known prefixes
+      # rather than a general absent-path check, deliberately: deciding what counts as a path in
+      # arbitrary prose, and which of those are legitimately external, is a harder problem than the
+      # realistic failure — exported content still carrying its old paths — calls for (#10). Each
+      # prefix covers its whole directory rather than one subtree, requires a character after the
+      # slash so that naming the directory itself — as AGENTS.md does — stays allowed, and requires
+      # a non-identifier character before it so that a word merely ending in the prefix
+      # (`preserving/`) does not match. It is a reference *into* one of them that breaks.
+      - name: Reject references to absent paths
         run: |
-          if git grep -nE '(\.\./)*thoughts/[A-Za-z0-9_.-]' -- . ':!.github/workflows/ci.yml' ':!.gitignore'; then
-            echo "::error::Source refers to a path that is not in this repository. Cite the GitHub issue instead — AGENTS.md gives the citation form for the kind of file you are in — or drop the reference entirely; content that cannot be public does not become an issue."
+          if git grep -nE '(^|[^A-Za-z0-9_.-])(thoughts|serving)/[A-Za-z0-9_.-]' -- . ':!.github/workflows/ci.yml' ':!.gitignore'; then
+            echo "::error::Source refers to a path that is not in this repository. If the file lives here under another path, name that path; if it is a working note, cite the GitHub issue instead — AGENTS.md gives the citation form for the kind of file you are in — or drop the reference entirely; content that cannot be public does not become an issue."
             exit 1
           fi
-          echo "No references to absent note paths."
+          echo "No references to absent paths."
 
   bazel:
     name: bazel test //...
