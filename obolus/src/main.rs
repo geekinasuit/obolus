@@ -2,8 +2,9 @@
 //!
 //! This is live-capable, and testnet-by-construction *unless an operator explicitly arms it*:
 //! startup refuses to advertise any network it cannot prove is testnet (see
-//! [`obolus::arming`]), and `OBOLUS_ALLOW_MAINNET=1` is the only way past that refusal. Stating the
-//! posture unconditionally would make this doc false on exactly the instance where it matters most.
+//! [`obolus::arming`]), and `OBOLUS_ALLOW_MAINNET`, naming the exact network ids to arm, is the only
+//! way past that refusal. Stating the posture unconditionally would make this doc false on exactly
+//! the instance where it matters most.
 //!
 //! It delegates settlement to a third-party
 //! x402 facilitator (`OBOLUS_FACILITATOR_URL`, required — the gateway never guesses where money
@@ -23,7 +24,9 @@ use std::time::Duration;
 use obolus::access::{
     parse_token_keys, PublicKeyTokenVerifier, TokenKeyEntry, TokenPath, SINGLE_KEY_VAR,
 };
-use obolus::arming::{check_arming, diagnose, legible, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK};
+use obolus::arming::{
+    check_arming, diagnose, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
+};
 use obolus::config::{
     parse_accepts, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
     SharedOffer,
@@ -265,10 +268,28 @@ async fn main() -> anyhow::Result<()> {
     // tests/server_arming.rs runs this binary and fails if the call moves. Exit status alone cannot
     // see it: a gateway that checks too late still exits non-zero, having already advertised.
     //
-    // Exactly the string "1" arms it. Anything else — `true`, `yes`, empty, unset — does not, which
-    // is the safe direction for a typo; the refusal message names the exact value required.
-    let armed = std::env::var("OBOLUS_ALLOW_MAINNET").as_deref() == Ok("1");
-    let unproven_networks = check_arming(&requirements, armed)?;
+    // Arming names its target: the value is the comma-separated set of network ids to arm, and
+    // `check_arming` admits an unproven network only if the set names it. The set must also name
+    // nothing else — an unadvertised id, or one already on the allowlist, refuses — so the
+    // environment can only describe exactly what it arms. The retired `=1` form is refused with a
+    // pointer to this one; a value that names no advertised network (`true`, `yes`) refuses as a
+    // mismatch, which is the safe direction for a typo.
+    //
+    // Read as an `OsString`, because `std::env::var` reports a non-UTF-8 value as an *error*, and
+    // an error read carelessly looks like "unset" — the one value shape that would arm nothing and
+    // refuse nothing. A value that is set is either a set of ids or a refusal; never silence.
+    let raw_arming = match std::env::var_os("OBOLUS_ALLOW_MAINNET") {
+        None => None,
+        Some(value) => Some(value.into_string().map_err(|value| {
+            anyhow::anyhow!(
+                "OBOLUS_ALLOW_MAINNET is set but is not valid UTF-8 ({value:?}). A network id is \
+                 ASCII, so this value can name nothing. Unset it, or set it to exactly the network \
+                 id(s) to arm, comma-separated."
+            )
+        })?),
+    };
+    let armed_for = parse_arming(raw_arming.as_deref())?;
+    let unproven_networks = check_arming(&requirements, &armed_for)?;
 
     // The second check on the advertised option set, beside the first because they read the same
     // value: `new` rejects an empty set, and two options sharing (scheme, network) — a pair no
@@ -330,10 +351,10 @@ async fn main() -> anyhow::Result<()> {
     // where money is real.
     let placeholders = requirements.iter().filter(|r| r.network == PLACEHOLDER_NETWORK).count();
 
-    // The banner must not be able to lie. Armed-but-all-testnet is a legal state (the flag is set;
-    // every advertised network is still on the allowlist), and shouting MAINNET there would plant a
-    // log line someone trusts during an incident. So the loud banner is keyed on what is actually
-    // unproven, not on the flag.
+    // The banner must not be able to lie. It is keyed on what is actually unproven, never on the
+    // variable being set: `check_arming` refuses a value that names nothing unproven, so an
+    // all-testnet gateway cannot reach here armed — and a banner keyed on anything but the list
+    // would plant a log line someone trusts during an incident.
     if !unproven_networks.is_empty() {
         // Armed by construction: `check_arming` would have refused to return otherwise.
         //
@@ -371,9 +392,9 @@ async fn main() -> anyhow::Result<()> {
             )
         };
         eprintln!(
-            "obolus: *** MAINNET ARMED *** OBOLUS_ALLOW_MAINNET=1 — advertising {} network(s) NOT \
-             on the pinned testnet allowlist: {}. {} That allowlist is a snapshot pinned {}; \
-             if yours is a genuine testnet newer than that, the fix is a reviewed addition to \
+            "obolus: *** MAINNET ARMED *** OBOLUS_ALLOW_MAINNET names {} network(s) NOT on the \
+             pinned testnet allowlist, advertised anyway: {}. {} That allowlist is a snapshot \
+             pinned {}; if yours is a genuine testnet newer than that, the fix is a reviewed addition to \
              TESTNET_NETWORKS, not this flag — which has made this gateway indistinguishable from a \
              mainnet one in its own logs.{}",
             unproven_networks.len(),
@@ -419,15 +440,6 @@ async fn main() -> anyhow::Result<()> {
              cannot produce this line — that combination refuses to start.) Compare the \
              per-option lines above against what you set.",
             requirements.len()
-        );
-    }
-
-    // Only meaningful when the flag changed nothing — on the armed branch the banner above has
-    // already said far more than this would.
-    if armed && unproven_networks.is_empty() {
-        eprintln!(
-            "obolus: OBOLUS_ALLOW_MAINNET is set but changed nothing here. Unset it so that an \
-             armed instance stays recognisable by its environment alone."
         );
     }
 

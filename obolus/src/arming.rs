@@ -17,6 +17,19 @@
 //! The flag's name (`OBOLUS_ALLOW_MAINNET`, read in `main`) under-describes what it gates — the
 //! predicate is *not provably testnet*, and mainnet is only its most important instance.
 //!
+//! # Arming names its target
+//!
+//! The override is not a boolean. `OBOLUS_ALLOW_MAINNET` lists the exact network ids being armed,
+//! comma-separated, and [`check_arming`] admits an unproven network only if the value names it —
+//! byte-exactly, the same comparison the allowlist makes, so a typo in the arming value fails closed
+//! rather than widening it. The value must also name nothing else: an id the gateway does not
+//! advertise, or one already on the allowlist, is refused rather than ignored. So the environment
+//! can only ever describe exactly what it arms, and an operator reading
+//! `OBOLUS_ALLOW_MAINNET=eip155:8453` learns which chain this instance is for. The boolean form
+//! (`=1`) admitted every advertised option at once — a typo two entries below the intended mainnet
+//! included — and survived every later edit to the network set; it is retired, and refused with a
+//! pointer to this form (#28).
+//!
 //! # When a new testnet shows up
 //!
 //! Add it to [`TESTNET_NETWORKS`] — a reviewed code change, in the open. Do **not** reach for the
@@ -220,16 +233,22 @@ fn is_empty_value(network: &str) -> bool {
      so it will not offer an unproven network by accident. Fix the network id, or — if it is \
      genuinely testnet — add it to TESTNET_NETWORKS in a reviewed change. Do NOT reach for \
      OBOLUS_ALLOW_MAINNET to run on a genuine testnet: that makes this gateway indistinguishable \
-     from a mainnet one in its own logs. To advertise anyway, set OBOLUS_ALLOW_MAINNET=1 (exactly \
-     the string \"1\"); real funds can then move against this gateway's challenge.",
+     from a mainnet one in its own logs. {}",
     .networks.len(),
     .networks.iter().map(|n| legible(n)).collect::<Vec<_>>().join(", "),
     .diagnosis,
-    PINNED_ON
+    PINNED_ON,
+    arming_remedy(.armed)
 )]
 pub struct NotProvablyTestnet {
-    /// The offending network ids: distinct, in the order they are first advertised.
+    /// The offending network ids: distinct, in the order they are first advertised, and none of
+    /// them named by the arming value.
     pub networks: Vec<String>,
+    /// The ids the arming value already names — every one of them advertised and unproven, because
+    /// [`ArmingMismatch`] is checked first. Chooses the remedy's wording: "set the variable to" when
+    /// empty, "add to it" when not, so that following the text literally never drops an id that
+    /// was already armed.
+    pub armed: Vec<String>,
     /// Newline-separated bullets naming the true cause; empty when no offender has one. Rendered
     /// *before* the generic three-cause text, which it supersedes when it fires.
     ///
@@ -240,6 +259,182 @@ pub struct NotProvablyTestnet {
     /// to reintroduce, so [`diagnose`] runs independent passes and both overlap directions have
     /// regression tests.
     pub diagnosis: String,
+}
+
+/// The refusal's closing remedy — how to arm the offenders above, phrased so that following it
+/// literally cannot drop an id the value already names.
+fn arming_remedy(armed: &[String]) -> String {
+    if armed.is_empty() {
+        "To advertise anyway, set OBOLUS_ALLOW_MAINNET to exactly the id(s) above, comma-separated \
+         and nothing else — arming names its target, and a value naming anything else refuses to \
+         start too. Real funds can then move against this gateway's challenge."
+            .to_string()
+    } else {
+        format!(
+            "To advertise anyway, add the id(s) above to OBOLUS_ALLOW_MAINNET, which already names \
+             {}. Real funds can then move against this gateway's challenge.",
+            armed.iter().map(|n| legible(n)).collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+/// One rendered group of an [`ArmingMismatch`]: empty when the group is, else `lead` followed by
+/// the quoted ids and a full stop, so a group with nothing in it leaves no dangling sentence.
+fn mismatch_group(lead: &str, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return String::new();
+    }
+    format!("{lead}{}.", ids.iter().map(|n| legible(n)).collect::<Vec<_>>().join(", "))
+}
+
+/// The quoted ids, or `none` when there are none — for the sentences that must still read when a
+/// list is empty.
+fn ids_or(ids: &[String], none: &str) -> String {
+    if ids.is_empty() {
+        return none.to_string();
+    }
+    ids.iter().map(|n| legible(n)).collect::<Vec<_>>().join(", ")
+}
+
+/// The one restart's worth of prescription an [`ArmingMismatch`] closes with: the exact value
+/// that would start this configuration, or the instruction to unset when nothing advertised is
+/// unproven. Both facts are known at the refusal; withholding them costs the operator a second
+/// restart to learn what the first already knew.
+fn arming_prescription(unproven: &[String]) -> String {
+    match unproven {
+        [] => "Here nothing is: unset the variable.".to_string(),
+        [only] => format!("Here that is {}.", legible(only)),
+        // The quoted list is for reading — it makes a stray byte visible — but it is not the value:
+        // copied with its separators it would arm `" eip155:1"`. So the value is spelled out too,
+        // exactly as it goes into the environment.
+        many => format!(
+            "Here that is {} (as one value: OBOLUS_ALLOW_MAINNET={}).",
+            ids_or(many, ""),
+            many.join(",")
+        ),
+    }
+}
+
+/// The arming value named something this gateway cannot arm.
+///
+/// Arming names its target, so the value must list exactly the advertised networks that are not
+/// provably testnet — nothing more. An entry naming a network the gateway does not advertise, or
+/// one already on the allowlist, is not inert: it is a value that has drifted from the
+/// configuration it was written for, which is the sticky-flag failure the boolean form was retired
+/// over (#28). Refused by name rather than reported as "set but changed nothing", so the environment
+/// can only ever describe what it is arming.
+///
+/// Checked **before** [`NotProvablyTestnet`], so an arming value that is wrong about itself is
+/// reported as that — an operator who typed `eip155:8543` for `eip155:8453` is told the value names
+/// an unadvertised id, not that their mainnet is unproven with a remedy of setting the value they
+/// believe they already set.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error(
+    "OBOLUS_ALLOW_MAINNET names {} network id(s) this gateway cannot arm.{}{} This gateway \
+     advertises {}. Arming names its target, so that an armed instance stays recognisable by its \
+     environment alone: the value must list exactly the advertised network id(s) that are not on \
+     the pinned testnet allowlist, comma-separated and compared byte-exactly, and nothing else. {}",
+    .unadvertised.len() + .already_testnet.len(),
+    mismatch_group(" Not advertised by this gateway: ", .unadvertised),
+    mismatch_group(" Already provably testnet, so not armable: ", .already_testnet),
+    ids_or(.advertised, "nothing"),
+    arming_prescription(.unproven)
+)]
+pub struct ArmingMismatch {
+    /// Named by the value, advertised by nobody. Includes the plausible typos for the retired
+    /// boolean form (`true`, `yes`), which name no network at all.
+    pub unadvertised: Vec<String>,
+    /// Named by the value, advertised, and on the allowlist already — armed for no reason.
+    pub already_testnet: Vec<String>,
+    /// Everything this gateway advertises: distinct, in first-advertised order. Printed because
+    /// this refusal runs before the per-option startup lines, so it is the operator's only view of
+    /// what the process actually received — the value can be right and the advertisement the
+    /// thing that went missing.
+    pub advertised: Vec<String>,
+    /// The advertised ids that are not provably testnet, named or not: the exact value that would
+    /// start this configuration, so the fix is one restart rather than two.
+    pub unproven: Vec<String>,
+}
+
+/// Why the assembled payment options cannot be advertised as configured: either the arming value
+/// names something there is not, or an unproven network is advertised that the value does not
+/// name. Both refuse to start.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ArmingRefusal {
+    #[error(transparent)]
+    Mismatch(#[from] ArmingMismatch),
+    #[error(transparent)]
+    NotProvablyTestnet(#[from] NotProvablyTestnet),
+}
+
+/// Why `OBOLUS_ALLOW_MAINNET`'s raw value could not be read as a set of network ids at all. These
+/// are defects of the value's *shape*; what it names is [`check_arming`]'s question.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ArmingValueError {
+    /// Set, and carrying nothing — the same "arrived empty" defect every other variable refuses.
+    #[error(
+        "OBOLUS_ALLOW_MAINNET is set but empty. The variable reached this process carrying nothing \
+         — an unexpanded `${{VAR}}` in a compose file, an EnvironmentFile line ending in `=`. Unset \
+         it to arm nothing, or set it to exactly the network id(s) to arm, comma-separated."
+    )]
+    SetButEmpty,
+    /// The retired boolean form. Refused with a pointer rather than swept into the generic
+    /// mismatch: it was the documented form, and an operator with old notes will reach for it.
+    #[error(
+        "OBOLUS_ALLOW_MAINNET=1 no longer arms anything: arming names its target now. Set the \
+         variable to exactly the network id(s) to arm, comma-separated — the refusal an un-armed \
+         start prints names them — and nothing else. A process-wide yes admitted every advertised \
+         option at once, a typo two entries below the one you meant included, and survived every \
+         later edit to the network set; naming the target closes both."
+    )]
+    RetiredBooleanForm,
+    /// A comma with nothing on one side of it.
+    #[error(
+        "OBOLUS_ALLOW_MAINNET has an empty entry at position {position} (counting from 1): a \
+         comma with nothing on one side of it. Each entry must be a network id, with no entry left \
+         blank."
+    )]
+    EmptyEntry { position: usize },
+    /// The same id twice — harmless to the check, but a value that is not a set is a value someone
+    /// edited without reading, which is the habit this variable must not tolerate.
+    #[error("OBOLUS_ALLOW_MAINNET names {} twice. List each network id once.", legible(.0))]
+    Duplicate(String),
+}
+
+/// Read `OBOLUS_ALLOW_MAINNET`'s raw value as the set of network ids it arms.
+///
+/// `None` — the variable unset — arms nothing, and is the normal case. Entries are split on `,`
+/// and taken **verbatim**: no trimming, no case folding, for the reason the module docs give — what
+/// this value names has to be byte-identical to what the gateway advertises, or the check admits
+/// one string and the challenge carries another. A stray space around a comma therefore surfaces
+/// as an [`ArmingMismatch`] naming the quoted entry, where the space is visible.
+///
+/// Pure — the caller reads the environment — so this stays testable without process-global state,
+/// as [`check_arming`] does.
+pub fn parse_arming(raw: Option<&str>) -> Result<Vec<String>, ArmingValueError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Err(ArmingValueError::SetButEmpty);
+    }
+    // Trimmed, unlike the ids: this branch only ever refuses, so recognising `1 ` or `1\r` — the
+    // forms an old `.env` line or a CRLF-saved unit file actually produces — widens nothing, and
+    // the operator with old notes is the one this pointer exists for.
+    if raw.trim() == "1" {
+        return Err(ArmingValueError::RetiredBooleanForm);
+    }
+    let mut ids: Vec<String> = Vec::new();
+    for (index, entry) in raw.split(',').enumerate() {
+        if entry.trim().is_empty() {
+            return Err(ArmingValueError::EmptyEntry { position: index + 1 });
+        }
+        if ids.iter().any(|seen| seen == entry) {
+            return Err(ArmingValueError::Duplicate(entry.to_string()));
+        }
+        ids.push(entry.to_string());
+    }
+    Ok(ids)
 }
 
 /// Whether `network` is provably testnet: on the pinned [`TESTNET_NETWORKS`] allowlist, or Obolus's
@@ -253,21 +448,28 @@ pub fn is_provably_testnet(network: &str) -> bool {
 
 /// Check the assembled payment options before the gateway is built.
 ///
-/// Returns the networks that are **not** provably testnet — distinct, in first-advertised order:
+/// `armed` is the set of network ids `OBOLUS_ALLOW_MAINNET` names (see [`parse_arming`]). Returns
+/// the networks that are **not** provably testnet — distinct, in first-advertised order:
 ///
-/// - un-armed and the list is non-empty → [`NotProvablyTestnet`], naming all of them; the caller
-///   refuses to start.
-/// - armed → `Ok` with that same list, so the caller can print a banner that names exactly what is
-///   unproven. `Ok(vec![])` therefore means "armed, but everything advertised is on the allowlist" —
-///   a real and legal state, and the reason the caller must not print a *mainnet* banner merely
-///   because the flag is set. A banner that cries mainnet on an all-testnet gateway is a log line
-///   someone will trust during an incident.
+/// - `armed` names something that is not an advertised unproven network → [`ArmingMismatch`],
+///   naming each such id and why; the caller refuses to start. Checked first, so a value that is
+///   wrong about itself is reported as that.
+/// - an unproven network is advertised that `armed` does not name → [`NotProvablyTestnet`], naming
+///   every such network and none of the armed ones; the caller refuses to start.
+/// - otherwise → `Ok` with the unproven list, which is exactly the armed set, so the caller can
+///   print a banner that names what is unproven. `Ok(vec![])` therefore means nothing was armed and
+///   everything advertised is on the allowlist — the reason the caller must not print a *mainnet*
+///   banner on any evidence but this list. A banner that cries mainnet on an all-testnet gateway is
+///   a log line someone will trust during an incident.
+///
+/// The set is compared byte-exactly on both sides, so a typo in the arming value cannot widen it.
 ///
 /// `armed` is passed in rather than read from the environment, mirroring
 /// [`superseded_single_chain_vars`](crate::config::superseded_single_chain_vars): it keeps this pure
 /// and testable without mutating process-global environment state, which would race other tests.
 ///
-/// Every advertised option is checked, so a mainnet entry hiding among testnet entries is caught.
+/// Every advertised option is checked, so a mainnet entry hiding among testnet entries is caught —
+/// and so is one hiding beside a deliberately armed mainnet, which the boolean form let through.
 ///
 /// # Keeping this true as Obolus grows
 ///
@@ -288,8 +490,8 @@ pub fn is_provably_testnet(network: &str) -> bool {
 /// Whether that asymmetry should be closed structurally is #27.
 pub fn check_arming(
     requirements: &[PaymentRequirements],
-    armed: bool,
-) -> Result<Vec<String>, NotProvablyTestnet> {
+    armed: &[String],
+) -> Result<Vec<String>, ArmingRefusal> {
     // Distinct, in first-advertised order. Two `OBOLUS_ACCEPTS` entries can name the same bad
     // network, and this guard runs before `Gateway::new`'s duplicate check would reject the pair —
     // so listing the id twice, with its whole diagnosis paragraph repeated byte-identically, is what
@@ -301,9 +503,36 @@ pub fn check_arming(
         }
     }
 
-    if !armed && !unproven.is_empty() {
-        let diagnosis = diagnose(&unproven);
-        return Err(NotProvablyTestnet { networks: unproven, diagnosis });
+    // The value first: everything it names must be an advertised, unproven network.
+    let mut unadvertised: Vec<String> = Vec::new();
+    let mut already_testnet: Vec<String> = Vec::new();
+    for id in armed {
+        if unproven.contains(id) {
+            continue;
+        }
+        if requirements.iter().any(|r| &r.network == id) {
+            already_testnet.push(id.clone());
+        } else {
+            unadvertised.push(id.clone());
+        }
+    }
+    if !unadvertised.is_empty() || !already_testnet.is_empty() {
+        let mut advertised: Vec<String> = Vec::new();
+        for r in requirements {
+            if !advertised.contains(&r.network) {
+                advertised.push(r.network.clone());
+            }
+        }
+        return Err(ArmingMismatch { unadvertised, already_testnet, advertised, unproven }.into());
+    }
+
+    // Then the advertisement: every unproven network must be named. The armed ids are not
+    // offenders and are kept out of the list — the refusal must not blame the id the operator
+    // deliberately armed alongside the one they did not.
+    let unnamed: Vec<String> = unproven.iter().filter(|n| !armed.contains(n)).cloned().collect();
+    if !unnamed.is_empty() {
+        let diagnosis = diagnose(&unnamed);
+        return Err(NotProvablyTestnet { networks: unnamed, diagnosis, armed: armed.to_vec() }.into());
     }
     Ok(unproven)
 }
@@ -537,6 +766,31 @@ mod tests {
     /// Base mainnet. The teeth: if the guard were inverted, absent, or a no-op, this is the input
     /// that would sail through and let a gateway advertise a real-money challenge.
     const BASE_MAINNET: &str = "eip155:8453";
+
+    /// Ethereum mainnet: a second unproven network, for the tests where one is armed and one is not.
+    const ETH_MAINNET: &str = "eip155:1";
+
+    /// The un-armed refusal every diagnosis test expects. A mismatch here is a test defect — none of
+    /// those tests names anything in the arming set — so it panics with the message rather than
+    /// letting a wrong variant satisfy a `to_string()` assertion by accident.
+    fn unproven_of(err: ArmingRefusal) -> NotProvablyTestnet {
+        match err {
+            ArmingRefusal::NotProvablyTestnet(err) => err,
+            ArmingRefusal::Mismatch(err) => panic!("expected NotProvablyTestnet, got: {err}"),
+        }
+    }
+
+    /// The mirror: the refusal the arming-value tests expect.
+    fn mismatch_of(err: ArmingRefusal) -> ArmingMismatch {
+        match err {
+            ArmingRefusal::Mismatch(err) => err,
+            ArmingRefusal::NotProvablyTestnet(err) => panic!("expected ArmingMismatch, got: {err}"),
+        }
+    }
+
+    fn armed(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
 
     // One constant per clause, shared by the positive AND negative assertions on purpose. Half these
     // tests assert a clause is *absent* — that is what stops any one clause becoming a catch-all —
@@ -813,7 +1067,7 @@ mod tests {
     fn a_whitespace_variant_is_diagnosed_rather_than_blamed_on_mainnet() {
         // The commonest real config slip. Fail-closed is unchanged — what must change is that the
         // refusal names the TRUE cause instead of offering three false ones and then the arming flag.
-        let err = check_arming(&[req("eip155:84532 ")], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req("eip155:84532 ")], &[]).unwrap_err());
         let msg = err.to_string();
         assert!(msg.contains(NEAR_MISS_CLAUSE), "a near-miss must be diagnosed, got: {msg}");
         // Teeth for the near-miss/placeholder split: an *allowlist* near-miss must still get the
@@ -832,30 +1086,37 @@ mod tests {
     fn the_refusal_names_the_pin_date() {
         // Staleness is the one cause that grows by itself AND the one where the operator is right
         // that the guard is wrong. The age has to be visible where they decide about the flag.
-        let err = check_arming(&[req("eip155:99999999")], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req("eip155:99999999")], &[]).unwrap_err());
         assert!(err.to_string().contains(PINNED_ON), "refusal must carry the pin date");
     }
 
     #[test]
     fn an_unarmed_mainnet_network_refuses_to_start() {
-        let err = check_arming(&[req(BASE_MAINNET)], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req(BASE_MAINNET)], &[]).unwrap_err());
         assert_eq!(err.networks, vec![BASE_MAINNET.to_string()]);
         // The message must name the offender and the flag, or an operator cannot act on it.
         let msg = err.to_string();
         assert!(msg.contains(BASE_MAINNET), "must name the network, got: {msg}");
-        assert!(msg.contains("OBOLUS_ALLOW_MAINNET=1"), "must name the flag, got: {msg}");
+        assert!(
+            msg.contains("set OBOLUS_ALLOW_MAINNET to exactly the id(s) above"),
+            "must name the flag and the form its value takes, got: {msg}"
+        );
+        assert!(
+            !msg.contains("OBOLUS_ALLOW_MAINNET=1"),
+            "the retired boolean form must not be offered as the remedy, got: {msg}"
+        );
     }
 
     #[test]
     fn the_same_mainnet_network_starts_when_armed() {
-        let unproven = check_arming(&[req(BASE_MAINNET)], true).unwrap();
+        let unproven = check_arming(&[req(BASE_MAINNET)], &[BASE_MAINNET.to_string()]).unwrap();
         // Reported back, not swallowed: the caller needs it to print an honest banner.
         assert_eq!(unproven, vec![BASE_MAINNET.to_string()]);
     }
 
     #[test]
     fn a_known_testnet_starts_unarmed() {
-        let unproven = check_arming(&[req("eip155:84532")], false).unwrap();
+        let unproven = check_arming(&[req("eip155:84532")], &[]).unwrap();
         assert!(unproven.is_empty(), "Base Sepolia is on the allowlist, got {unproven:?}");
     }
 
@@ -863,7 +1124,7 @@ mod tests {
     fn the_placeholder_default_starts_unarmed() {
         // An out-of-the-box Obolus must boot without arming anything — otherwise the first thing
         // every operator learns is how to set the mainnet flag.
-        let unproven = check_arming(&[req(PLACEHOLDER_NETWORK)], false).unwrap();
+        let unproven = check_arming(&[req(PLACEHOLDER_NETWORK)], &[]).unwrap();
         assert!(unproven.is_empty(), "the default must not need arming, got {unproven:?}");
     }
 
@@ -877,7 +1138,7 @@ mod tests {
             req(BASE_MAINNET),
             req("eip155:421614"),
         ];
-        let err = check_arming(&reqs, false).unwrap_err();
+        let err = unproven_of(check_arming(&reqs, &[]).unwrap_err());
         assert_eq!(err.networks, vec![BASE_MAINNET.to_string()]);
     }
 
@@ -886,14 +1147,14 @@ mod tests {
         // The discriminating case for allowlist-vs-denylist. This id is on no list of ours, mainnet
         // or testnet; a denylist implementation would wave it through, an allowlist refuses.
         let unknown = "eip155:99999999";
-        let err = check_arming(&[req(unknown)], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req(unknown)], &[]).unwrap_err());
         assert_eq!(err.networks, vec![unknown.to_string()]);
     }
 
     #[test]
     fn every_offender_is_named_not_just_the_first() {
         let reqs = [req(BASE_MAINNET), req("eip155:84532"), req("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp")];
-        let err = check_arming(&reqs, false).unwrap_err();
+        let err = unproven_of(check_arming(&reqs, &[]).unwrap_err());
         assert_eq!(
             err.networks,
             vec![BASE_MAINNET.to_string(), "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp".to_string()],
@@ -910,14 +1171,14 @@ mod tests {
         // construction, which is why it goes there.
         let variant = "EIP155:84532";
         assert!(!is_provably_testnet(variant));
-        assert!(check_arming(&[req(variant)], false).is_err());
+        assert!(check_arming(&[req(variant)], &[]).is_err());
     }
 
     #[test]
     fn an_empty_requirement_set_is_not_this_guards_problem() {
         // `Gateway::new` already rejects an empty option set. The guard must not invent a second
         // opinion about it: nothing advertised is nothing unproven.
-        assert!(check_arming(&[], false).unwrap().is_empty());
+        assert!(check_arming(&[], &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -931,7 +1192,7 @@ mod tests {
         assert!(!homoglyph.is_ascii(), "the fixture must actually carry a non-ASCII byte");
         assert!(!is_provably_testnet(homoglyph));
 
-        let err = check_arming(&[req(homoglyph)], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req(homoglyph)], &[]).unwrap_err());
         let rendered = err.to_string();
 
         // The escaped form is the whole point: `\u{435}` is the only place in this message where
@@ -964,7 +1225,7 @@ mod tests {
         assert!(!nbsp.is_ascii());
         assert!(!is_provably_testnet(nbsp));
 
-        let err = check_arming(&[req(nbsp)], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req(nbsp)], &[]).unwrap_err());
         let rendered = err.to_string();
 
         assert!(rendered.contains(NEAR_MISS_CLAUSE), "near-miss clause missing:\n{rendered}");
@@ -984,7 +1245,7 @@ mod tests {
     fn an_ascii_offender_gets_no_non_ascii_clause() {
         // Teeth for the clause above: it must fire on non-ASCII and nothing else. A plain unknown
         // mainnet is pure ASCII and should reach the generic three-cause text untouched.
-        let err = check_arming(&[req(BASE_MAINNET)], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req(BASE_MAINNET)], &[]).unwrap_err());
         assert!(!err.to_string().contains(NON_ASCII_CLAUSE), "got:\n{err}");
         // Same fixture is the teeth for the CAIP-2 clause: a real mainnet id has a colon, so the
         // short-name clause must stay silent. Without this the clause could fire on everything and
@@ -999,7 +1260,7 @@ mod tests {
         // byte-exact — so the refusal has to say *why*, or the operator reads three false causes
         // about an id they copied from the spec and the arming flag is the only actionable thing
         // left in the message.
-        let err = check_arming(&[req("base-sepolia")], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req("base-sepolia")], &[]).unwrap_err());
         let rendered = err.to_string();
 
         assert!(rendered.contains(SHORT_NAME_CLAUSE), "got:\n{rendered}");
@@ -1023,7 +1284,7 @@ mod tests {
         // be a fourth wrong diagnosis, which is the failure mode this whole clause set exists to
         // avoid.
         for malformed in ["eip155:", ":84532"] {
-            let err = check_arming(&[req(malformed)], false).unwrap_err();
+            let err = unproven_of(check_arming(&[req(malformed)], &[]).unwrap_err());
             assert!(!err.to_string().contains(SHORT_NAME_CLAUSE), "{malformed:?} got:\n{err}");
         }
     }
@@ -1038,7 +1299,7 @@ mod tests {
         // Whitespace-only is the same defect wearing a disguise: it has no colon either, and
         // `near_miss` trims it to "" and matches nothing.
         for empty in ["", " ", "\t", "\u{a0}"] {
-            let err = check_arming(&[req(empty)], false).unwrap_err();
+            let err = unproven_of(check_arming(&[req(empty)], &[]).unwrap_err());
             let rendered = err.to_string();
             assert!(
                 rendered.contains(EMPTY_CLAUSE),
@@ -1058,7 +1319,7 @@ mod tests {
         // suppressing the later one would cost the operator a whole restart cycle: they retype the id
         // by hand as instructed, get `base-sepolia`, restart, and hit the refusal again, having spent
         // two restarts learning two facts both known at the first one.
-        let err = check_arming(&[req("bas\u{435}-sepolia")], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req("bas\u{435}-sepolia")], &[]).unwrap_err());
         let rendered = err.to_string();
 
         assert!(rendered.contains(NON_ASCII_CLAUSE), "got:\n{rendered}");
@@ -1085,7 +1346,7 @@ mod tests {
         assert_eq!(near_miss(&variant), None, "must NOT near-miss anything on the allowlist");
         assert!(!is_not_caip2(&variant), "the placeholder is not an x402 short name");
 
-        let err = check_arming(&[req(&variant)], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req(&variant)], &[]).unwrap_err());
         let rendered = err.to_string();
 
         // Both applicable clauses, so the overlap this fixture still demonstrates stays honest.
@@ -1119,7 +1380,7 @@ mod tests {
         let shouted = PLACEHOLDER_NETWORK.to_ascii_uppercase();
         assert!(!is_provably_testnet(&shouted), "byte-exact comparison still refuses it");
 
-        let err = check_arming(&[req(&shouted)], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req(&shouted)], &[]).unwrap_err());
         let rendered = err.to_string();
 
         assert!(rendered.contains(PLACEHOLDER_CLAUSE), "got:\n{rendered}");
@@ -1136,7 +1397,7 @@ mod tests {
         // message is all the operator sees. Un-deduped it lists the id twice in the header and
         // repeats its whole ~470-character paragraph byte-identically, which reads as the message
         // being broken rather than the config.
-        let err = check_arming(&[req("base-sepolia"), req("base-sepolia")], false).unwrap_err();
+        let err = unproven_of(check_arming(&[req("base-sepolia"), req("base-sepolia")], &[]).unwrap_err());
         let rendered = err.to_string();
 
         assert_eq!(err.networks, vec!["base-sepolia".to_string()], "offenders must be distinct");
@@ -1157,7 +1418,7 @@ mod tests {
         //
         // Both assertions are about the *shape*, deliberately loose on wording so this does not
         // become a change-detector — what must not regress is per-offender repetition returning.
-        let err = check_arming(
+        let err = unproven_of(check_arming(
             &[
                 req("base-sepolia"),
                 req("base-sepolia"),
@@ -1165,9 +1426,9 @@ mod tests {
                 req("solana-devnet"),
                 req("arbitrum-sepolia"),
             ],
-            false,
+            &[],
         )
-        .unwrap_err();
+        .unwrap_err());
         let rendered = err.to_string();
 
         // One bullet per clause kind, not per offender: three kinds fire here (near-miss, short
@@ -1183,9 +1444,10 @@ mod tests {
             "one bullet per firing clause kind plus the closing line:\n{rendered}"
         );
         // Two today, both in the header and both load-bearing: the escape hatch has to be nameable
-        // ("to advertise anyway, set OBOLUS_ALLOW_MAINNET=1") and warned against ("do NOT reach
-        // for"). The clauses name it none. The bound allows one more for headroom; anything past
-        // that is per-offender repetition creeping back, which measured at seven.
+        // ("to advertise anyway, set OBOLUS_ALLOW_MAINNET to exactly the id(s) above") and warned
+        // against ("do NOT reach for"). The clauses name it none. The bound allows one more for
+        // headroom; anything past that is per-offender repetition creeping back, which measured at
+        // seven.
         assert!(
             rendered.matches("OBOLUS_ALLOW_MAINNET").count() <= 3,
             "the flag must not gain salience with N; got {} mentions in:\n{rendered}",
@@ -1203,5 +1465,193 @@ mod tests {
         for admitted in TESTNET_NETWORKS.iter().chain(std::iter::once(&PLACEHOLDER_NETWORK)) {
             assert!(admitted.is_ascii(), "{admitted:?} is not pure ASCII");
         }
+    }
+
+    // ── Arming names its target ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_unset_arming_value_arms_nothing() {
+        assert_eq!(parse_arming(None).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn arming_values_split_on_commas_and_are_taken_verbatim() {
+        assert_eq!(parse_arming(Some(BASE_MAINNET)).unwrap(), armed(&[BASE_MAINNET]));
+        assert_eq!(
+            parse_arming(Some("eip155:8453,eip155:1")).unwrap(),
+            armed(&[BASE_MAINNET, ETH_MAINNET])
+        );
+        // No trimming: the byte-exact rule applies to the arming value as it does to the
+        // advertisement, so the space survives and is refused downstream, quoted, where an
+        // operator can see it.
+        assert_eq!(parse_arming(Some("eip155:8453, eip155:1")).unwrap(), armed(&[BASE_MAINNET, " eip155:1"]));
+    }
+
+    #[test]
+    fn the_retired_boolean_form_is_refused_by_name() {
+        let err = parse_arming(Some("1")).unwrap_err();
+        assert_eq!(err, ArmingValueError::RetiredBooleanForm);
+        let msg = err.to_string();
+        assert!(msg.starts_with("OBOLUS_ALLOW_MAINNET=1 no longer arms anything"), "got: {msg}");
+        assert!(msg.contains("network id(s) to arm"), "must point at the named form, got: {msg}");
+        // The whitespace-adjacent forms old notes and CRLF files produce get the same pointer,
+        // not the generic mismatch; a refusal either way, so this widens nothing.
+        for cousin in ["1 ", " 1", "1\r", "\t1\n"] {
+            assert_eq!(
+                parse_arming(Some(cousin)).unwrap_err(),
+                ArmingValueError::RetiredBooleanForm,
+                "{cousin:?} must be recognised as the retired form"
+            );
+        }
+        // But not the boolean's other spellings, which name no network and land in the mismatch.
+        assert!(parse_arming(Some("true")).is_ok());
+        assert!(parse_arming(Some("11")).is_ok());
+    }
+
+    #[test]
+    fn a_set_but_empty_arming_value_is_refused() {
+        assert_eq!(parse_arming(Some("")).unwrap_err(), ArmingValueError::SetButEmpty);
+        assert_eq!(parse_arming(Some("  ")).unwrap_err(), ArmingValueError::SetButEmpty);
+    }
+
+    #[test]
+    fn an_empty_entry_is_refused_with_its_position() {
+        assert_eq!(
+            parse_arming(Some("eip155:8453,")).unwrap_err(),
+            ArmingValueError::EmptyEntry { position: 2 }
+        );
+        assert_eq!(
+            parse_arming(Some(",eip155:8453")).unwrap_err(),
+            ArmingValueError::EmptyEntry { position: 1 }
+        );
+        assert_eq!(
+            parse_arming(Some("eip155:8453,,eip155:1")).unwrap_err(),
+            ArmingValueError::EmptyEntry { position: 2 }
+        );
+    }
+
+    #[test]
+    fn a_duplicated_arming_entry_is_refused() {
+        let err = parse_arming(Some("eip155:8453,eip155:1,eip155:8453")).unwrap_err();
+        assert_eq!(err, ArmingValueError::Duplicate(BASE_MAINNET.to_string()));
+        assert!(err.to_string().contains("\"eip155:8453\" twice"), "got: {err}");
+    }
+
+    #[test]
+    fn arming_names_every_unproven_network_or_refuses() {
+        // Two unproven networks advertised, one armed: the OTHER is refused — and the refusal
+        // names only it, never the id the operator deliberately armed beside it.
+        let reqs = [req(BASE_MAINNET), req("eip155:84532"), req(ETH_MAINNET)];
+        let err = unproven_of(check_arming(&reqs, &armed(&[BASE_MAINNET])).unwrap_err());
+        assert_eq!(err.networks, vec![ETH_MAINNET.to_string()]);
+        assert_eq!(err.armed, armed(&[BASE_MAINNET]));
+        let msg = err.to_string();
+        assert!(msg.contains("\"eip155:1\""), "must name the unnamed offender, got: {msg}");
+        // The remedy is "add to", naming what is already armed: an operator following "set the
+        // variable to the id(s) above" literally would have dropped Base.
+        assert!(
+            msg.contains("add the id(s) above to OBOLUS_ALLOW_MAINNET, which already names \"eip155:8453\""),
+            "the remedy must not tell the operator to overwrite an armed id, got: {msg}"
+        );
+        assert!(!msg.contains("set OBOLUS_ALLOW_MAINNET to exactly"), "got: {msg}");
+
+        // Naming both starts, and reports exactly the unproven pair in advertised order.
+        let both = check_arming(&reqs, &armed(&[ETH_MAINNET, BASE_MAINNET])).unwrap();
+        assert_eq!(both, armed(&[BASE_MAINNET, ETH_MAINNET]));
+    }
+
+    #[test]
+    fn arming_an_unadvertised_network_is_a_mismatch() {
+        // The typo case: the value names an id nothing advertises. Refused, not ignored — an
+        // arming value that is wrong about itself must not be a value that "changed nothing".
+        let reqs = [req(BASE_MAINNET)];
+        let err = mismatch_of(check_arming(&reqs, &armed(&[BASE_MAINNET, "eip155:8543"])).unwrap_err());
+        assert_eq!(err.unadvertised, armed(&["eip155:8543"]));
+        assert!(err.already_testnet.is_empty());
+        let msg = err.to_string();
+        assert!(msg.starts_with("OBOLUS_ALLOW_MAINNET names 1 network id(s) this gateway cannot arm."), "got: {msg}");
+        assert!(msg.contains("Not advertised by this gateway: \"eip155:8543\"."), "got: {msg}");
+        assert!(!msg.contains("Already provably testnet"), "an empty group must leave no sentence, got: {msg}");
+        // One restart, not two: the refusal says what is advertised and what the value must be.
+        assert!(msg.contains("This gateway advertises \"eip155:8453\"."), "got: {msg}");
+        assert!(msg.ends_with("Here that is \"eip155:8453\"."), "got: {msg}");
+
+        // The boolean form's plausible cousins land here too: they name no network at all.
+        let err = mismatch_of(check_arming(&reqs, &armed(&["true"])).unwrap_err());
+        assert_eq!(err.unadvertised, armed(&["true"]));
+        assert_eq!(err.advertised, armed(&[BASE_MAINNET]));
+        assert_eq!(err.unproven, armed(&[BASE_MAINNET]));
+
+        // The value right and the advertisement missing: what an operator sees when the network
+        // variable did not reach the process and the placeholder is advertised instead. The remedy
+        // must not be "remove the id" — it is to unset, with what arrived printed so the missing
+        // variable is the obvious next question.
+        let err = mismatch_of(check_arming(&[req(PLACEHOLDER_NETWORK)], &armed(&[BASE_MAINNET])).unwrap_err());
+        let msg = err.to_string();
+        assert!(msg.contains(&format!("This gateway advertises {}.", legible(PLACEHOLDER_NETWORK))), "got: {msg}");
+        assert!(msg.ends_with("Here nothing is: unset the variable."), "got: {msg}");
+        assert!(err.unproven.is_empty());
+
+        // Nothing advertised at all reads the same way, rather than as an empty list.
+        let err = mismatch_of(check_arming(&[], &armed(&[BASE_MAINNET])).unwrap_err());
+        assert!(err.to_string().contains("This gateway advertises nothing."), "got: {err}");
+
+        // Two or more to name: the quoted list is for reading, and the value is spelled out as it
+        // goes into the environment — copying the quoted list with its separators would arm
+        // `" eip155:1"`.
+        let err = mismatch_of(
+            check_arming(&[req(BASE_MAINNET), req(ETH_MAINNET)], &armed(&["eip155:8543"])).unwrap_err(),
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.ends_with(
+                "Here that is \"eip155:8453\", \"eip155:1\" (as one value: \
+                 OBOLUS_ALLOW_MAINNET=eip155:8453,eip155:1)."
+            ),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn arming_a_network_that_is_already_testnet_is_a_mismatch() {
+        let reqs = [req("eip155:84532")];
+        let err = mismatch_of(check_arming(&reqs, &armed(&["eip155:84532"])).unwrap_err());
+        assert!(err.unadvertised.is_empty());
+        assert_eq!(err.already_testnet, armed(&["eip155:84532"]));
+        let msg = err.to_string();
+        assert!(msg.contains("Already provably testnet, so not armable: \"eip155:84532\"."), "got: {msg}");
+        assert!(!msg.contains("Not advertised"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_mismatch_is_reported_before_an_unarmed_offender() {
+        // Both defects at once: the value names a typo AND the real mainnet goes unnamed. The
+        // mismatch wins, because "your value names something that is not there" is the fact the
+        // operator has to fix first — the NotProvablyTestnet remedy would tell them to set a value
+        // they believe they already set.
+        let reqs = [req(BASE_MAINNET), req("eip155:84532")];
+        let err = mismatch_of(check_arming(&reqs, &armed(&["eip155:8543", "eip155:84532"])).unwrap_err());
+        assert_eq!(err.unadvertised, armed(&["eip155:8543"]));
+        assert_eq!(err.already_testnet, armed(&["eip155:84532"]));
+        assert_eq!(err.advertised, armed(&[BASE_MAINNET, "eip155:84532"]));
+        assert_eq!(err.unproven, armed(&[BASE_MAINNET]));
+        let msg = err.to_string();
+        assert!(msg.contains("names 2 network id(s)"), "got: {msg}");
+        // ...and the mismatch still says what the value should have been, so the un-named mainnet
+        // is learned at this restart, not the next.
+        assert!(msg.contains("Here that is \"eip155:8453\""), "got: {msg}");
+    }
+
+    #[test]
+    fn the_arming_comparison_is_byte_exact() {
+        // A whitespace variant in the VALUE is a mismatch (unadvertised, quoted so the space shows),
+        // not a match for the id it nearly spells.
+        let reqs = [req(BASE_MAINNET)];
+        let err = mismatch_of(check_arming(&reqs, &armed(&["eip155:8453 "])).unwrap_err());
+        assert!(err.to_string().contains("\"eip155:8453 \""), "got: {err}");
+        // And the reverse: a whitespace variant in the ADVERTISEMENT is not armed by the clean id —
+        // which, advertised by nobody, is itself the mismatch reported.
+        let err = mismatch_of(check_arming(&[req("eip155:8453 ")], &armed(&[BASE_MAINNET])).unwrap_err());
+        assert_eq!(err.unadvertised, armed(&[BASE_MAINNET]));
     }
 }

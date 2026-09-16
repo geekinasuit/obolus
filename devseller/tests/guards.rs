@@ -4,7 +4,7 @@
 //!
 //! Every guard in `main` is unreachable from a unit test: `src/main.rs` is the binary's crate root,
 //! and the checks it performs are statements in `main` rather than functions anything else calls.
-//! Deleting the placeholder refusal, hardcoding `check_arming`'s `armed` to `true`, or moving
+//! Deleting the placeholder refusal, handing `check_arming` every advertised id as armed, or moving
 //! either below the advertisement banner all compile and leave the 30-test unit suite fully green.
 //!
 //! So these tests run the shipped binary and read its behaviour off stderr. That is the only
@@ -211,13 +211,20 @@ impl Run {
 /// The baseline is a configuration that gets past every guard, so any test that observes a refusal
 /// is observing the effect of its own `vars` and not of an incidental gap in the setup.
 fn run(vars: &[(&str, &str)]) -> Run {
-    let mut all: Vec<(&str, &str)> = vec![
-        ("OBOLUS_NETWORK", TESTNET),
-        ("OBOLUS_ASSET", SYNTHETIC_ASSET),
-        ("OBOLUS_PAY_TO", SYNTHETIC_PAY_TO),
+    let vars: Vec<(&str, &std::ffi::OsStr)> =
+        vars.iter().map(|(key, value)| (*key, std::ffi::OsStr::new(value))).collect();
+    run_os(&vars)
+}
+
+/// [`run`] for values a `&str` cannot express — a non-UTF-8 value, which one test needs.
+fn run_os(vars: &[(&str, &std::ffi::OsStr)]) -> Run {
+    let mut all: Vec<(&str, &std::ffi::OsStr)> = vec![
+        ("OBOLUS_NETWORK", std::ffi::OsStr::new(TESTNET)),
+        ("OBOLUS_ASSET", std::ffi::OsStr::new(SYNTHETIC_ASSET)),
+        ("OBOLUS_PAY_TO", std::ffi::OsStr::new(SYNTHETIC_PAY_TO)),
     ];
     all.extend_from_slice(vars);
-    exec(&all)
+    exec_os(&all)
 }
 
 /// Run with an `OBOLUS_ACCEPTS` array and **no** single-chain baseline.
@@ -256,6 +263,12 @@ fn without_ambient_config(cmd: &mut Command) {
 }
 
 fn exec(vars: &[(&str, &str)]) -> Run {
+    let vars: Vec<(&str, &std::ffi::OsStr)> =
+        vars.iter().map(|(key, value)| (*key, std::ffi::OsStr::new(value))).collect();
+    exec_os(&vars)
+}
+
+fn exec_os(vars: &[(&str, &std::ffi::OsStr)]) -> Run {
     // Occupy a loopback port and hand it to the child so that bind — the last statement of startup
     // — always fails. See the module docs.
     let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy a loopback port");
@@ -384,11 +397,28 @@ fn a_testnet_configuration_gets_past_startup() {
     run.must_not_say(BEYOND_LOOPBACK);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_arming_value_is_still_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    // "Set at all" has to include a value `std::env::var` cannot return: read through that
+    // function, a non-UTF-8 value is an error, and an error read as "absent" would let the one
+    // value shape this refusal cannot see boot clean on a testnet configuration.
+    let value = std::ffi::OsStr::from_bytes(b"1\xff");
+    let run = run_os(&[("OBOLUS_ALLOW_MAINNET", value)]);
+
+    run.must_say("this binary has no arming override");
+    run.must_have_refused_during_startup();
+}
+
 #[test]
 fn an_unarmed_mainnet_network_refuses_to_start() {
     let run = run(&[("OBOLUS_NETWORK", MAINNET)]);
 
     run.must_say("not on Obolus's pinned testnet allowlist");
+    // The shared refusal's remedy offers `obolus`'s arming value; this binary has to say that
+    // instruction is a dead end here, or the operator's next start is a second refusal.
+    run.must_say("that remedy does not exist here");
     run.must_have_refused_during_startup();
 }
 
@@ -864,8 +894,9 @@ fn the_open_proxy_refusal_can_be_acknowledged() {
     run.must_say(BEYOND_LOOPBACK);
 }
 
-/// Anything other than exactly `"1"` leaves the refusal armed — the safe direction for a typo, and
-/// the same convention `OBOLUS_ALLOW_MAINNET` uses in `obolus`.
+/// Anything other than exactly `"1"` leaves the refusal armed — the safe direction for a typo. This
+/// acknowledgement stays a boolean (there is exactly one thing here to acknowledge); `obolus`'s
+/// arming value, by contrast, names the network ids it arms.
 #[test]
 fn a_misspelled_acknowledgement_does_not_arm_anything() {
     for value in ["true", "yes", "0", "", "1 "] {

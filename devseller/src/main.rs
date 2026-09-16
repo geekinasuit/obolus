@@ -63,8 +63,10 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8404";
 const PLACEHOLDER_PAY_TO: &str = "0xTEST-PAY-TO-ADDRESS-NOT-REAL";
 const PLACEHOLDER_ASSET: &str = "0xTEST-ASSET-ADDRESS-NOT-REAL";
 
-/// The acknowledgement that turns the open-proxy refusal off. Exactly the string `"1"`, matching
-/// `OBOLUS_ALLOW_MAINNET`'s convention in `obolus` — the safe direction for a typo.
+/// The acknowledgement that turns the open-proxy refusal off. Exactly the string `"1"`: anything
+/// else (`true`, `yes`, empty) does not acknowledge, which is the safe direction for a typo. This
+/// one stays a boolean where `obolus`'s arming value names its target — there is exactly one thing
+/// here to acknowledge, so a name would add nothing.
 const ALLOW_OPEN_PROXY_VAR: &str = "OBOLUS_DEV_ALLOW_OPEN_PROXY";
 
 /// What `--help` prints.
@@ -247,7 +249,9 @@ async fn main() -> anyhow::Result<()> {
 
     // No arming override exists here, and a flag that silently does nothing is worse than one that
     // is absent: an operator who sets it believes they have armed something.
-    if std::env::var("OBOLUS_ALLOW_MAINNET").is_ok() {
+    // `var_os`, not `var`: a non-UTF-8 value is still a value that is set, and `var` reports it as
+    // an error that a presence test would read as absent.
+    if std::env::var_os("OBOLUS_ALLOW_MAINNET").is_some() {
         anyhow::bail!(
             "OBOLUS_ALLOW_MAINNET is set, and this binary has no arming override. \
              obolus-devseller settles no payment — it hands out whatever is behind it for free — \
@@ -257,9 +261,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // `armed: false`, hardcoded — not a variable, not a parameter. Refuses on any network not on
-    // the pinned testnet allowlist.
-    check_arming(&requirements, false)?;
+    // Nothing armed, hardcoded — an empty set, not a variable, not a parameter. Refuses on any
+    // network not on the pinned testnet allowlist. The refusal's own remedy is written for
+    // `obolus` and offers the arming value; here that instruction leads only to the refusal above,
+    // so the text says so before the operator tries it.
+    check_arming(&requirements, &[]).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}\nobolus-devseller has no arming override, so that remedy does not exist here: the \
+             only fix is a network on the pinned testnet allowlist."
+        )
+    })?;
 
     // ...and separately, the placeholder, which the check above ADMITS through a clause of its own
     // (`obolus::arming::is_provably_testnet`). Two directions, two guards: deleting either one
