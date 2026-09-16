@@ -114,6 +114,15 @@ const PAST_STARTUP: &str = "starting on";
 const STARTUP_LINE: &str = "obolus: ";
 const BAILED: &str = "Error:";
 
+/// The remedy every facilitator-URL refusal points at (#35). This binary has no outbound TLS
+/// client, and the public testnet facilitator is served over https, so the way to reach it is a
+/// proxy in front of the process that accepts `http://` and speaks `https://` onward. One needle
+/// shared by the missing-variable and the https-refusal tests, so the two messages cannot drift
+/// apart — and cannot drift back to recommending a URL the binary then refuses, which is how #35
+/// was found. The phrase names the proxy's outbound leg on purpose: "terminate TLS" is the
+/// inbound idiom, and this direction is the one the README keeps distinct from it.
+const TLS_REMEDY: &str = "speaks https:// to the facilitator";
+
 /// The x402-short-name diagnosis clause's lead-in, asserted both present and absent below. One
 /// constant on purpose: a `must_not_say` written against a stale literal is satisfied by wording
 /// drift exactly as happily as by correct behaviour, so the two directions have to share a needle
@@ -386,6 +395,13 @@ fn temp_file(name: &str, contents: &str) -> String {
 
 /// Run the real server binary to completion with `vars` applied over a fixed, valid baseline.
 fn run(vars: &[(&str, &str)]) -> Run {
+    run_without(&[], vars)
+}
+
+/// [`run`], then with `remove` taken back out of the environment — for the refusals only a
+/// variable's *absence* can reach, which the baseline otherwise forecloses by supplying every
+/// required one. Removal is applied last, so a name in both `vars` and `remove` ends up absent.
+fn run_without(remove: &[&str], vars: &[(&str, &str)]) -> Run {
     // Both halves of the dual build, because both are supposed to pass. Bazel passes the path
     // through the rule's `env`; cargo sets `CARGO_BIN_EXE_<bin>` at compile time. `option_env!`
     // rather than `env!` because the latter is a compile error under Bazel, where cargo's variable
@@ -415,6 +431,9 @@ fn run(vars: &[(&str, &str)]) -> Run {
     cmd.env("OBOLUS_FACILITATOR_URL", "http://127.0.0.1:9/facilitator");
     for (key, value) in vars {
         cmd.env(key, value);
+    }
+    for key in remove {
+        cmd.env_remove(key);
     }
 
     let output = cmd.output().expect("run the server binary");
@@ -763,6 +782,31 @@ fn an_empty_accepts_alongside_single_chain_vars_reports_the_true_premise() {
     // negative would be satisfied by the very text it checks for the absence of.
     run.must_not_say("would be silently ignored");
     run.must_have_refused_during_startup();
+}
+
+#[test]
+fn a_missing_facilitator_url_refuses_and_names_the_tls_remedy() {
+    // The one required variable with no default. The refusal is where an operator first meets the
+    // facilitator question, so what it recommends has to be something the binary then accepts.
+    let run = run_without(&["OBOLUS_FACILITATOR_URL"], &[]);
+
+    run.must_have_refused_during_startup();
+    run.must_say(BAILED);
+    run.must_say("OBOLUS_FACILITATOR_URL is required");
+    run.must_say(TLS_REMEDY);
+}
+
+#[test]
+fn an_https_facilitator_url_refuses_and_names_the_tls_remedy() {
+    // The URL an operator would reach for first — the public testnet facilitator — is https, and
+    // this binary speaks plain http. The refusal must say what to do instead, not only what it
+    // will not do; "use an http:// endpoint" on its own reads as "there is no way to reach it".
+    let run = run(&[("OBOLUS_FACILITATOR_URL", "https://x402.org/facilitator")]);
+
+    run.must_have_refused_during_startup();
+    run.must_say(BAILED);
+    run.must_say("OBOLUS_FACILITATOR_URL");
+    run.must_say(TLS_REMEDY);
 }
 
 #[test]

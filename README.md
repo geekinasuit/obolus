@@ -75,17 +75,17 @@ there is no mainnet signing path in the binary.
 
 **`OBOLUS_FACILITATOR_URL` is required and has no default** — a payment gateway must never guess where
 money settles, so the server refuses to start without it. It is the base URL of the x402 facilitator
-(`/verify` and `/settle` are appended); it must be `http://` (TLS is not wired in Phase A). The address
-in the example above is a **placeholder** — point it at whatever x402 facilitator you actually run. Note
-that the public testnet facilitator (`x402.org`) is served over `https`, so reaching it from this
-http-only client means terminating TLS in front of it — that belongs to the not-yet-built testnet e2e
-rail, not this binary.
+(`/verify` and `/settle` are appended); it must be `http://`, because the binary has no outbound TLS
+client. The public testnet facilitator (`x402.org`) is served over `https`, so reaching it means a
+proxy in front of the gateway that speaks `https` on its behalf — the address in the example above
+is where such a proxy would listen, and [Reaching an https facilitator](#reaching-an-https-facilitator)
+gives the recipe.
 
 Configuration is by environment variable:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `OBOLUS_FACILITATOR_URL` | **required** | Base URL of the x402 facilitator that verifies and settles payments (`/verify` + `/settle` appended). No default: the server refuses to start without it rather than guess where money settles. Must be `http://` (no TLS wired) or startup aborts. |
+| `OBOLUS_FACILITATOR_URL` | **required** | Base URL of the x402 facilitator that verifies and settles payments (`/verify` + `/settle` appended). No default: the server refuses to start without it rather than guess where money settles. Must be `http://` (no outbound TLS client) or startup aborts; for an `https` facilitator, point this at a local TLS-terminating proxy — see [Reaching an https facilitator](#reaching-an-https-facilitator). |
 | `OBOLUS_UPSTREAM_URL` | `http://127.0.0.1:11434` | Ollama origin the gateway proxies to. Origin only (scheme + host + port); the `/v1/chat/completions` path is appended. Must be `http://` — the client speaks plain HTTP only (no TLS is wired), so an `https://` or schemeless value is rejected at startup rather than 502-ing every paid request. |
 | `OBOLUS_ADDR` | `127.0.0.1:8403` | Bind address. Must parse as a socket address or the server refuses to start. |
 | `OBOLUS_RESOURCE` | `http://<ADDR>/v1/chat/completions` | The resource the 402 challenge tells the payer to pay for, so it must be an address they can actually reach. The default is derived from the bind address, which is only correct when that address is routable — **set this explicitly** behind a reverse proxy, a container port map, or a wildcard (`0.0.0.0`) bind, or the challenge advertises a resource nobody can pay for. |
@@ -124,6 +124,48 @@ because this is the variable whose *set-ness* chooses which of the two configura
 empty value takes the multi-chain door and configures nothing, while still superseding every
 single-chain variable — so the refusal says exactly that and tells you to unset it, rather than
 handing you a JSON parser error about column 1 for a value you never meant to be JSON.
+
+### Reaching an https facilitator
+
+The gateway has no outbound TLS client, and the public testnet facilitator is served over `https`,
+so between the two sits a proxy that accepts plain `http://` from the gateway and speaks `https://`
+to the facilitator. That is a **deployment requirement, not an implementation detail.** Pointed
+straight at an `https://` URL, the gateway refuses to start and says so. Pointed at a proxy that is
+not running, it starts fine — the facilitator is only dialled when a payment arrives — and then
+answers every paid request with a 502 while `/health` still reports OK.
+
+One line does it with [Caddy](https://caddyserver.com/):
+
+```bash
+caddy reverse-proxy --from http://127.0.0.1:8404 --to https://x402.org --change-host-header
+```
+
+```bash
+OBOLUS_FACILITATOR_URL=http://127.0.0.1:8404/facilitator bazel run //obolus:obolus
+```
+
+`--from` carries an explicit `http://` so Caddy serves plain HTTP on the loopback instead of minting
+a local certificate, and `--change-host-header` rewrites `Host` to the upstream's, which a
+facilitator behind a shared front end needs in order to route the request. The proxy validates the
+facilitator's certificate, so peer authenticity is still checked — but by a process the gateway
+cannot inspect. That is acceptable when both run on one host under one operator, and it is why an
+in-process TLS client is still owed before anyone else deploys this
+([#35](https://github.com/geekinasuit/obolus/issues/35)).
+
+The proxy also sits inside the settle deadline. `OBOLUS_MAX_TIMEOUT_SECS` plus its margin bounds
+one `/settle` call so that the facilitator's advertised budget is never undercut by the gateway's
+own client — a proxy-side timeout shorter than that undercuts it anyway, and from the gateway's side
+it is indistinguishable from the case it most wants to avoid: a 502 after the facilitator may
+already have moved the money. The one-liner above sets no such timeout, and Caddy's documented
+defaults are a 3-second dial timeout — which can only fire before a request is sent — and no
+response-header, read, or write timeout. Keep it that way, or set anything you add above the
+settle deadline.
+
+This is **outbound** TLS: the gateway as a client. Inbound TLS — clients reaching the gateway — is a
+separate question with the same answer for a different reason: it is terminated outside the process
+so that the binary holds no private key. [Serving without payment](#serving-without-payment) says
+what that costs on the token path, and [#26](https://github.com/geekinasuit/obolus/issues/26) tracks
+the exposure guide.
 
 ## Refusing to advertise an unproven network
 

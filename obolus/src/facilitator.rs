@@ -264,12 +264,15 @@ const MAX_REJECT_REASON_LEN: usize = 128;
 /// "facilitator unavailable" once the URL has reached config.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DelegatedFacilitatorError {
-    /// The base URL is `https://`, but Phase A has no TLS client wired. TLS enters at the connector
-    /// when the live rail is built; until then this type speaks plain HTTP only (a loopback in
-    /// tests, a local facilitator otherwise).
+    /// The base URL is `https://`, but this crate has no outbound TLS client. An in-process client
+    /// is the second stage of #35; until then an https facilitator is reached through a proxy in
+    /// front of the process that accepts plain `http://` and speaks `https://` onward, and this
+    /// type speaks only plain HTTP (a loopback in tests; that proxy, or a local facilitator,
+    /// otherwise).
     #[error(
-        "facilitator base URL {0:?} uses https, but Obolus Phase A has no TLS client wired yet; \
-         use an http:// endpoint until the live rail adds TLS"
+        "facilitator base URL {0:?} uses https, but this binary has no outbound TLS client; put a \
+         local proxy in front of it that accepts http:// and speaks https:// to the facilitator, \
+         and point this at the proxy's http:// address"
     )]
     TlsNotWired(String),
 
@@ -709,6 +712,13 @@ mod delegated_tests {
     fn new_rejects_an_https_base_because_no_tls_is_wired() {
         let err = DelegatedFacilitator::new("https://x402.org/facilitator").unwrap_err();
         assert!(matches!(err, DelegatedFacilitatorError::TlsNotWired(_)), "got {err:?}");
+        // The message names the remedy, not only the refusal: the input here is the public testnet
+        // facilitator, exactly the URL an operator reaches for first, so "use http://" alone reads
+        // as "unreachable". `server_arming` pins the same phrase on the binary's own output.
+        assert!(
+            err.to_string().contains("speaks https:// to the facilitator"),
+            "the https refusal should say how to reach an https facilitator; got: {err}"
+        );
     }
 
     #[tokio::test]
