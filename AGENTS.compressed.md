@@ -25,7 +25,7 @@ tickets|research|plans = GitHub issues ON THIS REPO [part of the project, not a 
   filing = PUBLIC+PERMANENT, edit history included; an issue body can't be quietly taken back
 anything that CANNOT be a public issue stays OUT of the repo ENTIRELY: session handoffs | research depending on infra not published here | plans that would leak something
   →untracked thoughts dir; gitignored AND enforced by `no-stray-notes` CI job [ignore alone defeated by git add -f]
-  that job ALSO rejects REFERENCES to those paths [link to a file not here = broken reference for anyone reading the code]
+  that job ALSO rejects REFERENCES to those paths [link to a file not here = broken reference for anyone reading the code] + references under `serving/`(private monorepo subtree this code was exported from; a path from that layout resolves nowhere here)
   CAN'T TELL WHICH SIDE → keep it OUT [an issue can't be unfiled; moving a note IN later costs nothing]
 write issues+PRs for BOTH audiences(agents+humans read them; padding serves neither): what changed+why, enough for a reader to act on, stop; NO throat-clearing|ceremonial sections|flourish; COMPLETE > SHORT
 public depends only on public: no internal/private repo dep; no sideways reach into sibling project; needed internal code→publish or reimplement first
