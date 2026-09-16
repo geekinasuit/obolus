@@ -7,7 +7,7 @@
 //! them mutated `arming.rs`. That proves the *function* and says nothing about the *call site* —
 //! and the call site is where this guard can actually be defeated. `src/main.rs` is excluded from
 //! the `obolus` library glob and is compiled by no other test target, so nothing else covers it:
-//! hardcoding `armed` to `true`, swapping `?` for `unwrap_or_default()`, or moving `check_arming`
+//! arming every advertised id unconditionally, swapping `?` for `unwrap_or_default()`, or moving `check_arming`
 //! below `Gateway::new` all compile and leave the library suite fully green.
 //!
 //! So these tests run the shipped binary and read its behaviour off stderr and its exit status.
@@ -128,6 +128,17 @@ const TLS_REMEDY: &str = "speaks https:// to the facilitator";
 /// drift exactly as happily as by correct behaviour, so the two directions have to share a needle
 /// or the negative rots silently while the positive keeps it honest.
 const SHORT_NAME_CLAUSE: &str = "Not a CAIP-2 identifier";
+
+/// Lead-in of the refusal for an arming value that names something the gateway cannot arm — an id
+/// it does not advertise, or one already on the allowlist (#28). Arming names its target, so a
+/// value that names the wrong thing is a configuration error, never a no-op: the old `=1` form's
+/// "set but changed nothing" advisory is what this replaces.
+const CANNOT_ARM: &str = "cannot arm";
+
+/// Lead-in of the refusal for the retired boolean form `OBOLUS_ALLOW_MAINNET=1`. Retired rather
+/// than kept as an "arm everything" escape hatch: a process-wide yes is what made the flag reusable
+/// as a general way past the guard instead of a statement about one deployment (#28).
+const RETIRED_FORM: &str = "no longer arms";
 
 /// The refusal's closing steer away from `OBOLUS_ALLOW_MAINNET`. The LEAD-IN only, deliberately:
 /// this guard's real protection is the operator not reaching for the flag, so what must be pinned is
@@ -402,6 +413,14 @@ fn run(vars: &[(&str, &str)]) -> Run {
 /// variable's *absence* can reach, which the baseline otherwise forecloses by supplying every
 /// required one. Removal is applied last, so a name in both `vars` and `remove` ends up absent.
 fn run_without(remove: &[&str], vars: &[(&str, &str)]) -> Run {
+    let vars: Vec<(&str, &std::ffi::OsStr)> =
+        vars.iter().map(|(key, value)| (*key, std::ffi::OsStr::new(value))).collect();
+    run_os(remove, &vars)
+}
+
+/// [`run`] for values a `&str` cannot express — which is exactly one shape, a non-UTF-8 value,
+/// and exactly one test needs it.
+fn run_os(remove: &[&str], vars: &[(&str, &std::ffi::OsStr)]) -> Run {
     // Both halves of the dual build, because both are supposed to pass. Bazel passes the path
     // through the rule's `env`; cargo sets `CARGO_BIN_EXE_<bin>` at compile time. `option_env!`
     // rather than `env!` because the latter is a compile error under Bazel, where cargo's variable
@@ -465,6 +484,25 @@ fn run_without(remove: &[&str], vars: &[(&str, &str)]) -> Run {
     Run { stderr }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_arming_value_refuses() {
+    use std::os::unix::ffi::OsStrExt;
+    // `std::env::var` reports this value as an error, not a string. Read carelessly, that error
+    // is indistinguishable from "unset" — and on an all-testnet gateway "unset" boots clean, with
+    // the variable set and nothing said. The one value shape that could arm nothing and refuse
+    // nothing has to refuse.
+    let value = std::ffi::OsStr::from_bytes(b"eip155:8453\xff");
+    let run = run_os(&[], &[
+        ("OBOLUS_NETWORK", std::ffi::OsStr::new(TESTNET)),
+        ("OBOLUS_ALLOW_MAINNET", value),
+    ]);
+
+    run.must_say("not valid UTF-8");
+    run.must_have_refused_during_startup();
+    run.must_not_say(ALL_CLEAR_CLAIM);
+}
+
 #[test]
 fn an_unarmed_mainnet_network_refuses_to_start() {
     let run = run(&[("OBOLUS_NETWORK", MAINNET)]);
@@ -514,20 +552,71 @@ fn a_duplicate_option_refuses_before_advertising_anything() {
 }
 
 #[test]
-fn only_the_exact_string_one_arms_the_gateway() {
-    // main compares against `Ok("1")`. `true` is the plausible typo, and the safe direction for it
-    // is "still refuses" — this is the call-site behaviour no unit test on `check_arming` can see,
-    // because the string comparison lives in main.
+fn a_boolean_arming_value_arms_nothing_and_refuses() {
+    // Arming names its target. `true` names no network this gateway advertises, so it arms
+    // nothing — and a value that arms nothing is refused, not ignored: an operator who set it
+    // believes they armed something.
     let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_ALLOW_MAINNET", "true")]);
 
+    run.must_say(CANNOT_ARM);
+    run.must_say("\"true\"");
+    run.must_have_refused_during_startup();
+    run.must_not_say("MAINNET ARMED");
+}
+
+#[test]
+fn the_retired_boolean_form_is_refused_and_redirected() {
+    // `=1` was the documented form and is the one an operator with old notes will reach for. It
+    // must not arm — a process-wide yes is exactly what #28 retired — and it must not merely fall
+    // into the generic "cannot arm" refusal either: the operator needs to be told the form changed.
+    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_ALLOW_MAINNET", "1")]);
+
+    run.must_say(RETIRED_FORM);
+    run.must_have_refused_during_startup();
+    run.must_not_say("MAINNET ARMED");
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn arming_names_only_one_of_two_unproven_networks_and_still_refuses() {
+    // The property #28 is for. The old flag disarmed every advertised option at once, so arming
+    // for a deliberate mainnet also admitted a typo two entries below it. Now the arming value
+    // must name each unproven id, and the one it does not name still refuses — by name, and
+    // without the named one being blamed alongside it.
+    let run = run(&[
+        ("OBOLUS_ACCEPTS", ACCEPTS_MAINNET_PLUS_DEAD_SHORT_NAME),
+        ("OBOLUS_ALLOW_MAINNET", MAINNET),
+    ]);
+
     run.must_say("not on Obolus's pinned testnet allowlist");
+    run.must_say("\"base-sepolia\"");
+    run.must_have_refused_during_startup();
+    run.must_not_say("MAINNET ARMED");
+    run.must_not_say(ADVERTISEMENT_LINE);
+    // The armed id is not an offender: the refusal's offender list must not carry it. Quoted, as
+    // `eip155:8453` is a strict prefix of `eip155:84532`.
+    run.must_not_say(&format!("allowlist: \"{MAINNET}\""));
+}
+
+#[test]
+fn arming_an_unadvertised_network_refuses() {
+    // The sticky-configuration case: an arming value left behind after the network set changed
+    // under it. The gateway advertises one mainnet and the value names it plus one it does not
+    // advertise; the extra entry is a refusal, not a no-op.
+    let run = run(&[
+        ("OBOLUS_NETWORK", MAINNET),
+        ("OBOLUS_ALLOW_MAINNET", &format!("{MAINNET},eip155:1")),
+    ]);
+
+    run.must_say(CANNOT_ARM);
+    run.must_say("\"eip155:1\"");
     run.must_have_refused_during_startup();
     run.must_not_say("MAINNET ARMED");
 }
 
 #[test]
 fn an_armed_mainnet_network_boots_and_says_so_loudly() {
-    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_ALLOW_MAINNET", "1")]);
+    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_ALLOW_MAINNET", MAINNET)]);
 
     run.must_have_got_past_startup();
     run.must_say("*** MAINNET ARMED ***");
@@ -554,7 +643,7 @@ fn an_armed_gateway_diagnoses_a_dead_entry_among_a_real_mainnet() {
     // landed in.
     let run = run(&[
         ("OBOLUS_ACCEPTS", ACCEPTS_MAINNET_PLUS_DEAD_SHORT_NAME),
-        ("OBOLUS_ALLOW_MAINNET", "1"),
+        ("OBOLUS_ALLOW_MAINNET", "eip155:8453,base-sepolia"),
     ]);
 
     run.must_have_got_past_startup();
@@ -589,7 +678,10 @@ fn an_armed_gateway_whose_offenders_are_all_diagnosable_claims_no_residue() {
     //
     // Discriminated against the mixed arm by asserting the mixed lead-in is ABSENT — without that,
     // the all-arm text could be added while the mixed text still printed and this would not notice.
-    let run = run(&[("OBOLUS_ACCEPTS", ACCEPTS_TWO_SHORT_NAMES), ("OBOLUS_ALLOW_MAINNET", "1")]);
+    let run = run(&[
+        ("OBOLUS_ACCEPTS", ACCEPTS_TWO_SHORT_NAMES),
+        ("OBOLUS_ALLOW_MAINNET", "base-sepolia,polygon-amoy"),
+    ]);
 
     run.must_have_got_past_startup();
     run.must_say("*** MAINNET ARMED ***");
@@ -616,7 +708,7 @@ fn an_armed_gateway_reports_a_placeholder_option_alongside_the_mainnet_banner() 
     // run.
     let run = run(&[
         ("OBOLUS_ACCEPTS", ACCEPTS_MAINNET_PLUS_PLACEHOLDER),
-        ("OBOLUS_ALLOW_MAINNET", "1"),
+        ("OBOLUS_ALLOW_MAINNET", MAINNET),
     ]);
 
     run.must_have_got_past_startup();
@@ -821,17 +913,19 @@ fn an_empty_pay_to_variable_refuses_to_start() {
 }
 
 #[test]
-fn an_armed_all_testnet_gateway_says_the_flag_changed_nothing() {
-    // The fourth posture line, and the only one no test observed. Armed-but-all-testnet is a legal
-    // state: the flag is set, every advertised network is still on the allowlist. The banner must
-    // NOT cry mainnet here — that is the "banner cannot lie" property — but the flag being set and
-    // inert has to be said, or an armed instance stops being recognisable by its environment alone.
-    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_ALLOW_MAINNET", "1")]);
+fn arming_a_network_that_is_already_testnet_refuses() {
+    // Armed-but-all-testnet used to be a legal state with an advisory line ("set but changed
+    // nothing"). Under scoped arming the value names its target, and a target already on the
+    // allowlist is nothing to arm — so this is a configuration error, refused by name, rather than
+    // an inert flag an operator has to notice in the log. What must not happen on either side of
+    // that change: the banner crying mainnet on an all-testnet gateway.
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_ALLOW_MAINNET", TESTNET)]);
 
-    run.must_have_got_past_startup();
-    run.must_say("testnet-by-construction");
-    run.must_say("OBOLUS_ALLOW_MAINNET is set but changed nothing here");
+    run.must_say(CANNOT_ARM);
+    run.must_say(&format!("\"{TESTNET}\""));
+    run.must_have_refused_during_startup();
     run.must_not_say("MAINNET ARMED");
+    run.must_not_say(ALL_CLEAR_CLAIM);
 }
 
 // ---- the bearer-token path's call site (#33) -----------------------------------------------------

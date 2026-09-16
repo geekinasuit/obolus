@@ -96,7 +96,7 @@ Configuration is by environment variable:
 | `OBOLUS_PAY_TO` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_ASSET` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_DESCRIPTION` | `One inference request` | Free text shown in the challenge. |
-| `OBOLUS_ALLOW_MAINNET` | unset | **Arming flag.** Unset, Obolus refuses to start if **any** advertised `network` is not on its pinned testnet allowlist — a mainnet id, a typo, or a testnet x402 added after this build. Set to exactly `1` to advertise one anyway; the startup log then carries a `*** MAINNET ARMED ***` banner naming every unproven network. Anything other than `1` (`true`, `yes`, empty) does **not** arm — the safe direction for a typo. See [Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network). |
+| `OBOLUS_ALLOW_MAINNET` | unset | **Arming value.** Unset, Obolus refuses to start if **any** advertised `network` is not on its pinned testnet allowlist — a mainnet id, a typo, or a testnet x402 added after this build. To advertise one anyway, set this to **exactly the network id(s) to arm**, comma-separated (`eip155:8453`, or `eip155:8453,eip155:1`); the startup log then carries a `*** MAINNET ARMED ***` banner naming every armed network. The value must name every advertised unproven network and nothing else: an id the gateway does not advertise, or one already on the allowlist, is a startup refusal, and so is the retired boolean form `1`. Comparison is byte-exact, so a typo in the value fails closed. See [Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network). |
 | `OBOLUS_ACCEPTS` | unset | **Multi-chain override.** A JSON array of `{"network","asset","payTo","maxAmountRequired"}` objects — one per chain — advertised together in a single 402; the client picks one to pay. When set it **supersedes** the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` vars — and setting both at once is a **startup error** (the single-chain values would be inert, so the server refuses rather than advertise a config you did not intend). At most one entry per `(scheme, network)`; see [Advertising more than one chain](#advertising-more-than-one-chain). |
 | `OBOLUS_TOKEN_PUBKEY_FILE` | unset | **Turns the bearer-token path on.** Path to an Ed25519 **public** key in PEM (`openssl pkey -pubout`). Unset, there is no token path at all and every caller pays — the previous behaviour. Set, a caller presenting a token this key verifies is served without paying; everyone else still gets the 402. A file that is missing or is not an Ed25519 public key is a startup error, not a per-request one — and so is setting this to an empty string, which would otherwise ask for a token path while naming no key to build one from. See [Serving without payment](#serving-without-payment). |
 | `OBOLUS_TOKEN_KEYS` | unset | **The multi-key form, for rotation.** A JSON array of `{"kid": "...", "file": "..."}` objects; `kid` is optional. Supersedes `OBOLUS_TOKEN_PUBKEY_FILE`, and setting **both is a startup error** — the superseded one would sit inert, and an inert *verifying* key says nothing until a token signed with it is refused. A token naming a `kid` is checked against that key first, but a `kid` that matches nothing (or is absent) does not reject the token: it is checked against the rest of the set. At most 8 keys, no `kid` repeated, no key armed twice, every named file readable — each a startup error naming the offending entry. Set-but-empty (or whitespace-only) is its own startup error rather than the both-set one, since an array that arrived empty configures nothing. See [Rotating the signing key](#rotating-the-signing-key). |
@@ -180,8 +180,17 @@ was meant is a one-character slip that yields a gateway advertising a mainnet ch
 
 So at startup, after the payment options are assembled and **before** the router is built, every
 advertised `network` is checked against a **pinned allowlist of provably-testnet identifiers**. Any
-network not on it refuses to boot unless `OBOLUS_ALLOW_MAINNET=1`.
+network not on it refuses to boot unless `OBOLUS_ALLOW_MAINNET` names it.
 
+- **Arming names its target.** The override is not a boolean: `OBOLUS_ALLOW_MAINNET` lists the exact
+  network ids being armed, comma-separated, and the guard admits an unproven network only if the
+  value names it. The value must also name nothing else — an id the gateway does not advertise, or
+  one already on the allowlist, is refused rather than ignored — so the environment can only ever
+  describe exactly what it arms, and `OBOLUS_ALLOW_MAINNET=eip155:8453` in a deployment file tells
+  the reader which chain that instance is for. A process-wide `=1` admitted every advertised option
+  at once, the typo two entries below the intended mainnet included, and survived every later edit to
+  the network set; it is retired and refused with a pointer to this form
+  ([#28](https://github.com/geekinasuit/obolus/issues/28)).
 - **An allowlist, not a mainnet denylist.** An id nobody anticipated — a new chain, a typo, a
   malformed string — fails *closed*. A denylist would wave all three through.
 - **Every option is checked**, so a mainnet entry hiding among testnet entries in a multi-chain
@@ -203,14 +212,16 @@ network not on it refuses to boot unless `OBOLUS_ALLOW_MAINNET=1`.
   raw.
 
 The startup log states the resulting posture once, and only where it has been checked — one of three
-lines, plus a note when the flag is set and changed nothing:
+lines:
 
 | what is advertised | line |
 |---|---|
-| something not on the allowlist (so: armed) | `*** MAINNET ARMED ***`, naming every unproven network, plus the same diagnosis the refusal gives for any of them it can diagnose |
+| something not on the allowlist (so: armed, by name) | `*** MAINNET ARMED ***`, naming every unproven network, plus the same diagnosis the refusal gives for any of them it can diagnose |
 | any advertised option carrying the built-in placeholder | `UNCONFIGURED NETWORK`, naming how many |
 | a real, configured, allowlisted network set | `testnet-by-construction — every advertised network is on the pinned testnet allowlist` |
-| (in addition) armed, but nothing advertised is unproven | `OBOLUS_ALLOW_MAINNET is set but changed nothing here` |
+
+There is no "armed but nothing to arm" line, because that state cannot start: an arming value that
+names a network the gateway does not advertise, or one already on the allowlist, is a refusal.
 
 The placeholder row says *any*, not *nothing was configured*, because that is what the code checks
 (`placeholders > 0` — any-of, not all-of). An `OBOLUS_ACCEPTS` array holding a good Base Sepolia entry
@@ -224,14 +235,16 @@ on the one kind of instance where the money is real. Rows 1 and 2 both print whe
 which is what makes this table a description of the code rather than of one branch of it
 (`an_armed_gateway_reports_a_placeholder_option_alongside_the_mainnet_banner`).
 
-The last row says *nothing advertised is unproven*, not *everything advertised is allowlisted*. It is
-printed by an `if armed && unproven.is_empty()`, which covers **both** of the preceding states —
-including `UNCONFIGURED NETWORK`, where "everything is allowlisted" is false, because the placeholder is
-deliberately absent from `TESTNET_NETWORKS` and admitted by a clause of `is_provably_testnet` instead.
+The last row is printed only when nothing advertised is unproven **and** nothing advertised is the
+placeholder. The placeholder is deliberately absent from `TESTNET_NETWORKS` and admitted by a clause of
+`is_provably_testnet` instead, so an unconfigured boot has nothing unproven and would otherwise be told
+"every advertised network is on the pinned testnet allowlist" — false, in the reassuring direction. The
+`UNCONFIGURED NETWORK` line takes its place there (see below).
 
-The flag being set is not on its own enough to print the mainnet banner — an armed instance
-advertising only testnet says so plainly instead, because a banner that cries mainnet on an
-all-testnet gateway is a log line someone would trust during an incident.
+The mainnet banner is keyed on that unproven list and never on the variable being set. There is no
+way to be "armed" with only allowlisted networks advertised: such a value is a refusal (see above).
+So a banner that cries mainnet on an all-testnet gateway — a log line someone would trust during an
+incident — has no path that prints it.
 
 The armed banner runs the same diagnosis clauses the refusal does, and for the same reason: an armed
 array can hold entries Obolus knows different amounts about. Of a bare `eip155:8453` it can say only
@@ -258,7 +271,7 @@ advertised network is on the pinned testnet allowlist" — false, and false in t
 direction: an operator whose `OBOLUS_NETWORK` never reached the process would read it as confirmation
 that their configuration had taken effect.
 
-All four lines are checked against the real binary by `obolus/tests/server_arming.rs`, which runs the
+All three lines are checked against the real binary by `obolus/tests/server_arming.rs`, which runs the
 `obolus` target rather than calling the guard directly — `src/main.rs` is compiled by no other test
 target, so the guard's call site would otherwise be untested. That file also drives the
 `OBOLUS_ACCEPTS` branch, not only the single-chain one: the supersession bail, a placeholder among
