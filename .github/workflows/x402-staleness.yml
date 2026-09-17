@@ -1,0 +1,63 @@
+name: x402 allowlist staleness
+
+# The out-of-band re-read of the x402 source that #29 asks for. NOT a per-PR gate: the merge gate is
+# hermetic (no network), and this fetches a live third-party page, so it runs on a schedule (and on
+# demand) instead — a red run here means the transcribed allowlist and the source have diverged, or
+# the page could not be read, neither of which should block an unrelated PR.
+#
+# It drives the SAME audit the merge-gate test runs against the checked-in snapshot
+# (`the_admitted_lists_still_match_the_live_x402_source` in obolus/src/arming.rs), but against the
+# live page. Reconciling a real divergence — adding or removing a network — stays a deliberate
+# reviewed code change; this lane only raises the flag.
+on:
+  schedule:
+    # Weekly, Monday 06:17 UTC. Off the top of the hour by GitHub's own guidance (scheduled runs
+    # bunch there and are dropped under load); the source changes slowly, so weekly is ample.
+    - cron: '17 6 * * 1'
+  # On demand, so a maintainer can re-read the source before a release without waiting for the cron —
+  # the "clear triggering criteria" #29's DoD asks for alongside the schedule.
+  workflow_dispatch: {}
+
+# Same posture as ci.yml: GitHub-hosted runner, read-only token. The lane only reads a public page
+# and runs a test; it writes nothing back to the repo.
+permissions:
+  contents: read
+
+jobs:
+  staleness:
+    name: x402 allowlist vs live source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `-f` fails the step on an HTTP error, `-S` surfaces the curl error, `-L` follows the docs
+      # host's redirect to the rendered `.md`. A fetch failure fails the lane HERE, labelled as a
+      # fetch fault — distinct from the divergence and parse-fault the test itself reports.
+      - name: Fetch the x402 network-and-token-support source
+        run: |
+          if ! curl -fSL --retry 3 --max-time 60 \
+              -o "$RUNNER_TEMP/x402-page.md" \
+              https://docs.x402.org/core-concepts/network-and-token-support.md; then
+            echo "::error::Could not fetch the x402 source page — a network or upstream fault, not a divergence."
+            exit 1
+          fi
+
+      # `--ignored` runs the otherwise-skipped live test; the positional filter runs ONLY it, so no
+      # other ignored test (if one is ever added) rides along. `--nocapture` lets its INFO/DIVERGENCE
+      # lines reach the run log. `--locked` holds the dependency graph fixed, as the merge gate does.
+      - name: Diff the admitted allowlist against the live source
+        env:
+          OBOLUS_X402_PAGE: ${{ runner.temp }}/x402-page.md
+        run: |
+          cargo test --locked -p obolus \
+            the_admitted_lists_still_match_the_live_x402_source \
+            -- --ignored --nocapture 2>&1 | tee "$RUNNER_TEMP/staleness.log"
+          # `cargo test <name>` EXITS 0 when its filter matches NO test — so a rename of the test would
+          # silently green this lane while it checks nothing. Assert the test actually ran, in ci.yml's
+          # own principle that a probe which cannot run must fail loudly rather than read as clean. (A
+          # real divergence fails the cargo step above under the runner's default `pipefail`; this only
+          # guards the matched-nothing case.)
+          if ! grep -qE 'the_admitted_lists_still_match_the_live_x402_source \.\.\. ok' "$RUNNER_TEMP/staleness.log"; then
+            echo "::error::The staleness test did not run — its name matched no test (renamed or moved?). The lane is not actually checking the allowlist."
+            exit 1
+          fi
