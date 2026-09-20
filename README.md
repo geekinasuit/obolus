@@ -44,6 +44,9 @@ without crypto, and A1's types are built to preserve it.
 | `obolus/src/gateway.rs` | Route wiring, and the decision of *when we charge* |
 | `obolus/src/main.rs` | The `obolus` binary, wired to the real facilitator + Ollama upstream (env-configured); testnet-by-construction |
 | `docs/x402-ecosystem.html` | **Orientation:** what x402 is, who the participants are, the Bazaar discovery layer, and where Obolus sits on the rail. Start here if the protocol is new to you — this README assumes it |
+| `docs/architecture.md` | **The map:** what Obolus is, the components and seams it is built from, and the paths a request takes — for a reader with no prior context |
+| `docs/pricing.md` | **Pricing design:** how a request's price is decided — the cost-vs-quote denomination frame, the rate structures, the config, and the granularity decision |
+| `docs/vision.md` | Product vision and the settled design directions the seams are built to honor |
 
 ## Build and test
 

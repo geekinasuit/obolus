@@ -102,8 +102,10 @@ These are settled directions the seams above are built to honor.
 
 ## Open questions
 
-- **Pricing configuration model & granularity** — the crux: *how* an operator specifies prices
-  and structures, and at what level (global, per-backend, per-model, per-client).
+- **Pricing configuration model & granularity** — *how* an operator specifies prices and
+  structures, and at what level (global, per-backend, per-model, per-client). The design is now
+  settled in [`pricing.md`](pricing.md): per-backend cost is the level being built, margin stays
+  gateway-wide, and per-model / per-client / cross-asset pricing are deferred with stated reasons.
 - **Refund / failure semantics** — paid, then the backend errors or times out: refund, retry, or
   credit? An x402 business needs an answer.
 - **Telemetry transport** — OpenTelemetry vs. Kafka vs. DB as the accurate-reporting backbone,
