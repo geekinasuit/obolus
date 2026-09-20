@@ -47,7 +47,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
+use serde::Deserialize;
+
 use crate::access::{bearer_token, TokenPath};
+use crate::backends::{Backends, RouteError};
 use crate::facilitator::{Facilitator, FacilitatorError};
 use crate::upstream::{Upstream, UpstreamResponse};
 use crate::arming::ArmedRequirements;
@@ -76,19 +79,18 @@ pub enum GatewayError {
     DuplicateOption { scheme: String, network: String },
 }
 
-/// A payment-gated route in front of one upstream service.
+/// A payment-gated route in front of a registry of upstream backends.
 ///
 /// It can advertise several ways to pay at once — one entry per `(scheme, network)`, e.g. Base and
 /// Solana — and settles each request against whichever advertised option the client actually paid.
 ///
-/// The upstream is held as `Arc<dyn Upstream>` rather than a compile-time type parameter, so which
-/// backend serves is a runtime choice and a heterogeneous set of them can sit behind this one seam.
-/// A single Ollama origin is the `N = 1` case: one `Arc::new(OllamaUpstream::new(..))` handed to
-/// [`new`](Self::new). Selecting *among* several by the request's model is a later story; today the
-/// gateway forwards to the one it was built with.
+/// It holds a [`Backends`] registry rather than a single upstream: each request is routed to a
+/// backend by its `model` field (see [`Backends::route`]). A single Ollama origin is the `N = 1`
+/// case — a one-entry catch-all registry that serves every model, which is what
+/// [`Backends::single_ollama`] and a one-backend config both produce.
 pub struct Gateway<F: Facilitator> {
     facilitator: F,
-    upstream: Arc<dyn Upstream>,
+    backends: Arc<Backends>,
     /// Non-empty and unique by `(scheme, network)` — enforced by [`Gateway::new`].
     requirements: Vec<PaymentRequirements>,
 }
@@ -113,7 +115,7 @@ impl<F: Facilitator> Gateway<F> {
     /// Neither reads the environment.
     pub fn new(
         facilitator: F,
-        upstream: Arc<dyn Upstream>,
+        backends: Arc<Backends>,
         requirements: ArmedRequirements,
     ) -> Result<Self, GatewayError> {
         let requirements = requirements.into_requirements();
@@ -130,7 +132,7 @@ impl<F: Facilitator> Gateway<F> {
                 }
             }
         }
-        Ok(Self { facilitator, upstream, requirements })
+        Ok(Self { facilitator, backends, requirements })
     }
 
     /// The advertised option whose `(scheme, network)` this payment matches, if any.
@@ -174,10 +176,51 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Just enough of the request body to route on. Every other field is ignored, and the *original*
+/// bytes are what gets forwarded — this reads a copy to pick a backend, it never re-serializes the
+/// request. `#[serde(default)]` so a body that omits `model` parses to `None` rather than failing.
+#[derive(Deserialize)]
+struct ModelField {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// The `model` the request names, or `None` when it named none — including when the body is not JSON
+/// we can read a `model` out of. A `None` routes to a catch-all if one exists (the single-backend
+/// case, unchanged from before routing) and is a `400` otherwise; it is never a `500`.
+fn requested_model(body: &Bytes) -> Option<String> {
+    serde_json::from_slice::<ModelField>(body).ok().and_then(|parsed| parsed.model)
+}
+
+/// A routing failure rendered as the client's 4xx. The model name is the client's own input, so
+/// echoing it back leaks nothing — unlike [`upstream_failure`], which hides server-side detail.
+fn route_failure(err: RouteError) -> Response {
+    match err {
+        RouteError::UnknownModel { model } => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no backend serves model {model:?}"),
+            })),
+        )
+            .into_response(),
+        RouteError::ModelRequired => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                // Covers all three inputs that resolve to "no model": a body that is not JSON, one
+                // with no `model` field, and one whose `model` is not a string — the remedy for each
+                // is the same, so the message names it rather than the parse detail behind it.
+                "error": "request body must be JSON naming a model in its \"model\" field",
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// The paying path. Not an axum handler — [`completion`] is the route, and reaches this when the
 /// caller presented no token we honour.
 async fn paid_completion<F: Facilitator>(
     gateway: Arc<Gateway<F>>,
+    upstream: Arc<dyn Upstream>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -212,7 +255,7 @@ async fn paid_completion<F: Facilitator>(
     }
 
     // Payment is good. Commit the upstream BEFORE charging.
-    let response = match gateway.upstream.forward(body).await {
+    let response = match upstream.forward(body).await {
         Ok(response) => response,
         Err(err) => return upstream_failure(err.to_string()),
     };
@@ -301,10 +344,18 @@ async fn completion<F: Facilitator>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Route before anything else. An unroutable request is refused here — before the token check
+    // and before any payment — so it is never charged (Obolus has no refund path), and both the
+    // recognised-caller path and the paying path forward to the same backend the model resolves to.
+    let upstream = match access.gateway.backends.route(requested_model(&body).as_deref()) {
+        Ok(backend) => backend.upstream(),
+        Err(err) => return route_failure(err),
+    };
+
     if let (Some(path), Some(token)) = (&access.token, bearer_token(&headers)) {
         match path.verify(token) {
             Ok(()) => {
-                let response = match access.gateway.upstream.forward(body).await {
+                let response = match upstream.forward(body).await {
                     Ok(response) => response,
                     Err(err) => return upstream_failure(err.to_string()),
                 };
@@ -317,7 +368,7 @@ async fn completion<F: Facilitator>(
             Err(err) => eprintln!("obolus: bearer token not honoured: {err}"),
         }
     }
-    paid_completion(access.gateway.clone(), headers, body).await
+    paid_completion(access.gateway.clone(), upstream, headers, body).await
 }
 
 /// Wire an access surface into an OpenAI-compatible route plus an ungated health check.
@@ -337,6 +388,7 @@ pub fn router<F: Facilitator>(access: Access<F>) -> Router {
 mod tests {
     use super::*;
     use crate::access::FakeTokenVerifier;
+    use crate::backends::Backend;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
     use crate::upstream::{FakeUpstream, UpstreamCalls};
     use crate::arming::{check_arming, is_provably_testnet};
@@ -344,6 +396,18 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
+
+    /// A one-backend catch-all registry wrapping `upstream`. Most tests here predate routing and do
+    /// not care which backend serves; a sole catch-all takes every request, so the request `model`
+    /// is irrelevant and the wiring matches the pre-routing single-upstream gateway.
+    fn one_backend(upstream: impl Upstream + 'static) -> Arc<Backends> {
+        Arc::new(Backends::from_parts(vec![Backend::for_test(
+            "default",
+            vec![],
+            None,
+            Arc::new(upstream),
+        )]))
+    }
 
     /// Obviously-synthetic fixtures — not real networks, addresses, or transactions.
     const FIXTURE_NETWORK: &str = "test-network-not-a-real-caip2";
@@ -399,7 +463,7 @@ mod tests {
     fn app_with(facilitator: FakeFacilitator, upstream: FakeUpstream) -> (Router, FakeCalls) {
         let calls = facilitator.calls();
         let gateway =
-            Gateway::new(facilitator, Arc::new(upstream), armed(vec![requirements()])).unwrap();
+            Gateway::new(facilitator, one_backend(upstream), armed(vec![requirements()])).unwrap();
         (router(Access::new(gateway, None)), calls)
     }
 
@@ -419,7 +483,7 @@ mod tests {
         let calls = facilitator.calls();
         let forwards = upstream.calls();
         let gateway =
-            Gateway::new(facilitator, Arc::new(upstream), armed(vec![requirements()])).unwrap();
+            Gateway::new(facilitator, one_backend(upstream), armed(vec![requirements()])).unwrap();
         let token = TokenPath::new(Arc::new(verifier));
         (router(Access::new(gateway, Some(token))), calls, forwards)
     }
@@ -741,7 +805,7 @@ mod tests {
             router(Access::new(
                 Gateway::new(
                     facilitator,
-                    Arc::new(upstream),
+                    one_backend(upstream),
                     armed(vec![requirements(), requirements_b()]),
                 )
                 .unwrap(),
@@ -852,7 +916,7 @@ mod tests {
         let app = router(Access::new(
             Gateway::new(
                 calls_holder,
-                Arc::new(FakeUpstream::streaming()),
+                one_backend(FakeUpstream::streaming()),
                 armed(vec![requirements_b(), short_name]),
             )
             .unwrap(),
@@ -886,7 +950,7 @@ mod tests {
         // `Debug`; the error type is.)
         let err = Gateway::new(
             FakeFacilitator::accepting(),
-            Arc::new(FakeUpstream::streaming()),
+            one_backend(FakeUpstream::streaming()),
             armed(vec![]),
         )
         .err()
@@ -904,7 +968,7 @@ mod tests {
         dup.asset = "0xDIFFERENT-ASSET-SAME-NETWORK-NOT-REAL".to_string();
         let err = Gateway::new(
             FakeFacilitator::accepting(),
-            Arc::new(FakeUpstream::streaming()),
+            one_backend(FakeUpstream::streaming()),
             armed(vec![requirements(), dup]),
         )
         .err()
@@ -998,7 +1062,7 @@ mod tests {
             let forwards = upstream.calls();
             let gateway = Gateway::new(
                 FakeFacilitator::accepting(),
-                Arc::new(upstream),
+                one_backend(upstream),
                 armed(vec![requirements()]),
             )
             .unwrap();
@@ -1081,5 +1145,79 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok");
+    }
+
+    // ---- model routing across backends (#56) ----
+
+    /// A gateway over two named backends, each a distinguishable fake. The two upstream call-counts
+    /// are the positive evidence of *which* backend a request reached — a 200 alone cannot say that.
+    fn app_two_backends() -> (Router, FakeCalls, UpstreamCalls, UpstreamCalls) {
+        let facilitator = FakeFacilitator::accepting();
+        let calls = facilitator.calls();
+        let a = FakeUpstream::streaming();
+        let b = FakeUpstream::streaming();
+        let a_calls = a.calls();
+        let b_calls = b.calls();
+        let backends = Arc::new(Backends::from_parts(vec![
+            Backend::for_test("a", vec!["llama3"], None, Arc::new(a)),
+            Backend::for_test("b", vec!["mistral"], None, Arc::new(b)),
+        ]));
+        let gateway = Gateway::new(facilitator, backends, armed(vec![requirements()])).unwrap();
+        (router(Access::new(gateway, None)), calls, a_calls, b_calls)
+    }
+
+    /// A paid completion request naming `model`.
+    fn paid_request_for_model(model: &str) -> Request<Body> {
+        let body = format!(r#"{{"model":{model:?},"messages":[]}}"#);
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(x402::HEADER_PAYMENT, x402::encode_payment(&payment()))
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_request_reaches_the_backend_that_serves_its_model() {
+        // DoD item 4: the OpenAI-compatible route now selects a backend by the request's model.
+        let (app, _calls, a_calls, b_calls) = app_two_backends();
+        let (status, _headers, body) = send(app, paid_request_for_model("mistral")).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, FakeUpstream::streamed_text(), "the serving backend's answer reached the client");
+        assert_eq!(b_calls.count(), 1, "the backend that lists mistral was reached");
+        assert_eq!(a_calls.count(), 0, "the backend that lists only llama3 was not");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_model_is_a_404_charging_nothing() {
+        // DoD item 2, and the resolve-before-pay property: a VALID payment rides along, but the model
+        // is unroutable, so the request is refused BEFORE verify/settle — the client is never charged
+        // for a request no backend could serve (Obolus has no refund path).
+        let (app, calls, a_calls, b_calls) = app_two_backends();
+        let (status, _headers, _body) = send(app, paid_request_for_model("gpt-4")).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "a clean 4xx, never a 500 or a panic");
+        assert_eq!(a_calls.count() + b_calls.count(), 0, "no backend was reached");
+        assert_eq!(calls.verifies(), 0, "the payment was never even verified");
+        assert_eq!(calls.settles(), 0, "and nothing was settled — an unroutable request costs nothing");
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_no_model_is_a_400_when_every_backend_is_named() {
+        // With only named backends there is no catch-all to take a request that named no model, so it
+        // is a clean 400 — again before any charge.
+        let (app, calls, a_calls, b_calls) = app_two_backends();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(x402::HEADER_PAYMENT, x402::encode_payment(&payment()))
+            .body(Body::from(r#"{"messages":[]}"#))
+            .unwrap();
+        let (status, _headers, _body) = send(app, request).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(a_calls.count() + b_calls.count(), 0, "no backend was reached");
+        assert_eq!(calls.verifies(), 0, "and nothing was charged");
     }
 }

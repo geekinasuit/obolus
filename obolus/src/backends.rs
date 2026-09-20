@@ -21,16 +21,21 @@
 //!   secret lives only inside the [`OllamaUpstream`] that sends it, never in a config struct, a log
 //!   line, or a `Debug`.
 //!
-//! ## Scope in S1
+//! ## Scope
 //!
 //! `ollama` and `openai-compat` are the same wire shape — both POST to `/v1/chat/completions` — so
 //! both are served by [`OllamaUpstream`], the difference being only whether a bearer is attached.
 //! `anthropic-compat` speaks a different wire format and is refused at boot as not-yet-implemented
-//! (it is in the #53 hardening backlog). Declaring **more than one** backend is refused too:
-//! model-based routing across backends is S2 (issue #56), and until a selector exists, silently
-//! serving only one of several declared backends is exactly the surprise fail-loud exists to
-//! prevent. `models` and `precedence` are parsed and carried but nothing reads them yet — S2's
-//! router is their first consumer.
+//! (it is in the #53 hardening backlog).
+//!
+//! **Routing (S2).** More than one backend is allowed; a request is routed to a backend by its
+//! `model` field, resolved through each backend's `models` aliases and `precedence` (see
+//! [`Backends::route`]). A backend with an empty `models` list is a *catch-all* that serves any
+//! model — allowed only when it is the sole backend (the `OBOLUS_UPSTREAM_URL` shim and a one-entry
+//! config are this case). With more than one backend a nameless catch-all is refused at boot: under
+//! a selector it would silently swallow traffic meant for a named sibling, the very surprise
+//! fail-loud exists to prevent. Two backends that name the same alias at the same precedence are
+//! refused too — the route would be ambiguous — as are two backends sharing an `id`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,9 +76,9 @@ impl std::fmt::Display for Kind {
 ///
 /// `deny_unknown_fields` for the reason [`crate::config::AcceptEntry`] uses it: a typo
 /// (`baseURL`, `keyfile`) must fail loudly at startup, not be silently dropped and leave a backend
-/// pointed at a default nobody meant. `models` and `precedence` default to empty/`None` because
-/// S1 does not route on them; declaring them is allowed (a config can be written S2-ready) but
-/// nothing consumes them yet.
+/// pointed at a default nobody meant. `models` and `precedence` default to empty/`None`: a backend
+/// that omits `models` is a catch-all serving every request (legal only as the sole backend), and an
+/// omitted `precedence` ranks below any explicit one.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BackendEntry {
@@ -107,15 +112,29 @@ pub enum BackendError {
     )]
     Empty,
 
-    /// More than one backend declared. Refused because S1 has no way to *choose* between them; the
-    /// alternative — serving only one and ignoring the rest — is the silent surprise fail-loud
-    /// exists to prevent. Names S2 so the message does not read as a permanent limit.
+    /// Two backends share an `id`. The id names the backend in diagnostics and routing; a duplicate
+    /// makes both ambiguous.
+    #[error("backend config declares two backends with id {id:?}; each backend's id must be unique")]
+    DuplicateBackendId { id: String },
+
+    /// A backend with an empty `models` list — a catch-all serving every model — declared alongside
+    /// others. Refused because a catch-all under a selector silently swallows traffic meant for a
+    /// named sibling: the same surprise the one-backend rule used to prevent. A sole backend may be
+    /// a catch-all (it is the whole registry); a catch-all *with siblings* cannot.
     #[error(
-        "backend config declares {count} backends ({ids}), but routing across multiple backends is \
-         not implemented yet — it arrives in S2 (https://github.com/geekinasuit/obolus/issues/56). \
-         Declare exactly one backend until then."
+        "backend {id:?} declares no models, making it a catch-all, but other backends are declared \
+         too — a catch-all alongside named backends would silently swallow their traffic. Give it an \
+         explicit models list, or declare it as the only backend."
     )]
-    MultipleBackends { count: usize, ids: String },
+    CatchAllWithSiblings { id: String },
+
+    /// Two backends name the same model alias at the same precedence, so a request for that model
+    /// has no single answer. Higher precedence would decide it; equal precedence cannot.
+    #[error(
+        "model {model:?} is served by more than one backend ({ids}) at the same precedence, so the \
+         route is ambiguous — give one of them a higher precedence, or split the model between them."
+    )]
+    AmbiguousRoute { model: String, ids: String },
 
     /// A `kind` whose upstream does not exist yet — `anthropic-compat` in S1.
     #[error(
@@ -125,8 +144,8 @@ pub enum BackendError {
     )]
     KindNotImplemented { id: String, kind: Kind },
 
-    /// A backend with an empty `id`. The id names the backend in diagnostics and (from S2) in
-    /// routing, so an empty one is a configuration that cannot mean what it says.
+    /// A backend with an empty `id`. The id names the backend in diagnostics and in routing, so an
+    /// empty one is a configuration that cannot mean what it says.
     #[error("backend config has a backend with an empty id; id names the backend and must be set")]
     EmptyId,
 
@@ -176,25 +195,40 @@ pub enum BackendError {
 
 /// The registry of backends a gateway serves from.
 ///
-/// In S1 it always holds exactly one backend — [`load_backends`] refuses an empty array and refuses
-/// more than one, and [`single_ollama`](Backends::single_ollama) builds one — so [`sole`] is the
-/// whole read surface. S2 adds a selector over the entries and relaxes the one-backend refusal.
+/// Holds one or more backends; [`load_backends`] refuses an empty array. A request is dispatched to
+/// one of them by [`route`](Backends::route), which resolves the request's `model` through each
+/// backend's aliases and precedence. [`single_ollama`](Backends::single_ollama) builds the one-entry
+/// catch-all registry the `OBOLUS_UPSTREAM_URL` path uses.
 pub struct Backends {
     entries: Vec<Backend>,
+}
+
+/// Why a request could not be routed to a backend. Unlike [`BackendError`] these are *request*-time
+/// outcomes, and each maps to a 4xx the client can act on — never a 5xx (the gateway is fine; the
+/// request named a model it does not serve, or none at all).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteError {
+    /// The request named a model no backend serves. Maps to `404 Not Found`.
+    UnknownModel { model: String },
+    /// The request named no model, and no catch-all backend exists to take it. Maps to
+    /// `400 Bad Request`. Only reachable with named backends: a sole catch-all takes it instead.
+    ModelRequired,
 }
 
 /// One resolved backend: its declared metadata plus the constructed upstream. The upstream is
 /// private, so a `Backend` can only be obtained from a [`Backends`] built by this module — and a
 /// resolved key, if any, lives inside that upstream and nowhere on this struct.
 pub struct Backend {
-    /// The operator-chosen name, used in diagnostics and (from S2) routing.
+    /// The operator-chosen name, used in diagnostics and in routing.
     pub id: String,
     pub kind: Kind,
     /// The origin, trailing slash already trimmed by [`OllamaUpstream::new`]; kept for the banner.
     pub base_url: String,
-    /// Model aliases this backend serves. Parsed and carried; S2's router is the first consumer.
+    /// Model aliases this backend serves. An empty list makes it a *catch-all* that serves any model
+    /// (allowed only as the sole backend — see [`Backends::route`]).
     pub models: Vec<String>,
-    /// Precedence rank. Parsed and carried; S2's router is the first consumer.
+    /// Precedence rank: when two backends serve the same model, the higher `precedence` wins. `None`
+    /// ranks below any explicit value.
     pub precedence: Option<i64>,
     /// Whether a bearer credential is attached — a boolean for the banner, never the key itself.
     pub has_key: bool,
@@ -205,6 +239,18 @@ impl Backend {
     /// A clone of this backend's upstream handle, for wiring into a gateway.
     pub fn upstream(&self) -> Arc<dyn Upstream> {
         self.upstream.clone()
+    }
+
+    /// Whether this backend serves `model`. A catch-all (empty `models`) serves everything; a
+    /// backend with an explicit list serves exactly the aliases on it.
+    fn serves(&self, model: &str) -> bool {
+        self.is_catch_all() || self.models.iter().any(|m| m == model)
+    }
+
+    /// A backend that names no models and therefore serves any request. Legal only as the sole
+    /// backend; [`load_backends`] refuses one declared alongside others.
+    fn is_catch_all(&self) -> bool {
+        self.models.is_empty()
     }
 }
 
@@ -238,11 +284,26 @@ impl Backends {
     /// exact message an operator on that path already gets.
     pub fn single_ollama(base_url: &str, head_timeout: Duration) -> Self {
         let upstream = Arc::new(OllamaUpstream::new(base_url).with_head_timeout(head_timeout));
+        Backends::single("default", Kind::Ollama, base_url.trim_end_matches('/'), upstream)
+    }
+
+    /// A one-backend catch-all registry wrapping an already-constructed upstream. With a single
+    /// backend there is nothing to route between, so it serves every request — the shape a caller
+    /// that built its own upstream wants (`single_ollama` above, and `obolus-devseller`, which puts a
+    /// gateway in front of a canned seller upstream). `id`, `kind`, and `base_url` are banner
+    /// metadata only; `has_key` is `false` because a keyed backend is resolved through
+    /// [`load_backends`], never wrapped after the fact.
+    pub fn single(
+        id: impl Into<String>,
+        kind: Kind,
+        base_url: impl Into<String>,
+        upstream: Arc<dyn Upstream>,
+    ) -> Self {
         Backends {
             entries: vec![Backend {
-                id: "default".to_string(),
-                kind: Kind::Ollama,
-                base_url: base_url.trim_end_matches('/').to_string(),
+                id: id.into(),
+                kind,
+                base_url: base_url.into(),
                 models: Vec::new(),
                 precedence: None,
                 has_key: false,
@@ -251,21 +312,88 @@ impl Backends {
         }
     }
 
-    /// The one backend to serve from. S1 guarantees exactly one entry; the assertion documents that
-    /// invariant for the reader and would catch a future constructor that broke it.
-    pub fn sole(&self) -> &Backend {
-        debug_assert_eq!(self.entries.len(), 1, "the S1 registry always holds exactly one backend");
-        &self.entries[0]
+    /// Every backend in the registry, in declaration order. The startup banner iterates this;
+    /// [`route`](Self::route) is how a request picks one.
+    pub fn backends(&self) -> &[Backend] {
+        &self.entries
+    }
+
+    /// Pick the backend that serves `model`, or say why none does.
+    ///
+    /// `model` is the request's `model` field — `None` when the body named none (or was not JSON we
+    /// could read a `model` out of). Resolution:
+    ///
+    /// * `Some(m)` → among the backends that serve `m` (an explicit alias, or a catch-all), the one
+    ///   with the highest [`precedence`](Backend::precedence). None serve it → [`UnknownModel`].
+    /// * `None` → the catch-all, if there is one; otherwise [`ModelRequired`].
+    ///
+    /// The winner is unambiguous by construction: [`load_backends`] refuses two backends that serve
+    /// the same alias at the same precedence, and a catch-all may only exist as the sole backend, so
+    /// the set this chooses from never contains a tie.
+    ///
+    /// [`UnknownModel`]: RouteError::UnknownModel
+    /// [`ModelRequired`]: RouteError::ModelRequired
+    pub fn route(&self, model: Option<&str>) -> Result<&Backend, RouteError> {
+        match model {
+            Some(model) => self
+                .entries
+                .iter()
+                .filter(|b| b.serves(model))
+                // `None` precedence sorts below any explicit rank; ties among the eligible set are
+                // impossible (load_backends refuses them), so the max is the single winner.
+                .max_by_key(|b| b.precedence)
+                .ok_or_else(|| RouteError::UnknownModel { model: model.to_string() }),
+            None => self.entries.iter().find(|b| b.is_catch_all()).ok_or(RouteError::ModelRequired),
+        }
+    }
+}
+
+/// Test-only constructors that inject a fake upstream, so a routing test can assert *which* backend
+/// a request reached without standing up an HTTP origin. Kept behind `cfg(test)` for the same reason
+/// [`crate::upstream::FakeUpstream`] is: it must not be reachable from a shipped gateway. These build
+/// a registry directly and do not run [`check_registry`] — a routing test supplies its own
+/// well-formed set; the boot rules are exercised through [`load_backends`] instead.
+#[cfg(test)]
+impl Backends {
+    pub fn from_parts(entries: Vec<Backend>) -> Self {
+        Backends { entries }
+    }
+}
+
+#[cfg(test)]
+impl Backend {
+    /// A backend wrapping an arbitrary [`Upstream`], for gateway routing tests.
+    pub fn for_test(
+        id: impl Into<String>,
+        models: Vec<&str>,
+        precedence: Option<i64>,
+        upstream: Arc<dyn Upstream>,
+    ) -> Self {
+        Backend {
+            id: id.into(),
+            kind: Kind::Ollama,
+            base_url: "http://test.invalid".to_string(),
+            models: models.into_iter().map(str::to_string).collect(),
+            precedence,
+            has_key: false,
+            upstream,
+        }
     }
 }
 
 /// Parse a backend-config JSON array, resolve each key reference through `read_key`, and construct
 /// the registry — all at startup. `head_timeout` is applied to every constructed upstream (it is a
-/// process-wide setting, not per-backend, in S1).
+/// process-wide setting, not per-backend).
 ///
 /// `read_key` is injected so the loader is hermetically testable without touching the filesystem;
 /// `main` passes `std::fs::read`. Every referenced key is read here, before the registry is handed
 /// back, so an unreadable one is a boot refusal rather than a mid-rotation surprise.
+///
+/// Each entry is validated and built in turn; then three whole-registry rules are checked, all of
+/// which only bite once there is more than one backend: no two backends share an `id`, no catch-all
+/// (empty `models`) is declared alongside siblings, and no model alias is served by two backends at
+/// equal precedence. Each is a route that could not be resolved unambiguously at request time, moved
+/// to boot.
 pub fn load_backends<R>(
     raw: &str,
     head_timeout: Duration,
@@ -281,23 +409,60 @@ where
         return Err(BackendError::Empty);
     }
 
-    // Refuse more than one before validating any single entry's semantics: with no selector, the
-    // fix for "too many" is "declare one", independent of whether entry 2 also has a bad URL. serde
-    // has already checked every entry's *structure* (types, unknown fields), so a typo in a later
-    // entry was caught at the parse above; what remains is the count.
-    if entries.len() > 1 {
-        let ids =
-            entries.iter().map(|e| format!("{:?}", e.id)).collect::<Vec<_>>().join(", ");
-        return Err(BackendError::MultipleBackends { count: entries.len(), ids });
+    let backends: Vec<Backend> = entries
+        .into_iter()
+        .map(|entry| build_backend(entry, head_timeout, &read_key))
+        .collect::<Result<_, _>>()?;
+
+    check_registry(&backends)?;
+    Ok(Backends { entries: backends })
+}
+
+/// The whole-registry rules that a single entry cannot self-check. All are vacuous at N = 1 (a lone
+/// backend has no sibling to collide with and may be a catch-all), so the single-backend path — the
+/// `OBOLUS_UPSTREAM_URL` shim and a one-entry config alike — is unaffected.
+fn check_registry(backends: &[Backend]) -> Result<(), BackendError> {
+    // Duplicate ids: the id names a backend in diagnostics and routing, so two of them make both
+    // ambiguous. O(n^2), but n is a handful of operator-declared backends.
+    for (i, a) in backends.iter().enumerate() {
+        if backends[i + 1..].iter().any(|b| b.id == a.id) {
+            return Err(BackendError::DuplicateBackendId { id: a.id.clone() });
+        }
     }
 
-    let entry = entries.into_iter().next().expect("length checked to be exactly 1 above");
-    let backend = build_backend(entry, head_timeout, &read_key)?;
-    Ok(Backends { entries: vec![backend] })
+    // A catch-all (empty models) is fine as the whole registry but not alongside named siblings: a
+    // selector cannot tell what the operator meant it to catch, and it would swallow their traffic.
+    if backends.len() > 1 {
+        if let Some(catch_all) = backends.iter().find(|b| b.is_catch_all()) {
+            return Err(BackendError::CatchAllWithSiblings { id: catch_all.id.clone() });
+        }
+    }
+
+    // Ambiguous routes: a model alias served by two backends at equal precedence has no single
+    // winner. Higher precedence would decide it; equal precedence (including two `None`s) cannot.
+    for (i, a) in backends.iter().enumerate() {
+        for model in &a.models {
+            let clash: Vec<String> = backends[i + 1..]
+                .iter()
+                .filter(|b| b.precedence == a.precedence && b.models.iter().any(|m| m == model))
+                .map(|b| format!("{:?}", b.id))
+                .collect();
+            if !clash.is_empty() {
+                let mut ids = vec![format!("{:?}", a.id)];
+                ids.extend(clash);
+                return Err(BackendError::AmbiguousRoute {
+                    model: model.clone(),
+                    ids: ids.join(", "),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate one entry and construct its upstream. Split out so the per-entry checks live in one
-/// place; S2 will call it once per entry rather than once for the sole one.
+/// place; called once per declared backend.
 fn build_backend<R>(
     entry: BackendEntry,
     head_timeout: Duration,
@@ -408,7 +573,7 @@ mod tests {
     fn parses_a_single_ollama_backend() {
         let raw = r#"[{"id":"local","kind":"ollama","baseUrl":"http://127.0.0.1:11434"}]"#;
         let registry = load_backends(raw, T, no_key).unwrap();
-        let b = registry.sole();
+        let b = &registry.backends()[0];
         assert_eq!(b.id, "local");
         assert_eq!(b.kind, Kind::Ollama);
         assert_eq!(b.base_url, "http://127.0.0.1:11434");
@@ -449,17 +614,137 @@ mod tests {
     }
 
     #[test]
-    fn multiple_backends_are_rejected_naming_s2() {
+    fn multiple_named_backends_load() {
         let raw = r#"[
-            {"id":"a","kind":"ollama","baseUrl":"http://a"},
-            {"id":"b","kind":"ollama","baseUrl":"http://b"}
+            {"id":"a","kind":"ollama","baseUrl":"http://a","models":["llama3"]},
+            {"id":"b","kind":"ollama","baseUrl":"http://b","models":["mistral"]}
+        ]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.backends().len(), 2);
+    }
+
+    #[test]
+    fn a_model_offered_by_two_backends_routes_to_the_higher_precedence_one() {
+        // DoD item 1. `fast` beats `slow` because 20 > 10, regardless of declaration order.
+        let raw = r#"[
+            {"id":"slow","kind":"ollama","baseUrl":"http://slow","models":["llama3"],"precedence":10},
+            {"id":"fast","kind":"ollama","baseUrl":"http://fast","models":["llama3"],"precedence":20}
+        ]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.route(Some("llama3")).unwrap().id, "fast");
+    }
+
+    #[test]
+    fn a_model_routes_to_the_backend_that_lists_it() {
+        let raw = r#"[
+            {"id":"a","kind":"ollama","baseUrl":"http://a","models":["llama3"]},
+            {"id":"b","kind":"ollama","baseUrl":"http://b","models":["mistral","mixtral"]}
+        ]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.route(Some("llama3")).unwrap().id, "a");
+        assert_eq!(registry.route(Some("mixtral")).unwrap().id, "b");
+    }
+
+    #[test]
+    fn an_unknown_model_is_a_route_error_not_a_panic() {
+        // DoD item 2: unknown model resolves to a clean 4xx-shaped error, never a panic.
+        let raw = r#"[
+            {"id":"a","kind":"ollama","baseUrl":"http://a","models":["llama3"]},
+            {"id":"b","kind":"ollama","baseUrl":"http://b","models":["mistral"]}
+        ]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(
+            registry.route(Some("gpt-4")).unwrap_err(),
+            RouteError::UnknownModel { model: "gpt-4".to_string() }
+        );
+    }
+
+    #[test]
+    fn a_sole_catch_all_serves_any_model_and_a_missing_model() {
+        // The OBOLUS_UPSTREAM_URL / one-entry-no-models case: it takes everything, named or not, so
+        // the pre-S2 single-backend behaviour is unchanged.
+        let raw = r#"[{"id":"local","kind":"ollama","baseUrl":"http://h"}]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.route(Some("anything-at-all")).unwrap().id, "local");
+        assert_eq!(registry.route(None).unwrap().id, "local");
+    }
+
+    #[test]
+    fn a_sole_named_backend_still_refuses_a_model_it_does_not_list() {
+        // A single backend that DOES declare models is held to them — a request for an undeclared
+        // model is unroutable rather than silently served.
+        let raw = r#"[{"id":"only","kind":"ollama","baseUrl":"http://h","models":["llama3"]}]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.route(Some("llama3")).unwrap().id, "only");
+        assert!(matches!(
+            registry.route(Some("gpt-4")).unwrap_err(),
+            RouteError::UnknownModel { .. }
+        ));
+    }
+
+    #[test]
+    fn a_missing_model_with_only_named_backends_requires_a_model() {
+        let raw = r#"[
+            {"id":"a","kind":"ollama","baseUrl":"http://a","models":["llama3"]},
+            {"id":"b","kind":"ollama","baseUrl":"http://b","models":["mistral"]}
+        ]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.route(None).unwrap_err(), RouteError::ModelRequired);
+    }
+
+    #[test]
+    fn an_explicit_precedence_outranks_an_absent_one() {
+        // `None` precedence sorts below any explicit value, so the ranked backend wins.
+        let raw = r#"[
+            {"id":"unranked","kind":"ollama","baseUrl":"http://u","models":["llama3"]},
+            {"id":"ranked","kind":"ollama","baseUrl":"http://r","models":["llama3"],"precedence":1}
+        ]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.route(Some("llama3")).unwrap().id, "ranked");
+    }
+
+    #[test]
+    fn two_backends_sharing_an_id_are_rejected() {
+        let raw = r#"[
+            {"id":"dup","kind":"ollama","baseUrl":"http://a","models":["llama3"]},
+            {"id":"dup","kind":"ollama","baseUrl":"http://b","models":["mistral"]}
         ]"#;
         let err = load_backends(raw, T, no_key).unwrap_err();
-        assert!(matches!(&err, BackendError::MultipleBackends { count: 2, .. }), "got {err:?}");
+        assert_eq!(err, BackendError::DuplicateBackendId { id: "dup".to_string() });
+    }
+
+    #[test]
+    fn a_catch_all_declared_alongside_a_named_backend_is_rejected() {
+        // The silent-swallow surprise the one-backend rule used to prevent, in its S2 form.
+        let raw = r#"[
+            {"id":"named","kind":"ollama","baseUrl":"http://a","models":["llama3"]},
+            {"id":"greedy","kind":"ollama","baseUrl":"http://b"}
+        ]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert_eq!(err, BackendError::CatchAllWithSiblings { id: "greedy".to_string() });
+    }
+
+    #[test]
+    fn the_same_model_at_equal_precedence_is_an_ambiguous_route() {
+        let raw = r#"[
+            {"id":"a","kind":"ollama","baseUrl":"http://a","models":["llama3"],"precedence":5},
+            {"id":"b","kind":"ollama","baseUrl":"http://b","models":["llama3"],"precedence":5}
+        ]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(&err, BackendError::AmbiguousRoute { model, .. } if model == "llama3"), "got {err:?}");
         let msg = err.to_string();
-        // The message must name both ids and point at S2, so the refusal does not read as permanent.
-        assert!(msg.contains("\"a\"") && msg.contains("\"b\""), "names the ids: {msg}");
-        assert!(msg.contains("issues/56"), "points at S2: {msg}");
+        assert!(msg.contains("\"a\"") && msg.contains("\"b\""), "names both ids: {msg}");
+    }
+
+    #[test]
+    fn the_same_model_at_absent_precedence_on_both_is_also_ambiguous() {
+        // Two `None`s are equal precedence too — neither outranks the other.
+        let raw = r#"[
+            {"id":"a","kind":"ollama","baseUrl":"http://a","models":["llama3"]},
+            {"id":"b","kind":"ollama","baseUrl":"http://b","models":["llama3"]}
+        ]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(&err, BackendError::AmbiguousRoute { .. }), "got {err:?}");
     }
 
     #[test]
@@ -499,7 +784,7 @@ mod tests {
     fn openai_compat_without_a_key_is_a_keyless_backend() {
         let raw = r#"[{"id":"local-oai","kind":"openai-compat","baseUrl":"http://127.0.0.1:8000"}]"#;
         let registry = load_backends(raw, T, no_key).unwrap();
-        let b = registry.sole();
+        let b = &registry.backends()[0];
         assert_eq!(b.kind, Kind::OpenaiCompat);
         assert!(!b.has_key, "no keyFile => no credential");
     }
@@ -512,7 +797,7 @@ mod tests {
         let raw =
             r#"[{"id":"gemini","kind":"openai-compat","baseUrl":"http://127.0.0.1:9000","keyFile":"/secrets/gemini"}]"#;
         let registry = load_backends(raw, T, key_bytes(b"sk-test-abc-123\n")).unwrap();
-        let b = registry.sole();
+        let b = &registry.backends()[0];
         assert_eq!(b.kind, Kind::OpenaiCompat);
         assert!(b.has_key, "a resolved keyFile => a credential is attached");
     }
@@ -544,14 +829,14 @@ mod tests {
 
     #[test]
     fn models_and_precedence_are_parsed_and_carried() {
-        // They are inert in S1 (routing is S2), but declaring them is allowed and they survive onto
-        // the registry so an S2-ready config parses today.
+        // The routing metadata survives parsing onto the backend verbatim — the raw material the
+        // registry-level route checks and `Backends::route` then work from.
         let raw = r#"[{
             "id":"x","kind":"ollama","baseUrl":"http://h",
             "models":["llama3","llama3:70b"],"precedence":10
         }]"#;
         let registry = load_backends(raw, T, no_key).unwrap();
-        let b = registry.sole();
+        let b = &registry.backends()[0];
         assert_eq!(b.models, vec!["llama3", "llama3:70b"]);
         assert_eq!(b.precedence, Some(10));
     }
@@ -566,7 +851,7 @@ mod tests {
     #[test]
     fn the_single_ollama_shim_builds_one_keyless_backend() {
         let registry = Backends::single_ollama("http://127.0.0.1:11434/", T);
-        let b = registry.sole();
+        let b = &registry.backends()[0];
         assert_eq!(b.kind, Kind::Ollama);
         assert_eq!(b.base_url, "http://127.0.0.1:11434", "trailing slash trimmed for the banner");
         assert!(!b.has_key);
