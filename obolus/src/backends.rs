@@ -76,9 +76,11 @@ impl std::fmt::Display for Kind {
 ///
 /// `deny_unknown_fields` for the reason [`crate::config::AcceptEntry`] uses it: a typo
 /// (`baseURL`, `keyfile`) must fail loudly at startup, not be silently dropped and leave a backend
-/// pointed at a default nobody meant. `models` and `precedence` default to empty/`None`: a backend
-/// that omits `models` is a catch-all serving every request (legal only as the sole backend), and an
-/// omitted `precedence` ranks below any explicit one.
+/// pointed at a default nobody meant. `models`, `precedence`, and `cost` default to empty/`None`: a
+/// backend that omits `models` is a catch-all serving every request (legal only as the sole
+/// backend), an omitted `precedence` ranks below any explicit one, and an omitted `cost` leaves the
+/// backend with no declared upstream cost (which the cost-plus rate refuses at boot — see
+/// [`crate::config::require_backend_costs`]).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BackendEntry {
@@ -91,6 +93,12 @@ struct BackendEntry {
     models: Vec<String>,
     #[serde(default)]
     precedence: Option<i64>,
+    /// The backend's declared upstream cost, in atomic units, as a string — the same shape an
+    /// advertised amount takes, because an atomic amount can exceed the range a JSON number
+    /// represents exactly. Parsed and validated in [`build_backend`]; the cost-plus rate marks it
+    /// up per request.
+    #[serde(default)]
+    cost: Option<String>,
 }
 
 /// Why a backend configuration could not be turned into a registry. Every arm is a boot-time
@@ -191,6 +199,25 @@ pub enum BackendError {
     /// A `models` entry that is empty or whitespace-only. An empty alias names no model.
     #[error("backend {id:?}: a models entry is empty; a model alias must name a model")]
     EmptyModelAlias { id: String },
+
+    /// A `cost` that is not a non-negative integer in atomic units — the same shape
+    /// [`crate::x402::validate_atomic_amount`] rejects for an advertised amount, applied to the
+    /// per-backend cost the cost-plus rate marks up.
+    #[error(
+        "backend {id:?}: cost {value:?} is not a non-negative integer in atomic units \
+         (no decimals, sign, separators, or exponent)."
+    )]
+    BadCost { id: String, value: String },
+
+    /// A `cost` of zero. A zero cost is not a cost to mark up (any margin on zero is still zero),
+    /// and a zero quote would reach the settle-a-zero-amount path the cost-plus rate deliberately
+    /// does not cover. Serving a backend free is a distinct rate, not cost-plus.
+    #[error(
+        "backend {id:?}: cost is 0 — a zero upstream cost is not a cost to mark up (any margin on \
+         zero is still zero). Set the cost cost-plus should mark up; serving free is a separate \
+         rate."
+    )]
+    ZeroCost { id: String },
 }
 
 /// The registry of backends a gateway serves from.
@@ -232,6 +259,11 @@ pub struct Backend {
     pub precedence: Option<i64>,
     /// Whether a bearer credential is attached — a boolean for the banner, never the key itself.
     pub has_key: bool,
+    /// The operator's declared upstream cost for this backend, in atomic units, or `None` if none
+    /// was declared. The cost-plus rate reads this per request (see [`crate::pricing::CostPlus`]);
+    /// routing never looks at it. `None` is refused at boot only when the cost-plus rate is
+    /// selected (see [`crate::config::require_backend_costs`]).
+    pub cost: Option<u128>,
     upstream: Arc<dyn Upstream>,
 }
 
@@ -267,6 +299,7 @@ impl std::fmt::Debug for Backend {
             .field("models", &self.models)
             .field("precedence", &self.precedence)
             .field("has_key", &self.has_key)
+            .field("cost", &self.cost)
             .finish_non_exhaustive()
     }
 }
@@ -307,9 +340,23 @@ impl Backends {
                 models: Vec::new(),
                 precedence: None,
                 has_key: false,
+                // No cost here: a caller that wraps its own upstream declares no per-backend cost.
+                // The single-backend `OBOLUS_UPSTREAM_COST` path attaches its cost after the fact
+                // (see `main`), and the cost-plus rate refuses a costless backend at boot.
+                cost: None,
                 upstream,
             }],
         }
+    }
+
+    /// Set the sole backend's declared cost — the single-backend (`OBOLUS_UPSTREAM_COST`) path,
+    /// where the cost is an environment variable rather than a config-file field. Only meaningful on
+    /// a one-entry registry (the shape `single`/`single_ollama` build); a no-op on an empty one.
+    pub fn with_sole_cost(mut self, cost: u128) -> Self {
+        if let Some(sole) = self.entries.first_mut() {
+            sole.cost = Some(cost);
+        }
+        self
     }
 
     /// Every backend in the registry, in declaration order. The startup banner iterates this;
@@ -376,8 +423,15 @@ impl Backend {
             models: models.into_iter().map(str::to_string).collect(),
             precedence,
             has_key: false,
+            cost: None,
             upstream,
         }
+    }
+
+    /// Attach a declared cost to a test backend, for exercising the per-backend cost-plus rate.
+    pub fn with_cost(mut self, cost: u128) -> Self {
+        self.cost = Some(cost);
+        self
     }
 }
 
@@ -471,7 +525,7 @@ fn build_backend<R>(
 where
     R: Fn(&str) -> std::io::Result<Vec<u8>>,
 {
-    let BackendEntry { id, kind, base_url, key_file, models, precedence } = entry;
+    let BackendEntry { id, kind, base_url, key_file, models, precedence, cost } = entry;
 
     if id.trim().is_empty() {
         return Err(BackendError::EmptyId);
@@ -484,6 +538,17 @@ where
     if models.iter().any(|m| m.trim().is_empty()) {
         return Err(BackendError::EmptyModelAlias { id });
     }
+    // A direct `u128` parse, the same shape `validate_atomic_amount` applies to an advertised
+    // amount — but the cost is computed *with* rather than advertised verbatim, so we keep the
+    // value, not the wire string. Zero is a valid atomic amount yet refused here; see `ZeroCost`.
+    let cost: Option<u128> = match cost {
+        None => None,
+        Some(raw) => match raw.parse::<u128>() {
+            Ok(0) => return Err(BackendError::ZeroCost { id }),
+            Ok(cost) => Some(cost),
+            Err(_) => return Err(BackendError::BadCost { id, value: raw }),
+        },
+    };
 
     let (has_key, upstream): (bool, Arc<dyn Upstream>) = match kind {
         Kind::AnthropicCompat => return Err(BackendError::KindNotImplemented { id, kind }),
@@ -518,6 +583,7 @@ where
         models,
         precedence,
         has_key,
+        cost,
         upstream,
     })
 }
@@ -855,5 +921,36 @@ mod tests {
         assert_eq!(b.kind, Kind::Ollama);
         assert_eq!(b.base_url, "http://127.0.0.1:11434", "trailing slash trimmed for the banner");
         assert!(!b.has_key);
+    }
+
+    #[test]
+    fn a_declared_cost_is_parsed_onto_the_backend() {
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","cost":"1500"}]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.backends()[0].cost, Some(1500));
+    }
+
+    #[test]
+    fn an_omitted_cost_leaves_the_backend_costless() {
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h"}]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        assert_eq!(registry.backends()[0].cost, None);
+    }
+
+    #[test]
+    fn a_non_integer_cost_is_rejected() {
+        // A decimal is not an atomic amount — the same shape validate_atomic_amount rejects.
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","cost":"1.5"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(&err, BackendError::BadCost { id, .. } if id == "x"), "got {err:?}");
+    }
+
+    #[test]
+    fn a_zero_cost_is_rejected() {
+        // Zero is a valid atomic amount but not a cost to mark up; the cost-plus rate refuses it,
+        // named per backend so the operator knows which entry to fix.
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","cost":"0"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(&err, BackendError::ZeroCost { id } if id == "x"), "got {err:?}");
     }
 }

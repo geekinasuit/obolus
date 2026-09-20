@@ -12,6 +12,7 @@
 
 use serde::Deserialize;
 
+use crate::backends::Backends;
 use crate::x402::{validate_atomic_amount, PaymentRequirements, SCHEME_EXACT};
 
 /// One per-chain entry in `OBOLUS_ACCEPTS`: network / asset / pay-to / price. The gateway-wide
@@ -243,9 +244,12 @@ pub enum PricingChoice {
     /// The behaviour-preserving default: [`crate::pricing::StaticPrice`], each option at its own
     /// armed amount.
     Static,
-    /// Cost-plus: a gateway-wide declared upstream `cost` marked up by `margin_bps` basis points
-    /// ([`crate::pricing::CostPlus`]).
-    CostPlus { cost: u128, margin_bps: u32 },
+    /// Cost-plus ([`crate::pricing::CostPlus`]): each backend's declared cost marked up by a
+    /// gateway-wide `margin_bps` basis points. The cost lives on the backend, not here — so this
+    /// carries only the margin, and `upstream_cost`: the single-backend path's `OBOLUS_UPSTREAM_COST`
+    /// value, which `main` attaches to the sole backend (`None` when a backends file declares the
+    /// cost per entry instead). Every backend having a cost is enforced by [`require_backend_costs`].
+    CostPlus { margin_bps: u32, upstream_cost: Option<u128> },
 }
 
 /// Why a pricing configuration could not be turned into a [`PricingChoice`]. Each is a boot refusal:
@@ -262,8 +266,10 @@ pub enum PricingConfigError {
     )]
     UnknownRate { value: String },
 
-    /// `cost-plus` is selected but one of its parameters is absent. Cost-plus infers no money value,
-    /// so a missing cost or margin is a refusal, not a default.
+    /// `cost-plus` is selected but its margin is absent. Cost-plus infers no margin, so a missing
+    /// one is a refusal, not a default. (The cost is not required here — it may be declared per
+    /// backend in `OBOLUS_BACKENDS_FILE` instead of via `OBOLUS_UPSTREAM_COST`; that every backend
+    /// has one is checked by [`require_backend_costs`], not here.)
     #[error("OBOLUS_PRICING is \"cost-plus\" but {var} is not set: {detail}")]
     MissingParam { var: &'static str, detail: &'static str },
 
@@ -293,14 +299,15 @@ pub enum PricingConfigError {
     )]
     BadMargin { value: String },
 
-    /// `cost-plus` is selected alongside the multi-chain `OBOLUS_ACCEPTS`. Cost-plus is gateway-wide
-    /// — one declared cost — and a single atomic cost is ambiguous across networks that carry
-    /// different assets and decimals, so the combination is deliberately not supported in this
-    /// slice. (A per-network or per-backend cost is later work.)
+    /// `cost-plus` is selected alongside the multi-chain `OBOLUS_ACCEPTS`. A declared cost is in
+    /// atomic units of one asset; the several networks `OBOLUS_ACCEPTS` advertises carry different
+    /// assets and decimals, so a cost is ambiguous across them. Per-*backend* cost is supported;
+    /// per-*network* (cross-asset) cost is later work — it needs a reference cost unit plus a
+    /// per-network conversion — so this combination is deliberately refused.
     #[error(
-        "OBOLUS_PRICING is \"cost-plus\" and OBOLUS_ACCEPTS is set. Cost-plus is gateway-wide (one \
-         declared cost), and a single atomic cost is ambiguous across the several networks \
-         OBOLUS_ACCEPTS advertises, which carry different assets and decimals — so multi-chain \
+        "OBOLUS_PRICING is \"cost-plus\" and OBOLUS_ACCEPTS is set. A cost-plus cost is in atomic \
+         units of a single asset, and the several networks OBOLUS_ACCEPTS advertises carry \
+         different assets and decimals, so one cost is ambiguous across them — multi-chain \
          cost-plus pricing is not supported yet. Unset OBOLUS_ACCEPTS to price a single chain with \
          cost-plus, or unset OBOLUS_PRICING to advertise each entry's own amount."
     )]
@@ -310,7 +317,7 @@ pub enum PricingConfigError {
     /// the amount comes from the cost and margin, so `OBOLUS_PRICE` would sit inert — the
     /// silently-ignored-payment-config surprise the `OBOLUS_ACCEPTS` supersession also guards.
     #[error(
-        "OBOLUS_PRICING is \"cost-plus\", which sets every amount from OBOLUS_UPSTREAM_COST and \
+        "OBOLUS_PRICING is \"cost-plus\", which sets every amount from a declared cost and \
          OBOLUS_MARGIN_BPS, but OBOLUS_PRICE is also set and would be silently ignored. Remove \
          OBOLUS_PRICE, or unset OBOLUS_PRICING to charge that amount instead."
     )]
@@ -324,6 +331,27 @@ pub enum PricingConfigError {
          be silently ignored. Set OBOLUS_PRICING=cost-plus to use them, or unset them."
     )]
     OrphanedParams { vars: String },
+
+    /// `cost-plus` is selected but one or more backends declare no cost. The rate marks up each
+    /// backend's own declared cost; a backend without one cannot be priced, and guessing a cost is
+    /// the fail-open the boot refusals exist to prevent. Names the backends so the operator knows
+    /// which to fix. A cross-source refusal (the registry plus the rate), so it lives in
+    /// [`require_backend_costs`], not [`select_pricing`].
+    #[error(
+        "OBOLUS_PRICING is \"cost-plus\" but these backends declare no cost: {ids}. Cost-plus marks \
+         up each backend's declared cost, so every backend needs one — set OBOLUS_UPSTREAM_COST for \
+         the single-backend setup, or a per-entry \"cost\" in OBOLUS_BACKENDS_FILE."
+    )]
+    MissingBackendCost { ids: String },
+
+    /// A backend declares a `cost`, but `cost-plus` is not selected — so the cost would sit inert,
+    /// the same silently-ignored-config surprise `OrphanedParams` guards for `OBOLUS_UPSTREAM_COST`.
+    /// Names the backends so the operator knows which entries to fix.
+    #[error(
+        "these backends declare a cost: {ids}, but OBOLUS_PRICING is not \"cost-plus\", so the cost \
+         would be silently ignored. Set OBOLUS_PRICING=cost-plus to use it, or remove the cost."
+    )]
+    InertBackendCost { ids: String },
 }
 
 /// Turn the pricing environment into a [`PricingChoice`], or refuse.
@@ -369,21 +397,18 @@ pub fn select_pricing<F: Fn(&str) -> Option<String>>(
                 if get("OBOLUS_PRICE").is_some() {
                     return Err(PricingConfigError::InertPrice);
                 }
-                let cost = match get(UPSTREAM_COST_VAR) {
-                    None => {
-                        return Err(PricingConfigError::MissingParam {
-                            var: UPSTREAM_COST_VAR,
-                            detail: "the upstream cost each request is marked up from, in atomic \
-                                     units",
-                        })
-                    }
-                    // A direct `u128` parse, which is exactly what `validate_atomic_amount` does —
-                    // but the cost is computed *with*, not advertised verbatim, so we keep the value,
-                    // not the wire string. Zero is admissible as an atomic amount yet refused here;
-                    // see `ZeroCost`.
+                // The single-backend cost. Optional here: with a backends file the cost is declared
+                // per entry instead (and OBOLUS_UPSTREAM_COST is refused alongside the file, in
+                // `main`), so its absence is not a refusal — a backend that ends up with no cost is
+                // caught by `require_backend_costs`, which names it. When present it is validated the
+                // way the single-backend amount is: a direct `u128` parse, the value kept because
+                // the cost is computed with, not advertised verbatim. Zero is a valid atomic amount
+                // yet refused; see `ZeroCost`.
+                let upstream_cost = match get(UPSTREAM_COST_VAR) {
+                    None => None,
                     Some(raw) => match raw.parse::<u128>() {
                         Ok(0) => return Err(PricingConfigError::ZeroCost),
-                        Ok(cost) => cost,
+                        Ok(cost) => Some(cost),
                         Err(_) => return Err(PricingConfigError::BadCost { value: raw }),
                     },
                 };
@@ -399,10 +424,59 @@ pub fn select_pricing<F: Fn(&str) -> Option<String>>(
                         Err(_) => return Err(PricingConfigError::BadMargin { value: raw }),
                     },
                 };
-                Ok(PricingChoice::CostPlus { cost, margin_bps })
+                Ok(PricingChoice::CostPlus { margin_bps, upstream_cost })
             }
             _ => Err(PricingConfigError::UnknownRate { value: raw }),
         },
+    }
+}
+
+/// The cross-source coverage check: does the selected rate agree with what the backends declare?
+///
+/// [`select_pricing`] sees only the environment; [`crate::backends::load_backends`] sees only the
+/// backends file. Whether *every* backend has the cost cost-plus needs — or whether a backend
+/// declares a cost no selected rate would read — is a fact about both at once, so it is checked
+/// here, once `main` has both in hand and before it prints the banner or arms the gateway.
+///
+/// Two symmetric refusals, both instances of the same rule the boot path holds throughout:
+/// configuration that cannot take effect refuses rather than being silently dropped.
+/// - cost-plus with a costless backend → [`PricingConfigError::MissingBackendCost`]: the rate marks
+///   up each backend's own cost, and guessing one for the backend that lacks it is the fail-open
+///   these refusals exist to prevent.
+/// - a backend cost with any non-cost-plus rate → [`PricingConfigError::InertBackendCost`]: the cost
+///   would sit unread, the `OrphanedParams` surprise arriving through the backends file.
+///
+/// Each refusal names the offending backends by id so an operator can find the entries to fix.
+pub fn require_backend_costs(
+    backends: &Backends,
+    pricing: PricingChoice,
+) -> Result<(), PricingConfigError> {
+    let named = |select: fn(&crate::backends::Backend) -> bool| -> String {
+        backends
+            .backends()
+            .iter()
+            .filter(|b| select(b))
+            .map(|b| b.id.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match pricing {
+        PricingChoice::CostPlus { .. } => {
+            let missing = named(|b| b.cost.is_none());
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(PricingConfigError::MissingBackendCost { ids: missing })
+            }
+        }
+        PricingChoice::Static => {
+            let inert = named(|b| b.cost.is_some());
+            if inert.is_empty() {
+                Ok(())
+            } else {
+                Err(PricingConfigError::InertBackendCost { ids: inert })
+            }
+        }
     }
 }
 
@@ -552,13 +626,32 @@ mod tests {
     }
 
     #[test]
-    fn cost_plus_reads_its_cost_and_margin() {
+    fn cost_plus_reads_its_margin_and_the_single_backend_cost() {
+        // The single-backend path: OBOLUS_UPSTREAM_COST is present and becomes the sole backend's
+        // cost (`main` attaches it), carried out of here as `upstream_cost`.
         let choice = select_pricing(env(&[
             ("OBOLUS_PRICING", "cost-plus"),
             ("OBOLUS_UPSTREAM_COST", "1000"),
             ("OBOLUS_MARGIN_BPS", "2500"),
         ]));
-        assert_eq!(choice, Ok(PricingChoice::CostPlus { cost: 1000, margin_bps: 2500 }));
+        assert_eq!(
+            choice,
+            Ok(PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: Some(1000) })
+        );
+    }
+
+    #[test]
+    fn cost_plus_without_an_upstream_cost_defers_the_cost_to_the_backends() {
+        // The backends-file path: no OBOLUS_UPSTREAM_COST, because each backend declares its own
+        // cost. Not a refusal here — `require_backend_costs` is what insists every backend has one.
+        let choice = select_pricing(env(&[
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_MARGIN_BPS", "2500"),
+        ]));
+        assert_eq!(
+            choice,
+            Ok(PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None })
+        );
     }
 
     #[test]
@@ -569,7 +662,10 @@ mod tests {
             ("OBOLUS_UPSTREAM_COST", "1000"),
             ("OBOLUS_MARGIN_BPS", "0"),
         ]));
-        assert_eq!(choice, Ok(PricingChoice::CostPlus { cost: 1000, margin_bps: 0 }));
+        assert_eq!(
+            choice,
+            Ok(PricingChoice::CostPlus { margin_bps: 0, upstream_cost: Some(1000) })
+        );
     }
 
     #[test]
@@ -583,19 +679,6 @@ mod tests {
                 "got {err:?} for {bad:?}",
             );
         }
-    }
-
-    #[test]
-    fn cost_plus_without_a_cost_is_rejected() {
-        let err = select_pricing(env(&[
-            ("OBOLUS_PRICING", "cost-plus"),
-            ("OBOLUS_MARGIN_BPS", "2500"),
-        ]))
-        .unwrap_err();
-        assert!(
-            matches!(err, PricingConfigError::MissingParam { var: UPSTREAM_COST_VAR, .. }),
-            "got {err:?}",
-        );
     }
 
     #[test]
@@ -703,5 +786,64 @@ mod tests {
                 "got {err:?} for OBOLUS_PRICING={pricing:?}",
             );
         }
+    }
+
+    // --- require_backend_costs: the cross-source coverage check ---
+
+    use crate::backends::Backend;
+    use crate::upstream::{FakeUpstream, Upstream};
+    use std::sync::Arc;
+
+    /// A test backend with the given id, model alias, and optional declared cost. The upstream is a
+    /// fake; this check never touches it.
+    fn backend_costing(id: &str, cost: Option<u128>) -> Backend {
+        let upstream: Arc<dyn Upstream> = Arc::new(FakeUpstream::streaming());
+        let b = Backend::for_test(id, vec![id], None, upstream);
+        match cost {
+            Some(c) => b.with_cost(c),
+            None => b,
+        }
+    }
+
+    #[test]
+    fn cost_plus_accepts_backends_that_all_declare_a_cost() {
+        let backends =
+            Backends::from_parts(vec![backend_costing("a", Some(1000)), backend_costing("b", Some(2000))]);
+        let pricing = PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None };
+        assert_eq!(require_backend_costs(&backends, pricing), Ok(()));
+    }
+
+    #[test]
+    fn cost_plus_rejects_a_costless_backend_naming_it() {
+        // The rate marks up each backend's own cost; one without a cost cannot be priced, and
+        // guessing one is the fail-open these boot refusals prevent. The refusal names the entry.
+        let backends =
+            Backends::from_parts(vec![backend_costing("has-cost", Some(1000)), backend_costing("no-cost", None)]);
+        let pricing = PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None };
+        let err = require_backend_costs(&backends, pricing).unwrap_err();
+        assert!(
+            matches!(&err, PricingConfigError::MissingBackendCost { ids } if ids == "no-cost"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn static_accepts_backends_that_declare_no_cost() {
+        let backends =
+            Backends::from_parts(vec![backend_costing("a", None), backend_costing("b", None)]);
+        assert_eq!(require_backend_costs(&backends, PricingChoice::Static), Ok(()));
+    }
+
+    #[test]
+    fn static_rejects_a_backend_cost_naming_it() {
+        // A cost with a non-cost-plus rate would sit unread — the OrphanedParams surprise arriving
+        // through the backends file rather than the environment. Named so the operator finds it.
+        let backends =
+            Backends::from_parts(vec![backend_costing("plain", None), backend_costing("priced", Some(1000))]);
+        let err = require_backend_costs(&backends, PricingChoice::Static).unwrap_err();
+        assert!(
+            matches!(&err, PricingConfigError::InertBackendCost { ids } if ids == "priced"),
+            "got {err:?}",
+        );
     }
 }

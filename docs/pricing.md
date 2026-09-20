@@ -102,8 +102,9 @@ the gateway, whichever chain the client pays on. It exists as a library rate —
 config door (below) does not yet offer a `flat` selector, so an operator reaches it only in code,
 not by configuration.
 
-**`CostPlus` — cost-in, margin-out.** The "run it for money" rate. The operator declares an
-upstream cost and a margin, and every request is quoted:
+**`CostPlus` — cost-in, margin-out.** The "run it for money" rate. Each backend declares what a
+request to it costs the operator upstream, and every request is quoted at the *routed backend's*
+cost plus a gateway-wide margin:
 
 ```
 quote = cost + floor(cost * margin_bps / 10000)
@@ -118,18 +119,15 @@ legitimate break-even rate. The arithmetic saturates: an absurd cost×margin tha
 `u128` yields a quote near the maximum — unpayable — the same fail-closed direction as
 `StaticPrice`'s unparseable guard.
 
-As shipped, cost-plus is **gateway-wide and single-chain**: one declared cost, applied to every
-request, on the single advertised chain. Per the [frame](#the-frame-cost-and-quote-are-two-different-denominations),
-one atomic cost is well-defined only against one asset.
+The cost is read per request from the routed backend, so two requests routed to backends with
+different costs are quoted differently through the one rate; the margin is shared across all of
+them. As shipped, cost-plus is **per-backend and single-chain**: each backend's own cost, one
+gateway-wide margin, on the single advertised chain. Per the [frame](#the-frame-cost-and-quote-are-two-different-denominations),
+one atomic cost is well-defined only against one asset — so the *cost* varies by backend but the
+*denomination* does not. How costs are declared, and the boot refusals that keep every backend
+covered, are in [The granularity decision](#the-granularity-decision) below.
 
 ### Planned
-
-**Per-backend cost-plus.** Different backends cost differently — a local model is not priced like
-a resold API. The next step lets cost-plus read the *routed backend's* declared cost, so each
-backend is marked up from its own cost. This is a cost-side refinement: it does not touch the
-denomination crossing, so it stays single-chain. See [The granularity
-decision](#the-granularity-decision) for exactly how far it goes and what it deliberately does
-not do.
 
 **Promotional and free.** A promotional rate (a temporary discount) and a genuinely free rate.
 Free is not just "quote zero" — a zero quote reaches a settle-a-zero-amount path that the paid
@@ -144,8 +142,12 @@ The pricing rate is selected by environment variables, parsed at boot by `select
 | Variable | Meaning |
 |---|---|
 | `OBOLUS_PRICING` | The rate: unset or `static` (the default — each option keeps its own configured amount), or `cost-plus`. |
-| `OBOLUS_UPSTREAM_COST` | Cost-plus only: the declared upstream cost, in atomic units. Required under `cost-plus`. |
-| `OBOLUS_MARGIN_BPS` | Cost-plus only: the margin, in basis points (`10000` = 100%). Required under `cost-plus`. |
+| `OBOLUS_UPSTREAM_COST` | Cost-plus, single-backend only: the sole backend's cost, in atomic units. With a backends file the cost is declared per entry instead (a `"cost"` on each backend), and this variable is refused alongside the file. |
+| `OBOLUS_MARGIN_BPS` | Cost-plus only: the gateway-wide margin, in basis points (`10000` = 100%). Required under `cost-plus`. |
+
+The cost is declared where the backend is: `OBOLUS_UPSTREAM_COST` for the single-backend
+(env-configured) gateway, or a per-entry `"cost"` in `OBOLUS_BACKENDS_FILE` for a multi-backend
+one. See [The granularity decision](#the-granularity-decision) for the shape and its refusals.
 
 ### Boot refusals
 
@@ -153,24 +155,37 @@ A gateway that priced wrongly — or advertised an amount it would not charge �
 that will not start. Every misconfiguration below is a boot refusal, fired **before** the banner,
 so a refused configuration never first advertises anything (the same discipline the arming guard
 follows). The rate parameters, not a computed quote, are what the banner prints when the gateway
-does start: per-backend cost will make quotes vary, so a single boot-time number would drift.
+does start: per-backend cost makes quotes vary, so a single boot-time number would drift — the
+margin is stated once on the rate line and each backend's cost on its own line.
 
 - **Unknown rate.** `OBOLUS_PRICING` names something that is neither `static` nor `cost-plus`
   (a typo, or an unexpanded `${VAR}` that arrived empty) — refused rather than guessed, so a
   mistyped rate never silently falls back to a price the operator did not choose.
 - **Missing / malformed / zero cost or margin.** Cost-plus infers no money value, so a missing
-  cost or margin is a refusal, not a default. A zero cost is refused specifically: there is
-  nothing to mark up (any margin on zero is still zero), and a zero quote would reach the deferred
-  zero-settle path. Serving free is a separate rate, not cost-plus.
+  margin is a refusal, not a default; a missing *cost* is refused too, but as a coverage check
+  over the backends (below), since the cost lives on the backend. A zero cost is refused
+  specifically: there is nothing to mark up (any margin on zero is still zero), and a zero quote
+  would reach the deferred zero-settle path. Serving free is a separate rate, not cost-plus.
+- **Cost-plus with a backend that declares no cost.** The rate marks up each backend's own cost,
+  so every backend needs one; guessing a cost is the fail-open these refusals exist to prevent.
+  Refused, naming the backends that lack a cost. (This is the cross-source coverage check described
+  under [the granularity decision](#the-granularity-decision) — it needs both the rate and the
+  registry, so it does not live in `select_pricing`.)
+- **A backends file alongside `OBOLUS_UPSTREAM_COST`.** With a file, cost is declared per entry, so
+  the single-backend variable would sit inert. Refused unconditionally on presence — mirroring the
+  existing refusal of a backends file alongside `OBOLUS_UPSTREAM_URL`.
 - **Cost-plus alongside multi-chain `OBOLUS_ACCEPTS`.** One declared cost is ambiguous across
   several networks carrying different assets and decimals — the denomination crossing this rate
-  does not yet make. Refused until per-chain cost lands.
+  does not yet make. Cost varies by *backend*, but a single backend's cost is still one atomic
+  amount in one asset; several assets is the deferred cross-asset work. Refused until per-chain
+  cost lands.
 - **Cost-plus alongside an explicit `OBOLUS_PRICE`.** Under cost-plus the amount comes from cost
   and margin, so a configured price would sit inert — the silently-ignored-config surprise. Keyed
   on whether the price was *explicitly set*, so an operator who never set it (and gets its
   default) is not refused on a default they do not know exists.
 - **Orphaned cost-plus parameters.** `OBOLUS_UPSTREAM_COST` / `OBOLUS_MARGIN_BPS` set without
-  `cost-plus` selected would sit inert — refused rather than dropped.
+  `cost-plus` selected would sit inert — refused rather than dropped. Its per-backend twin: a
+  backend that declares a `"cost"` under a non-cost-plus rate is refused too, naming the entry.
 
 ## The granularity decision
 
@@ -180,9 +195,9 @@ resolves it by separating the axes.
 
 **Decided:**
 
-- **Per-backend cost** is the level to build. It is the concrete operator need — resold APIs and
-  local models have genuinely different costs — and it fits the seam and registry unchanged
-  (`PriceContext` already carries the routed backend).
+- **Per-backend cost** is the level built (and now shipped). It is the concrete operator need —
+  resold APIs and local models have genuinely different costs — and it fit the seam and registry
+  unchanged (`PriceContext` already carries the routed backend).
 - **Margin stays gateway-wide.** Margin is a business policy, not a per-backend fact. Per-backend
   margin is a trivial later addition if a need appears; it is not built now.
 
@@ -196,52 +211,49 @@ resolves it by separating the axes.
   have. Out of scope for the current milestone.
 - **Cross-asset (multi-chain) cost-plus.** The denomination crossing. See below.
 
-### How per-backend cost will be declared (planned)
+### How per-backend cost is declared
 
-> The rest of this section is the **planned** design for per-backend cost — the config shape and
-> the boot refusals it will add. None of it is implemented yet: today cost-plus is gateway-wide
-> and single-chain, as [Configuration](#configuration) above describes. It is written here so the
-> shape is settled before the code lands.
+Cost is a fact about a backend, so it is declared with the backend. This follows the config model
+already in place, where a multi-backend gateway is defined by a JSON file and a single-backend
+gateway by environment variables:
 
-Cost is a fact about a backend, so it will be declared with the backend. This follows the config
-model already in place, where a multi-backend gateway is defined by a JSON file and a
-single-backend gateway by environment variables:
-
-- **Single-backend (no backends file).** The existing `OBOLUS_UPSTREAM_COST` is gateway-wide,
-  which *is* per-backend when there is one backend — unchanged.
-- **Multi-backend (`OBOLUS_BACKENDS_FILE`).** Each backend entry will declare its own `cost`, in
+- **Single-backend (no backends file).** `OBOLUS_UPSTREAM_COST` is the sole backend's cost — the
+  gateway-wide value *is* per-backend when there is one backend. `main` attaches it to that
+  backend at boot.
+- **Multi-backend (`OBOLUS_BACKENDS_FILE`).** Each backend entry declares its own `"cost"`, in
   atomic units, as a string (an atomic amount can exceed the range a JSON number represents
   exactly, and every other atomic amount in the config is already a string). `OBOLUS_MARGIN_BPS`
-  will stay gateway-wide.
+  stays gateway-wide.
 
-Two boot refusals will guard this, each modeled on a rule already shipped:
+Two boot refusals guard this, each modeled on a rule already shipped:
 
-- **A backends file set alongside `OBOLUS_UPSTREAM_COST`** will be refused, unconditionally: if a
-  file is present, cost comes from the file. This mirrors the *existing* refusal of a backends
-  file alongside `OBOLUS_UPSTREAM_URL` — the file supersedes the single-backend variables.
+- **A backends file set alongside `OBOLUS_UPSTREAM_COST`** is refused, unconditionally: if a file
+  is present, cost comes from the file. This mirrors the refusal of a backends file alongside
+  `OBOLUS_UPSTREAM_URL` — the file supersedes the single-backend variables.
 - **Under cost-plus, every backend in the registry must declare a cost.** A backend without one
   cannot be marked up, and guessing a cost is exactly the fail-open the boot refusals exist to
-  prevent. The refusal will name the backends that are missing a cost, so an operator knows what
-  to fix. A malformed or zero per-entry cost will be refused where the backend entry is validated
-  (the same place a bad `baseUrl` is caught today), naming the offending backend — so the
-  cost-coverage check is the clean question "is a cost present on every backend," not "present and
-  parseable."
+  prevent. The refusal names the backends that are missing a cost, so an operator knows what to
+  fix. A malformed or zero per-entry cost is refused where the backend entry is validated (the
+  same place a bad `baseUrl` is caught), naming the offending backend — so the cost-coverage check
+  is the clean question "is a cost present on every backend," not "present and parseable." Its
+  mirror image also holds: a backend that declares a cost under a non-cost-plus rate is refused,
+  since the cost would sit unread.
 
-### Where the checks will live in the boot sequence (planned)
+### Where the checks live in the boot sequence
 
-Per-backend cost will be declared in the backends file but the rate is selected from the
-environment, so cost *completeness* is a cross-source check: it needs both the parsed registry and
-the selected rate. It cannot live inside `select_pricing`, which sees the environment only. It
-will be a distinct validation stage, run after both parses and before the banner. The diagram
-below is the *planned* sequence; the per-entry-cost parsing and the cross-source coverage check
-are the two stages it adds to today's boot.
+Per-backend cost is declared in the backends file but the rate is selected from the environment,
+so cost *completeness* is a cross-source check: it needs both the parsed registry and the selected
+rate. It cannot live inside `select_pricing`, which sees the environment only. It is a distinct
+validation stage (`require_backend_costs`), run after both parses and before the banner. The two
+stages per-backend cost adds to the boot are the per-entry cost parsing (in the registry build)
+and this cross-source coverage check.
 
 ```mermaid
 flowchart TB
-  be["build backends registry<br/>(planned: per-entry cost parsed + validated here —<br/>malformed / zero cost refused, names the id)"] --> reqs["parse payment requirements"]
-  reqs --> sel["select_pricing (env)<br/>rate + gateway-wide params"]
-  sel --> cov{"planned cross-source check:<br/>if cost-plus + backends file,<br/>does every backend declare a cost?"}
-  cov -->|"no → name the missing ids"| refuse(["refuse to start"])
+  be["build backends registry<br/>(per-entry cost parsed + validated here —<br/>malformed / zero cost refused, names the id)"] --> reqs["parse payment requirements"]
+  reqs --> sel["select_pricing (env)<br/>rate + gateway-wide margin"]
+  sel --> cov{"require_backend_costs:<br/>cost-plus → every backend has a cost?<br/>other rate → no backend has a cost?"}
+  cov -->|"no → name the offending ids"| refuse(["refuse to start"])
   cov -->|"yes"| arm["check_arming → witness"]
   arm --> gw["build gateway + install determiner"]
   gw --> banner["banner (rate parameters, not a quote)"]

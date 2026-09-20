@@ -30,8 +30,8 @@ use obolus::arming::{
     check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
-    parse_accepts, select_pricing, superseded_single_chain_vars, validated_option, EntryDefect,
-    EntryField, PricingChoice, SharedOffer,
+    parse_accepts, require_backend_costs, select_pricing, superseded_single_chain_vars,
+    validated_option, EntryDefect, EntryField, PricingChoice, SharedOffer,
 };
 use obolus::backends::{load_backends, Backends};
 use obolus::facilitator::DelegatedFacilitator;
@@ -199,6 +199,18 @@ async fn main() -> anyhow::Result<()> {
                      whichever one you meant."
                 );
             }
+            // The cost twin of the refusal above. OBOLUS_UPSTREAM_COST is the *single* backend's
+            // cost; with a file each backend declares its own per-entry "cost", so the env one would
+            // sit inert. Refused unconditionally — on presence, not on whether the file happens to
+            // set costs — so the rule is a property of the pairing, not of the config's contents.
+            if std::env::var("OBOLUS_UPSTREAM_COST").is_ok() {
+                anyhow::bail!(
+                    "OBOLUS_BACKENDS_FILE and OBOLUS_UPSTREAM_COST are both set. OBOLUS_UPSTREAM_COST \
+                     is the single-backend cost; with a config file each backend declares its own \
+                     per-entry \"cost\", so the variable would sit inert. Set the cost per entry in \
+                     the file, or unset OBOLUS_UPSTREAM_COST."
+                );
+            }
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("OBOLUS_BACKENDS_FILE {path:?}: {e}"))?;
             if raw.trim().is_empty() {
@@ -226,9 +238,9 @@ async fn main() -> anyhow::Result<()> {
             Backends::single_ollama(&upstream_url, head_timeout)
         }
     };
-    // The registry the gateway routes over. One backend or many; a request picks one by its `model`
-    // field (see `obolus::backends::Backends::route`). Shared, so the banner below can still read it.
-    let backends = Arc::new(backends);
+    // The registry the gateway routes over. Kept owned for now: the pricing block below may still
+    // attach the single-backend cost to it (`with_sole_cost`), which needs `&mut`. It is sealed into
+    // an `Arc` there, once the rate is known and every backend's cost is settled.
 
     // The challenge tells the payer WHICH resource they are paying for, so `resource` must be an
     // address they can actually reach. Deriving it from the bind address is only right when that
@@ -320,6 +332,27 @@ async fn main() -> anyhow::Result<()> {
     // refusals inside can fire on at most one of them.
     let pricing = select_pricing(|k| std::env::var(k).ok())?;
 
+    // Land the single-backend cost on the sole backend, and check the whole registry against the
+    // rate — both before the `Arc` seal, the arming guard, and the banner, for the same reason
+    // `select_pricing` sits here: a pricing configuration this process will refuse must never first
+    // advertise a price.
+    //
+    // Under cost-plus on the single-backend path, `OBOLUS_UPSTREAM_COST` arrives as `upstream_cost`
+    // and is the sole backend's cost; `with_sole_cost` puts it there (the registry has exactly one
+    // entry on that path). On the backends-file path `upstream_cost` is `None` — the env cost is
+    // refused alongside a file above — and each backend already carries its own declared cost.
+    let backends = match pricing {
+        PricingChoice::CostPlus { upstream_cost: Some(cost), .. } => backends.with_sole_cost(cost),
+        _ => backends,
+    };
+    // Cross-source coverage: cost-plus needs every backend to declare a cost (guessing one is a
+    // fail-open); a declared cost under any other rate would sit unread. Either mismatch refuses,
+    // naming the backends. `select_pricing` sees only the environment and `load_backends` only the
+    // file — this is the one place that holds both.
+    require_backend_costs(&backends, pricing)?;
+    // Sealed now the rate is known and every cost is settled. Shared, so the banner below can read it.
+    let backends = Arc::new(backends);
+
     // Obolus holds no key, but the 402 challenge it advertises IS the real-money trigger: a
     // cooperating client reads (network, asset, pay-to) out of it and pays against it. So the guard
     // sits on the advertisement. Fail-closed against a pinned testnet allowlist — a
@@ -382,8 +415,10 @@ async fn main() -> anyhow::Result<()> {
     // determiner cannot alter which networks are advertised — it prices the amount and nothing else.
     let gateway = match pricing {
         PricingChoice::Static => gateway,
-        PricingChoice::CostPlus { cost, margin_bps } => {
-            gateway.with_price_determiner(Arc::new(CostPlus::new(cost, margin_bps)))
+        PricingChoice::CostPlus { margin_bps, .. } => {
+            // The cost is not here: it lives on each backend and the determiner reads it per
+            // request (see `CostPlus`). The margin is the gateway-wide half.
+            gateway.with_price_determiner(Arc::new(CostPlus::new(margin_bps)))
         }
     };
 
@@ -413,13 +448,21 @@ async fn main() -> anyhow::Result<()> {
         } else {
             backend.models.join(", ")
         };
+        // The declared cost, when there is one. Present exactly on the cost-plus path (the coverage
+        // check refuses a cost under any other rate), where it is the number this backend's quote is
+        // marked up from — so it belongs on the backend's own line, not the single rate line above.
+        let cost = match backend.cost {
+            Some(c) => format!(", cost {c} atomic units"),
+            None => String::new(),
+        };
         eprintln!(
-            "obolus: upstream (inference) -> backend {:?} kind {} at {} ({}, serves {})",
+            "obolus: upstream (inference) -> backend {:?} kind {} at {} ({}, serves {}{})",
             backend.id,
             backend.kind,
             backend.base_url,
             if backend.has_key { "keyed" } else { "keyless" },
             models,
+            cost,
         );
     }
     // The unconditional half of the posture: true on every instance, armed or not. The
@@ -440,9 +483,9 @@ async fn main() -> anyhow::Result<()> {
     // below, read off the verifier rather than composed here.
     match pricing {
         PricingChoice::Static => {}
-        PricingChoice::CostPlus { cost, margin_bps } => eprintln!(
-            "obolus: pricing: cost-plus — every request quoted at upstream cost {cost} atomic \
-             units + {margin_bps} bps margin."
+        PricingChoice::CostPlus { margin_bps, .. } => eprintln!(
+            "obolus: pricing: cost-plus — every request quoted at its backend's declared cost \
+             + {margin_bps} bps margin (each backend's cost is on its line above)."
         ),
     }
     eprintln!("obolus: advertising {} payment option(s):", requirements.len());
