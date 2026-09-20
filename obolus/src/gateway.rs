@@ -439,7 +439,7 @@ mod tests {
     use crate::access::FakeTokenVerifier;
     use crate::backends::Backend;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
-    use crate::pricing::FlatPrice;
+    use crate::pricing::{CostPlus, FlatPrice};
     use crate::upstream::{FakeUpstream, UpstreamCalls};
     use crate::arming::{check_arming, is_provably_testnet};
     use crate::x402::{PaymentPayload, SettlementReceipt, SCHEME_EXACT, X402_VERSION};
@@ -549,6 +549,23 @@ mod tests {
         // because a determiner cannot touch which network is advertised.
         assert_eq!(json["accepts"][0]["network"], serde_json::json!(FIXTURE_NETWORK));
         assert_eq!(json["accepts"][0]["payTo"], serde_json::json!(FIXTURE_PAY_TO));
+    }
+
+    #[tokio::test]
+    async fn a_cost_plus_rate_quotes_cost_plus_margin_in_the_challenge() {
+        // The rate `main` installs for OBOLUS_PRICING=cost-plus, exercised end to end: unlike the
+        // flat cases above, the quoted amount is *computed* (cost + margin), so this proves
+        // CostPlus's arithmetic reaches a real 402 through the seam, not just its unit tests. The
+        // armed option carries "1000"; a cost of 1000 marked up 2500 bps (25%) must quote 1250.
+        let (app, _) = app_priced_with(
+            FakeFacilitator::accepting(),
+            FakeUpstream::streaming(),
+            Arc::new(CostPlus::new(1000, 2500)),
+        );
+        let (status, _, body) = send(app, completion_request(None)).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["accepts"][0]["maxAmountRequired"], serde_json::json!("1250"));
     }
 
     #[tokio::test]

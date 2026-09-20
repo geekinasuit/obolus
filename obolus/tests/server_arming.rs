@@ -64,6 +64,9 @@ const OBOLUS_VARS: &[&str] = &[
     "OBOLUS_PRICE",
     "OBOLUS_PAY_TO",
     "OBOLUS_ASSET",
+    "OBOLUS_PRICING",
+    "OBOLUS_UPSTREAM_COST",
+    "OBOLUS_MARGIN_BPS",
     "OBOLUS_ALLOW_MAINNET",
     "OBOLUS_TOKEN_PUBKEY_FILE",
     "OBOLUS_TOKEN_KEYS",
@@ -554,6 +557,58 @@ fn a_duplicate_option_refuses_before_advertising_anything() {
     // *is* on the allowlist, so the posture line is the one thing a refused run could still print
     // truthfully — and printing it for a startup that does not happen is what the ordering prevents.
     run.must_not_say(ALL_CLEAR_CLAIM);
+}
+
+#[test]
+fn cost_plus_pricing_is_named_in_the_banner() {
+    // A valid cost-plus configuration boots (reaching bind, which this harness fails). The banner
+    // must name the rate and its parameters, and the per-option line must NOT print the armed
+    // default amount as a price — under cost-plus that amount is inert.
+    let run = run(&[
+        ("OBOLUS_PRICING", "cost-plus"),
+        ("OBOLUS_UPSTREAM_COST", "1000"),
+        ("OBOLUS_MARGIN_BPS", "2500"),
+    ]);
+
+    run.must_have_got_past_startup();
+    run.must_say("pricing: cost-plus");
+    run.must_say("upstream cost 1000 atomic units + 2500 bps margin");
+    // The per-option line shows the option is governed by the rate above rather than a number a
+    // client would not be charged (the armed default here is "1000", now inert).
+    run.must_say("priced by the cost-plus rate above");
+}
+
+#[test]
+fn a_bad_cost_plus_config_refuses_before_advertising_anything() {
+    // A pricing refusal fires at the same early point as the arming and duplicate-option guards: a
+    // configuration about to abort must never first advertise a price. Bad cost is the parse path.
+    let run = run(&[
+        ("OBOLUS_PRICING", "cost-plus"),
+        ("OBOLUS_UPSTREAM_COST", "1.5"), // not an integer amount in atomic units
+        ("OBOLUS_MARGIN_BPS", "2500"),
+    ]);
+
+    run.must_say("OBOLUS_UPSTREAM_COST");
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn cost_plus_alongside_an_explicit_price_refuses_before_advertising_anything() {
+    // The inert-amount supersession, end to end: an OBOLUS_PRICE set under cost-plus would sit
+    // inert, so the gateway refuses to start and names it — the posture OBOLUS_ACCEPTS already has
+    // with the single-chain variables. Before advertising, like every other payment-config refusal.
+    let run = run(&[
+        ("OBOLUS_PRICING", "cost-plus"),
+        ("OBOLUS_UPSTREAM_COST", "1000"),
+        ("OBOLUS_MARGIN_BPS", "2500"),
+        ("OBOLUS_PRICE", "1000"),
+    ]);
+
+    run.must_say("OBOLUS_PRICE");
+    run.must_say("silently ignored");
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
 }
 
 #[test]
