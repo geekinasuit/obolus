@@ -572,7 +572,10 @@ fn cost_plus_pricing_is_named_in_the_banner() {
 
     run.must_have_got_past_startup();
     run.must_say("pricing: cost-plus");
-    run.must_say("upstream cost 1000 atomic units + 2500 bps margin");
+    // The margin is stated once on the rate line; the cost is per-backend now, so it lands on the
+    // (single) backend's own banner line — here OBOLUS_UPSTREAM_COST=1000 attached to the sole one.
+    run.must_say("2500 bps margin");
+    run.must_say("cost 1000 atomic units");
     // The per-option line shows the option is governed by the rate above rather than a number a
     // client would not be charged (the armed default here is "1000", now inert).
     run.must_say("priced by the cost-plus rate above");
@@ -609,6 +612,82 @@ fn cost_plus_alongside_an_explicit_price_refuses_before_advertising_anything() {
     run.must_say("silently ignored");
     run.must_have_refused_during_startup();
     run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn a_backends_file_declaring_per_entry_costs_prices_each_backend() {
+    // Per-backend cost, end to end: cost-plus with a backends file whose entries each declare a
+    // "cost". Every backend has one, so it boots; the rate line states the shared margin, and each
+    // backend's own banner line carries its own cost.
+    let path = temp_file(
+        "backends-costed.json",
+        r#"[{"id":"cheap","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"],"cost":"1000"},{"id":"dear","kind":"ollama","baseUrl":"http://10.0.0.2","models":["llama3:70b"],"cost":"5000"}]"#,
+    );
+    let run = run(&[
+        ("OBOLUS_BACKENDS_FILE", &path),
+        ("OBOLUS_PRICING", "cost-plus"),
+        ("OBOLUS_MARGIN_BPS", "2500"),
+    ]);
+
+    run.must_have_got_past_startup();
+    run.must_say("pricing: cost-plus");
+    run.must_say("2500 bps margin");
+    run.must_say("backend \"cheap\"");
+    run.must_say("cost 1000 atomic units");
+    run.must_say("backend \"dear\"");
+    run.must_say("cost 5000 atomic units");
+}
+
+#[test]
+fn cost_plus_with_a_backend_that_declares_no_cost_refuses_naming_it() {
+    // The cross-source coverage check end to end: cost-plus marks up each backend's own cost, so a
+    // backend without one cannot be priced. Refuses at boot, naming the offender, before advertising.
+    let path = temp_file(
+        "backends-missing-cost.json",
+        r#"[{"id":"priced","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"],"cost":"1000"},{"id":"free-rider","kind":"ollama","baseUrl":"http://10.0.0.2","models":["mistral"]}]"#,
+    );
+    let run = run(&[
+        ("OBOLUS_BACKENDS_FILE", &path),
+        ("OBOLUS_PRICING", "cost-plus"),
+        ("OBOLUS_MARGIN_BPS", "2500"),
+    ]);
+
+    run.must_say("free-rider");
+    run.must_say("declare no cost");
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn single_backend_cost_plus_without_a_cost_refuses_naming_the_sole_backend() {
+    // The single-backend twin of the coverage check above. Cost-plus with no OBOLUS_UPSTREAM_COST
+    // and no backends file leaves the auto-built sole backend ("default", from OBOLUS_UPSTREAM_URL)
+    // costless, so `main` routes it through `require_backend_costs` and refuses — the fail-closed
+    // outcome, not a boot that would later quote the unpayable u128::MAX fallback.
+    let run = run(&[("OBOLUS_PRICING", "cost-plus"), ("OBOLUS_MARGIN_BPS", "2500")]);
+
+    run.must_say("declare no cost: default"); // names the sole backend, not just "some backend"
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn the_backend_config_and_the_upstream_cost_at_once_refuse_to_start() {
+    // The cost twin of the OBOLUS_UPSTREAM_URL supersession: OBOLUS_UPSTREAM_COST is the
+    // single-backend cost, so alongside a file (where cost is per-entry) it would sit inert. Refused
+    // unconditionally on presence, before the file is even read.
+    let path = temp_file(
+        "backends-cost-super.json",
+        r#"[{"id":"local","kind":"ollama","baseUrl":"http://127.0.0.1:11434"}]"#,
+    );
+    let run = run(&[
+        ("OBOLUS_BACKENDS_FILE", &path),
+        ("OBOLUS_UPSTREAM_COST", "500"),
+    ]);
+
+    run.must_say("OBOLUS_UPSTREAM_COST");
+    run.must_say("both set");
+    run.must_have_refused_during_startup();
 }
 
 #[test]

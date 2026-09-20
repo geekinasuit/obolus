@@ -556,12 +556,18 @@ mod tests {
         // The rate `main` installs for OBOLUS_PRICING=cost-plus, exercised end to end: unlike the
         // flat cases above, the quoted amount is *computed* (cost + margin), so this proves
         // CostPlus's arithmetic reaches a real 402 through the seam, not just its unit tests. The
-        // armed option carries "1000"; a cost of 1000 marked up 2500 bps (25%) must quote 1250.
-        let (app, _) = app_priced_with(
+        // cost lives on the backend now (the config door guarantees one at boot), so the backend
+        // carries 1000; marked up 2500 bps (25%) it must quote 1250.
+        let backend = Backend::for_test("default", vec![], None, Arc::new(FakeUpstream::streaming()))
+            .with_cost(1000);
+        let gateway = Gateway::new(
             FakeFacilitator::accepting(),
-            FakeUpstream::streaming(),
-            Arc::new(CostPlus::new(1000, 2500)),
-        );
+            Arc::new(Backends::from_parts(vec![backend])),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
+        .with_price_determiner(Arc::new(CostPlus::new(2500)));
+        let app = router(Access::new(gateway, None));
         let (status, _, body) = send(app, completion_request(None)).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();

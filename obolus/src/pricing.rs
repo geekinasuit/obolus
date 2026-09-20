@@ -36,7 +36,8 @@ pub struct PriceContext<'a> {
     /// took without a model (the single-backend case).
     pub model: Option<&'a str>,
     /// The backend this request routed to. Carries the operator's per-backend metadata a policy may
-    /// price on (`id`, `kind`, `models`, `precedence`).
+    /// price on — `id`, `kind`, `models`, `precedence`, and the declared `cost` the cost-plus rate
+    /// marks up.
     pub backend: &'a Backend,
     /// The advertised option being priced. Its `maxAmountRequired` is the current quote; every other
     /// field is copied through unchanged and must not influence anything but the amount.
@@ -103,46 +104,50 @@ impl PriceDeterminer for FlatPrice {
 /// Basis points per whole: 10000 bps = 100%. The denominator [`CostPlus`] marks a cost up by.
 const BPS_PER_WHOLE: u128 = 10_000;
 
-/// Cost-in, margin-out: quote a declared upstream cost plus a margin in basis points.
+/// Cost-in, margin-out: quote the routed backend's declared upstream cost plus a margin in basis
+/// points.
 ///
-/// The "run it for money" rate. An operator states what the request costs them upstream and the
-/// margin they take, and every request is quoted `cost + cost * margin_bps / 10000`. Basis points,
-/// not a percentage or a float: the margin is an exact integer with sub-percent precision (`250`
-/// bps = 2.5%) and there is no float in the money path. The *markup* is in whole atomic units and
-/// floored, so a markup that works out to less than one atomic unit (a tiny cost, or a tiny margin)
-/// rounds down to zero: the quote is only ever rounded toward the payer, and by less than one
-/// atomic unit. `0` bps quotes the cost exactly — a legitimate break-even rate the operator states
-/// on purpose.
+/// The "run it for money" rate. Each backend declares what a request to it costs the operator
+/// upstream — `OBOLUS_UPSTREAM_COST` on the single-backend path, a per-entry `cost` in the backends
+/// file otherwise — and this rate marks that cost up by a gateway-wide margin, quoting
+/// `cost + cost * margin_bps / 10000`. Basis points, not a percentage or a float: the margin is an
+/// exact integer with sub-percent precision (`250` bps = 2.5%) and there is no float in the money
+/// path. The *markup* is in whole atomic units and floored, so a markup that works out to less than
+/// one atomic unit (a tiny cost, or a tiny margin) rounds down to zero: the quote is only ever
+/// rounded toward the payer, and by less than one atomic unit. `0` bps quotes the cost exactly — a
+/// legitimate break-even rate the operator states on purpose.
 ///
-/// Gateway-wide by construction here: one declared cost, so — like [`FlatPrice`] — the quote is the
-/// same on every advertised option. It is a distinct type rather than a pre-computed `FlatPrice`
-/// because it holds `cost` and `margin_bps` as live inputs: a later slice makes `cost` vary by the
-/// routed backend (`ctx.backend`), at which point `quote` genuinely depends on the context it is
-/// handed. The config door refuses a declared cost of zero, so a positive cost with any margin
-/// quotes a positive, payable amount — this rate never reaches the zero-amount case.
+/// The cost is read per request from [`PriceContext::backend`], so two requests routed to backends
+/// with different costs are quoted differently through the one determiner; the margin is shared.
+/// The config door refuses to start under this rate unless *every* backend declares a cost (see
+/// [`crate::config::require_backend_costs`]) and refuses a declared cost of zero, so on the paying
+/// path the backend's cost is present and positive — the fail-closed branch below is unreachable in
+/// a configured gateway.
 pub struct CostPlus {
-    cost: u128,
     margin_bps: u32,
 }
 
 impl CostPlus {
-    /// A cost-plus rate: `cost` atomic units marked up by `margin_bps` basis points. `cost` is the
-    /// operator's declared upstream cost; the config door (see [`crate::config::select_pricing`])
-    /// rejects a zero cost before one reaches here.
-    pub fn new(cost: u128, margin_bps: u32) -> Self {
-        Self { cost, margin_bps }
+    /// A cost-plus rate marking each backend's declared cost up by `margin_bps` basis points. The
+    /// cost is read per request from the routed backend; the config door
+    /// ([`crate::config::require_backend_costs`]) guarantees one is present before this runs.
+    pub fn new(margin_bps: u32) -> Self {
+        Self { margin_bps }
     }
 }
 
 impl PriceDeterminer for CostPlus {
-    fn quote(&self, _ctx: PriceContext<'_>) -> u128 {
-        // Saturating throughout, so `quote` is total on any input the config door admits (it must
-        // never panic on the paying path). The base cost is kept exact and only the *markup* can
-        // saturate: an absurd cost×margin that would overflow `u128` yields a quote near the
-        // maximum, which no client can pay — fail-closed, the same direction as `StaticPrice`'s
-        // unparseable guard, never a giveaway.
-        let markup = self.cost.saturating_mul(self.margin_bps as u128) / BPS_PER_WHOLE;
-        self.cost.saturating_add(markup)
+    fn quote(&self, ctx: PriceContext<'_>) -> u128 {
+        // The routed backend's declared cost. `None` is unreachable on the paying path — the config
+        // door refuses cost-plus unless every backend has a cost — so it fails *closed*: quote the
+        // unpayable maximum rather than give the work away, the same direction as `StaticPrice`'s
+        // unparseable guard.
+        let cost = ctx.backend.cost.unwrap_or(u128::MAX);
+        // Saturating throughout, so `quote` is total. The base cost is kept exact and only the
+        // *markup* can saturate: an absurd cost×margin that would overflow `u128` yields a quote
+        // near the maximum, which no client can pay — fail-closed, never a giveaway.
+        let markup = cost.saturating_mul(self.margin_bps as u128) / BPS_PER_WHOLE;
+        cost.saturating_add(markup)
     }
 }
 
@@ -208,26 +213,38 @@ mod tests {
     }
 
     #[test]
-    fn cost_plus_marks_the_cost_up_by_the_margin() {
-        let backend = backend();
-        // 1000 cost + 2500 bps (25%) margin = 1250, whatever the requirement's own amount was.
-        let rate = CostPlus::new(1000, 2500);
+    fn cost_plus_marks_the_backends_cost_up_by_the_margin() {
+        // Cost 1000 (from the backend) + 2500 bps (25%) margin = 1250, whatever the requirement's
+        // own amount was.
+        let backend = backend().with_cost(1000);
+        let rate = CostPlus::new(2500);
         assert_eq!(rate.quote(ctx(&backend, &requirement("1"))), 1250);
         assert_eq!(rate.quote(ctx(&backend, &requirement("999999"))), 1250);
     }
 
     #[test]
+    fn cost_plus_prices_each_backend_from_its_own_cost() {
+        // The point of per-backend cost: one determiner, one margin, but the quote follows the
+        // routed backend's declared cost.
+        let cheap = backend().with_cost(1000);
+        let dear = backend().with_cost(2000);
+        let rate = CostPlus::new(2500);
+        assert_eq!(rate.quote(ctx(&cheap, &requirement("1"))), 1250);
+        assert_eq!(rate.quote(ctx(&dear, &requirement("1"))), 2500);
+    }
+
+    #[test]
     fn cost_plus_with_zero_margin_quotes_the_cost_exactly() {
         // Break-even is a legitimate rate: charge the upstream cost and take nothing on top.
-        let backend = backend();
-        assert_eq!(CostPlus::new(1000, 0).quote(ctx(&backend, &requirement("1"))), 1000);
+        let backend = backend().with_cost(1000);
+        assert_eq!(CostPlus::new(0).quote(ctx(&backend, &requirement("1"))), 1000);
     }
 
     #[test]
     fn cost_plus_keeps_sub_percent_margin_precision() {
         // 250 bps = 2.5%, which an integer-percentage margin could not express. 1000 + 25 = 1025.
-        let backend = backend();
-        assert_eq!(CostPlus::new(1000, 250).quote(ctx(&backend, &requirement("1"))), 1025);
+        let backend = backend().with_cost(1000);
+        assert_eq!(CostPlus::new(250).quote(ctx(&backend, &requirement("1"))), 1025);
     }
 
     #[test]
@@ -237,8 +254,8 @@ mod tests {
         // payer (never overcharges) and loses under one atomic unit of margin; it is why the doc
         // says the margin is exact but the markup is floored, not that every quote is exact.
         // 3 * 2500 / 10000 = 0.
-        let backend = backend();
-        assert_eq!(CostPlus::new(3, 2500).quote(ctx(&backend, &requirement("1"))), 3);
+        let backend = backend().with_cost(3);
+        assert_eq!(CostPlus::new(2500).quote(ctx(&backend, &requirement("1"))), 3);
     }
 
     #[test]
@@ -246,8 +263,17 @@ mod tests {
         // A cost and margin whose product overflows u128 must not wrap to a tiny quote and sell the
         // work off cheap. Saturating arithmetic yields a quote near the maximum — unpayable — the
         // same fail-closed direction as StaticPrice's unparseable guard.
-        let backend = backend();
-        let rate = CostPlus::new(u128::MAX, u32::MAX);
+        let backend = backend().with_cost(u128::MAX);
+        let rate = CostPlus::new(u32::MAX);
         assert_eq!(rate.quote(ctx(&backend, &requirement("1"))), u128::MAX);
+    }
+
+    #[test]
+    fn cost_plus_fails_closed_on_a_costless_backend() {
+        // Unreachable in a configured gateway — the config door refuses cost-plus unless every
+        // backend has a cost — but if a costless backend ever reached the seam, the quote must be
+        // the unpayable maximum, never zero (which would give the work away).
+        let backend = backend(); // no cost declared
+        assert_eq!(CostPlus::new(2500).quote(ctx(&backend, &requirement("1"))), u128::MAX);
     }
 }

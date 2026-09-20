@@ -161,7 +161,7 @@ The seams, and what rides behind each:
 |---|---|---|---|
 | Fulfillment | `Facilitator` | Is this payment good, and settle it | delegating (HTTP), test fake |
 | Upstream | `Upstream` | Serve the inference | Ollama / OpenAI-compatible, test fake |
-| Pricing | `PriceDeterminer` | What does this request cost | static, cost-plus (config-selectable); flat (a library rate, not yet wired to config) |
+| Pricing | `PriceDeterminer` | What does this request cost | static, cost-plus (config-selectable; cost-plus is per-backend, single-chain); flat (a library rate, not yet wired to config) |
 
 Planned seams named by the vision but not yet built: telemetry/metrics (out-of-process revenue
 and cost reporting) and feature-flags/kill-switch (per-backend switches and spend caps).
@@ -180,8 +180,10 @@ flowchart TB
   start(["obolus starts"]) --> be["build backends registry<br/>(OBOLUS_BACKENDS_FILE | OBOLUS_UPSTREAM_URL)"]
   be --> reqs["parse payment requirements<br/>(OBOLUS_ACCEPTS, or single-chain vars)"]
   reqs --> price["select pricing rate<br/>(select_pricing — env only)"]
-  price --> arm{"check_arming:<br/>every network on the allowlist?"}
-  arm -->|"no"| refuse(["refuse to start<br/>(no banner, no router)"])
+  price --> cov{"require_backend_costs:<br/>rate and backend costs agree?"}
+  cov -->|"no → name the offending ids"| refuse(["refuse to start<br/>(no banner, no router)"])
+  cov -->|"yes"| arm{"check_arming:<br/>every network on the allowlist?"}
+  arm -->|"no"| refuse
   arm -->|"yes → ArmedRequirements witness"| gw["Gateway::new(facilitator, backends, witness)<br/>+ install price determiner"]
   gw --> banner["print banner<br/>(advertised options, pricing rate, token path)"]
   banner --> serve(["serve HTTP"])
@@ -256,8 +258,9 @@ These hold today; each is easy to break while improving something nearby.
 The near-term milestone is "someone can run this for money": the object-safe backend seam,
 structured multi-backend config, model-identity routing, the pricing seam, and minimal
 revenue/cost telemetry — all still stateless. The subsystem currently growing is **pricing**:
-per-backend cost is the next step, and it lands on the seam and registry already described. See
-[`pricing.md`](pricing.md) for that design.
+per-backend cost-plus has landed (each backend declares its own cost; the margin stays
+gateway-wide), on the seam and registry already described; promotional/free rates and cross-asset
+(multi-chain) cost-plus are the remaining steps. See [`pricing.md`](pricing.md) for that design.
 
 Sequenced after the stateless core: an admin UX and the stateless→stateful transition,
 feature-flags / kill-switch, client-key pass-through, Anthropic-compatible routing,
