@@ -43,15 +43,16 @@ mod upstream;
 mod verify;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use obolus::arming::{check_arming, PLACEHOLDER_NETWORK};
 use obolus::config::{parse_accepts, superseded_single_chain_vars, validated_option, SharedOffer};
 use obolus::gateway::{router, Access, Gateway};
-use obolus::upstream::OllamaUpstream;
+use obolus::upstream::{OllamaUpstream, Upstream};
 use obolus::x402::PaymentRequirements;
 
 use crate::config::{VerifyMode, TOKEN_NAME_VAR, TOKEN_VERSION_VAR};
-use crate::upstream::DevUpstream;
+use crate::upstream::CannedUpstream;
 use crate::verify::TokenDomain;
 
 /// Deliberately neither 8402 (which x402 client tooling tends to bind) nor 8403 (`obolus`), so a
@@ -191,8 +192,8 @@ async fn main() -> anyhow::Result<()> {
     // Unset means the canned upstream — a development seller that needs a model running to test a
     // *payment* flow would be a worse tool than the one it replaces.
     let upstream_url = std::env::var("OBOLUS_UPSTREAM_URL").ok();
-    let upstream = match &upstream_url {
-        None => DevUpstream::Canned,
+    let upstream: Arc<dyn Upstream> = match &upstream_url {
+        None => Arc::new(CannedUpstream),
         Some(url) => {
             if !url.to_ascii_lowercase().starts_with("http://") {
                 anyhow::bail!(
@@ -200,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
                      client speaks plain HTTP only. Unset it to serve a canned response instead."
                 );
             }
-            DevUpstream::Ollama(OllamaUpstream::new(url))
+            Arc::new(OllamaUpstream::new(url))
         }
     };
 
@@ -407,7 +408,7 @@ async fn main() -> anyhow::Result<()> {
          away."
     );
     eprintln!("obolus-devseller: behaviour -> {dev}");
-    eprintln!("obolus-devseller: upstream -> {}", upstream::describe(&upstream, upstream_url.as_deref()));
+    eprintln!("obolus-devseller: upstream -> {}", upstream::describe(upstream_url.as_deref()));
     if dev.verify == VerifyMode::Verify {
         // The two fields no x402 challenge carries (#13). Printed unconditionally under
         // `verify` because a wrong one rejects every correct signature, and the payer cannot see

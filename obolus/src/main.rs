@@ -311,7 +311,7 @@ async fn main() -> anyhow::Result<()> {
     // advertised" a property of the constructor rather than of this file's ordering. The witness
     // holds its own copy of the option set; `requirements` stays for the banner below, and neither
     // is mutated after the guard ran, so they cannot drift.
-    let gateway = Gateway::new(facilitator, upstream, armed_requirements)
+    let gateway = Gateway::new(facilitator, Arc::new(upstream), armed_requirements)
         .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
 
     // "starting on", not "listening on" — the bind is ~100 lines below and every check between here

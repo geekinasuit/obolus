@@ -80,14 +80,20 @@ pub enum GatewayError {
 ///
 /// It can advertise several ways to pay at once — one entry per `(scheme, network)`, e.g. Base and
 /// Solana — and settles each request against whichever advertised option the client actually paid.
-pub struct Gateway<F: Facilitator, U: Upstream> {
+///
+/// The upstream is held as `Arc<dyn Upstream>` rather than a compile-time type parameter, so which
+/// backend serves is a runtime choice and a heterogeneous set of them can sit behind this one seam.
+/// A single Ollama origin is the `N = 1` case: one `Arc::new(OllamaUpstream::new(..))` handed to
+/// [`new`](Self::new). Selecting *among* several by the request's model is a later story; today the
+/// gateway forwards to the one it was built with.
+pub struct Gateway<F: Facilitator> {
     facilitator: F,
-    upstream: U,
+    upstream: Arc<dyn Upstream>,
     /// Non-empty and unique by `(scheme, network)` — enforced by [`Gateway::new`].
     requirements: Vec<PaymentRequirements>,
 }
 
-impl<F: Facilitator, U: Upstream> Gateway<F, U> {
+impl<F: Facilitator> Gateway<F> {
     /// Build a gateway advertising `requirements`. Fails if the list is empty, or if two entries
     /// share a `(scheme, network)` — see [`GatewayError`].
     ///
@@ -107,7 +113,7 @@ impl<F: Facilitator, U: Upstream> Gateway<F, U> {
     /// Neither reads the environment.
     pub fn new(
         facilitator: F,
-        upstream: U,
+        upstream: Arc<dyn Upstream>,
         requirements: ArmedRequirements,
     ) -> Result<Self, GatewayError> {
         let requirements = requirements.into_requirements();
@@ -170,8 +176,8 @@ async fn health() -> &'static str {
 
 /// The paying path. Not an axum handler — [`completion`] is the route, and reaches this when the
 /// caller presented no token we honour.
-async fn paid_completion<F: Facilitator, U: Upstream>(
-    gateway: Arc<Gateway<F, U>>,
+async fn paid_completion<F: Facilitator>(
+    gateway: Arc<Gateway<F>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -265,15 +271,15 @@ fn proxy_response(response: UpstreamResponse, receipt: Option<&SettlementReceipt
 ///
 /// [`Gateway`] deliberately does not appear in this decision: it runs the 402 handshake and must
 /// never learn who the caller is.
-pub struct Access<F: Facilitator, U: Upstream> {
+pub struct Access<F: Facilitator> {
     /// `None` switches the token path off entirely and every request pays — which is what an
     /// instance with no verifying key configured does, and is the behaviour to fall back to.
     token: Option<TokenPath>,
-    gateway: Arc<Gateway<F, U>>,
+    gateway: Arc<Gateway<F>>,
 }
 
-impl<F: Facilitator, U: Upstream> Access<F, U> {
-    pub fn new(gateway: Gateway<F, U>, token: Option<TokenPath>) -> Self {
+impl<F: Facilitator> Access<F> {
+    pub fn new(gateway: Gateway<F>, token: Option<TokenPath>) -> Self {
         Self { token, gateway: Arc::new(gateway) }
     }
 
@@ -290,8 +296,8 @@ impl<F: Facilitator, U: Upstream> Access<F, U> {
 }
 
 /// Serve a caller we recognise; charge one we do not.
-async fn completion<F: Facilitator, U: Upstream>(
-    State(access): State<Arc<Access<F, U>>>,
+async fn completion<F: Facilitator>(
+    State(access): State<Arc<Access<F>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -318,12 +324,12 @@ async fn completion<F: Facilitator, U: Upstream>(
 ///
 /// Takes the constructed [`Access`] rather than its parts so that whatever `main` printed about the
 /// token path was read off the same value that lands here.
-pub fn router<F: Facilitator, U: Upstream>(access: Access<F, U>) -> Router {
+pub fn router<F: Facilitator>(access: Access<F>) -> Router {
     Router::new()
         // Ungated on purpose: liveness is not a paid service, and a health check that needs a
         // wallet is a health check nothing can call.
         .route("/health", get(health))
-        .route("/v1/chat/completions", post(completion::<F, U>))
+        .route("/v1/chat/completions", post(completion::<F>))
         .with_state(Arc::new(access))
 }
 
@@ -392,7 +398,8 @@ mod tests {
     /// receipt header as one that correctly never charged.
     fn app_with(facilitator: FakeFacilitator, upstream: FakeUpstream) -> (Router, FakeCalls) {
         let calls = facilitator.calls();
-        let gateway = Gateway::new(facilitator, upstream, armed(vec![requirements()])).unwrap();
+        let gateway =
+            Gateway::new(facilitator, Arc::new(upstream), armed(vec![requirements()])).unwrap();
         (router(Access::new(gateway, None)), calls)
     }
 
@@ -411,7 +418,8 @@ mod tests {
     ) -> (Router, FakeCalls, UpstreamCalls) {
         let calls = facilitator.calls();
         let forwards = upstream.calls();
-        let gateway = Gateway::new(facilitator, upstream, armed(vec![requirements()])).unwrap();
+        let gateway =
+            Gateway::new(facilitator, Arc::new(upstream), armed(vec![requirements()])).unwrap();
         let token = TokenPath::new(Arc::new(verifier));
         (router(Access::new(gateway, Some(token))), calls, forwards)
     }
@@ -731,8 +739,12 @@ mod tests {
         let calls = facilitator.calls();
         (
             router(Access::new(
-                Gateway::new(facilitator, upstream, armed(vec![requirements(), requirements_b()]))
-                    .unwrap(),
+                Gateway::new(
+                    facilitator,
+                    Arc::new(upstream),
+                    armed(vec![requirements(), requirements_b()]),
+                )
+                .unwrap(),
                 None,
             )),
             calls,
@@ -840,7 +852,7 @@ mod tests {
         let app = router(Access::new(
             Gateway::new(
                 calls_holder,
-                FakeUpstream::streaming(),
+                Arc::new(FakeUpstream::streaming()),
                 armed(vec![requirements_b(), short_name]),
             )
             .unwrap(),
@@ -872,9 +884,13 @@ mod tests {
         // A gateway that accepts nothing can never be paid — refused at construction, not served as
         // a route that 402s forever. (`.err()` rather than `.unwrap_err()` because `Gateway` is not
         // `Debug`; the error type is.)
-        let err = Gateway::new(FakeFacilitator::accepting(), FakeUpstream::streaming(), armed(vec![]))
-            .err()
-            .expect("an empty option list must be rejected");
+        let err = Gateway::new(
+            FakeFacilitator::accepting(),
+            Arc::new(FakeUpstream::streaming()),
+            armed(vec![]),
+        )
+        .err()
+        .expect("an empty option list must be rejected");
         assert!(matches!(err, GatewayError::NoPaymentOptions), "got {err:?}");
     }
 
@@ -888,7 +904,7 @@ mod tests {
         dup.asset = "0xDIFFERENT-ASSET-SAME-NETWORK-NOT-REAL".to_string();
         let err = Gateway::new(
             FakeFacilitator::accepting(),
-            FakeUpstream::streaming(),
+            Arc::new(FakeUpstream::streaming()),
             armed(vec![requirements(), dup]),
         )
         .err()
@@ -980,9 +996,12 @@ mod tests {
         let (app, forwards) = {
             let upstream = FakeUpstream::streaming();
             let forwards = upstream.calls();
-            let gateway =
-                Gateway::new(FakeFacilitator::accepting(), upstream, armed(vec![requirements()]))
-                    .unwrap();
+            let gateway = Gateway::new(
+                FakeFacilitator::accepting(),
+                Arc::new(upstream),
+                armed(vec![requirements()]),
+            )
+            .unwrap();
             (router(Access::new(gateway, None)), forwards)
         };
         let (status, _headers, _body) = send(app, tokened_request(HONOURED)).await;
