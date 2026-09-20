@@ -46,6 +46,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use obolus::arming::{check_arming, PLACEHOLDER_NETWORK};
+use obolus::backends::{Backends, Kind};
 use obolus::config::{parse_accepts, superseded_single_chain_vars, validated_option, SharedOffer};
 use obolus::gateway::{router, Access, Gateway};
 use obolus::upstream::{OllamaUpstream, Upstream};
@@ -442,9 +443,17 @@ async fn main() -> anyhow::Result<()> {
     // `new` takes the arming guard's witness, which holds its own copy of the option set; the
     // banner below reports `requirements`. Neither is mutated after the guard ran, so they cannot
     // drift.
+    // The gateway routes over a registry; devseller has exactly one upstream (canned, or the origin
+    // OBOLUS_UPSTREAM_URL names), so it wraps it as a one-backend catch-all that serves every model.
+    let backends = Arc::new(Backends::single(
+        "devseller",
+        Kind::Ollama,
+        upstream_url.as_deref().unwrap_or("canned://devseller"),
+        upstream,
+    ));
     let gateway = Gateway::new(
         facilitator::DevFacilitator::new(dev.verify, dev.settle, token),
-        upstream,
+        backends,
         armed_requirements,
     )
     .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;

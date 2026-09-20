@@ -1224,15 +1224,43 @@ fn the_backend_config_and_the_single_upstream_at_once_refuse_to_start() {
 }
 
 #[test]
-fn multiple_backends_refuse_to_start_and_point_at_s2() {
+fn multiple_named_backends_boot_and_are_named() {
+    // Routing across backends is implemented (S2), so more than one backend is no longer a refusal.
+    // Each declares an explicit model, so the registry is unambiguous; the banner names both.
     let path = temp_file(
         "backends-multi.json",
-        r#"[{"id":"a","kind":"ollama","baseUrl":"http://a"},{"id":"b","kind":"ollama","baseUrl":"http://b"}]"#,
+        r#"[{"id":"fast","kind":"ollama","baseUrl":"http://10.0.0.1:11434","models":["llama3"]},{"id":"big","kind":"ollama","baseUrl":"http://10.0.0.2:11434","models":["llama3:70b"]}]"#,
     );
     let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
 
-    // The refusal names S2 so it does not read as a permanent limit.
-    run.must_say("issues/56");
+    run.must_have_got_past_startup();
+    run.must_say("backend \"fast\"");
+    run.must_say("backend \"big\"");
+}
+
+#[test]
+fn a_catch_all_backend_alongside_named_ones_refuses_to_start() {
+    // A backend with no models is a catch-all; declared alongside named siblings it would silently
+    // swallow their traffic, so it is refused at boot — the S2 form of the old one-backend rule.
+    let path = temp_file(
+        "backends-catchall.json",
+        r#"[{"id":"named","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"]},{"id":"greedy","kind":"ollama","baseUrl":"http://10.0.0.2"}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_say("catch-all");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn backends_sharing_an_id_refuse_to_start() {
+    let path = temp_file(
+        "backends-dupid.json",
+        r#"[{"id":"dup","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"]},{"id":"dup","kind":"ollama","baseUrl":"http://10.0.0.2","models":["mistral"]}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_say("id \"dup\"");
     run.must_have_refused_during_startup();
 }
 

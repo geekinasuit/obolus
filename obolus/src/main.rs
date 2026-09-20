@@ -9,7 +9,8 @@
 //! It delegates settlement to a third-party
 //! x402 facilitator (`OBOLUS_FACILITATOR_URL`, required — the gateway never guesses where money
 //! settles) and proxies inference to a backend: a single Ollama origin (`OBOLUS_UPSTREAM_URL`) by
-//! default, or the backend declared in `OBOLUS_BACKENDS_FILE` (see [`obolus::backends`]). The payment
+//! default, or one of the backends declared in `OBOLUS_BACKENDS_FILE`, routed to by the request's
+//! `model` (see [`obolus::backends`]). The payment
 //! placeholders below are deliberately not real addresses and must be overridden for any real
 //! network; there is no mainnet signing path in this crate.
 //!
@@ -167,16 +168,16 @@ async fn main() -> anyhow::Result<()> {
     }
     let head_timeout = Duration::from_secs(head_timeout_secs);
 
-    // Where backends come from (#55). `OBOLUS_BACKENDS_FILE`, when set, is a JSON file declaring a
-    // backend — its kind (`ollama` | `openai-compat` | `anthropic-compat`), base URL, an optional
-    // key-file reference, and (parsed but not yet routed on) its models and precedence. It
+    // Where backends come from (#55, #56). `OBOLUS_BACKENDS_FILE`, when set, is a JSON file declaring
+    // one or more backends — each a kind (`ollama` | `openai-compat` | `anthropic-compat`), base URL,
+    // an optional key-file reference, and the models and precedence a request is routed on. It
     // supersedes the single-backend `OBOLUS_UPSTREAM_URL` exactly as `OBOLUS_ACCEPTS` supersedes the
     // single-chain payment variables, and refuses to start when both are set for the same reason: an
     // ignored upstream is a gateway serving a backend the operator did not think they configured.
-    // Unset, the single Ollama backend is built from `OBOLUS_UPSTREAM_URL` — the N = 1 path,
-    // behaviourally identical to before this module. `obolus::backends` fails loud at boot on a
-    // malformed config, an unreadable key file, or a non-http origin, so no such fault survives to
-    // the first paid request.
+    // Unset, the single Ollama backend is built from `OBOLUS_UPSTREAM_URL` — the N = 1 catch-all
+    // path, behaviourally identical to before this module. `obolus::backends` fails loud at boot on a
+    // malformed config, an unreadable key file, a non-http origin, or a registry whose routes are
+    // ambiguous, so no such fault survives to the first paid request.
     let backends = match std::env::var("OBOLUS_BACKENDS_FILE") {
         // Set-but-empty first, ahead of the supersession bail below, for the reason the
         // OBOLUS_ACCEPTS arm gives: that bail is actionable but its premise is false here — the file
@@ -224,9 +225,9 @@ async fn main() -> anyhow::Result<()> {
             Backends::single_ollama(&upstream_url, head_timeout)
         }
     };
-    // The one backend to serve from. S1 admits exactly one (routing over several is S2); the gateway
-    // holds it exactly as it held the single upstream before.
-    let backend_upstream = backends.sole().upstream();
+    // The registry the gateway routes over. One backend or many; a request picks one by its `model`
+    // field (see `obolus::backends::Backends::route`). Shared, so the banner below can still read it.
+    let backends = Arc::new(backends);
 
     // The challenge tells the payer WHICH resource they are paying for, so `resource` must be an
     // address they can actually reach. Deriving it from the bind address is only right when that
@@ -363,7 +364,7 @@ async fn main() -> anyhow::Result<()> {
     // advertised" a property of the constructor rather than of this file's ordering. The witness
     // holds its own copy of the option set; `requirements` stays for the banner below, and neither
     // is mutated after the guard ran, so they cannot drift.
-    let gateway = Gateway::new(facilitator, backend_upstream, armed_requirements)
+    let gateway = Gateway::new(facilitator, backends.clone(), armed_requirements)
         .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
 
     // "starting on", not "listening on" — the bind is ~100 lines below and every check between here
@@ -383,16 +384,24 @@ async fn main() -> anyhow::Result<()> {
     );
     eprintln!("obolus: facilitator (verify/settle) -> {facilitator_url}");
     // Off the constructed registry, not the configuration that built it, so the line describes what
-    // was actually wired. S1 serves exactly one backend; the "keyed"/"keyless" note says whether a
-    // bearer is attached without ever naming the credential.
-    let backend = backends.sole();
-    eprintln!(
-        "obolus: upstream (inference) -> backend {:?} kind {} at {} ({})",
-        backend.id,
-        backend.kind,
-        backend.base_url,
-        if backend.has_key { "keyed" } else { "keyless" }
-    );
+    // was actually wired. One line per backend the router can reach; the "keyed"/"keyless" note says
+    // whether a bearer is attached without ever naming the credential. A backend with no `models` is
+    // the catch-all that serves every request (the single-backend case).
+    for backend in backends.backends() {
+        let models = if backend.models.is_empty() {
+            "any model".to_string()
+        } else {
+            backend.models.join(", ")
+        };
+        eprintln!(
+            "obolus: upstream (inference) -> backend {:?} kind {} at {} ({}, serves {})",
+            backend.id,
+            backend.kind,
+            backend.base_url,
+            if backend.has_key { "keyed" } else { "keyless" },
+            models,
+        );
+    }
     // The unconditional half of the posture: true on every instance, armed or not. The
     // testnet-by-construction claim is NOT stated here — on an armed instance it would be false, and
     // it sits one line above a MAINNET ARMED banner. It is asserted below, where it is checked.
