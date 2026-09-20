@@ -215,7 +215,7 @@ sequenceDiagram
   G->>F: verify(payment, requirement)
   F-->>G: ok
   G->>U: forward to routed backend
-  U-->>G: 200 (answer begins; body not yet streamed)
+  U-->>G: 200 OK (body not yet streamed)
   G->>F: settle(payment)
   F-->>G: receipt
   G-->>C: stream answer (receipt in the response header)
