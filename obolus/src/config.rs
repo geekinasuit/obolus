@@ -226,6 +226,186 @@ pub fn superseded_single_chain_vars<F: Fn(&str) -> bool>(is_set: F) -> Vec<&'sta
     SINGLE_CHAIN_VARS.into_iter().filter(|&k| is_set(k)).collect()
 }
 
+/// Selects the pricing rate. Unset (or `static`) keeps today's behaviour — each option quoted at
+/// its own armed amount; `cost-plus` selects [`crate::pricing::CostPlus`].
+pub const PRICING_VAR: &str = "OBOLUS_PRICING";
+/// Cost-plus's declared upstream cost, atomic units. Required when `OBOLUS_PRICING=cost-plus`.
+pub const UPSTREAM_COST_VAR: &str = "OBOLUS_UPSTREAM_COST";
+/// Cost-plus's margin, in basis points (10000 = 100%). Required when `OBOLUS_PRICING=cost-plus`.
+pub const MARGIN_BPS_VAR: &str = "OBOLUS_MARGIN_BPS";
+
+/// The pricing rate an operator selected, ready for `main` to build a determiner from. A plain data
+/// value, not a determiner: the determiner types live in [`crate::pricing`], and keeping the config
+/// door's output free of them lets this parse and its refusals be unit-tested without wiring a
+/// gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PricingChoice {
+    /// The behaviour-preserving default: [`crate::pricing::StaticPrice`], each option at its own
+    /// armed amount.
+    Static,
+    /// Cost-plus: a gateway-wide declared upstream `cost` marked up by `margin_bps` basis points
+    /// ([`crate::pricing::CostPlus`]).
+    CostPlus { cost: u128, margin_bps: u32 },
+}
+
+/// Why a pricing configuration could not be turned into a [`PricingChoice`]. Each is a boot refusal:
+/// a gateway that priced wrongly — or advertised an amount it would not charge — is worse than one
+/// that will not start.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PricingConfigError {
+    /// `OBOLUS_PRICING` names something that is not a rate — a typo, or an unexpanded `${VAR}` that
+    /// arrived empty. Refused rather than guessed, so a mistyped rate never silently falls back to a
+    /// price the operator did not choose.
+    #[error(
+        "OBOLUS_PRICING {value:?} is not a known rate. Set it to \"static\" (the default — each \
+         advertised option keeps its own configured amount) or \"cost-plus\", or unset it."
+    )]
+    UnknownRate { value: String },
+
+    /// `cost-plus` is selected but one of its parameters is absent. Cost-plus infers no money value,
+    /// so a missing cost or margin is a refusal, not a default.
+    #[error("OBOLUS_PRICING is \"cost-plus\" but {var} is not set: {detail}")]
+    MissingParam { var: &'static str, detail: &'static str },
+
+    /// The declared cost is not a non-negative integer in atomic units — the same shape
+    /// [`validate_atomic_amount`] rejects for an advertised amount, applied to the cost cost-plus
+    /// marks up.
+    #[error(
+        "OBOLUS_UPSTREAM_COST {value:?} is not a non-negative integer in atomic units \
+         (no decimals, sign, separators, or exponent)."
+    )]
+    BadCost { value: String },
+
+    /// The declared cost is zero. A zero cost is not a cost to mark up (any margin on zero is still
+    /// zero), and a zero quote would reach the settle-a-zero-amount path this rate deliberately does
+    /// not cover. Serving requests free is a distinct rate, not cost-plus.
+    #[error(
+        "OBOLUS_UPSTREAM_COST is 0: a zero upstream cost is not a cost to mark up (any margin on \
+         zero is still zero). Set the upstream cost cost-plus should mark up; serving free is a \
+         separate rate, not cost-plus."
+    )]
+    ZeroCost,
+
+    /// The margin is not a whole number of basis points.
+    #[error(
+        "OBOLUS_MARGIN_BPS {value:?} is not a whole number of basis points \
+         (10000 = 100%, 2500 = 25%, 250 = 2.5%)."
+    )]
+    BadMargin { value: String },
+
+    /// `cost-plus` is selected alongside the multi-chain `OBOLUS_ACCEPTS`. Cost-plus is gateway-wide
+    /// — one declared cost — and a single atomic cost is ambiguous across networks that carry
+    /// different assets and decimals, so the combination is deliberately not supported in this
+    /// slice. (A per-network or per-backend cost is later work.)
+    #[error(
+        "OBOLUS_PRICING is \"cost-plus\" and OBOLUS_ACCEPTS is set. Cost-plus is gateway-wide (one \
+         declared cost), and a single atomic cost is ambiguous across the several networks \
+         OBOLUS_ACCEPTS advertises, which carry different assets and decimals — so multi-chain \
+         cost-plus pricing is not supported yet. Unset OBOLUS_ACCEPTS to price a single chain with \
+         cost-plus, or unset OBOLUS_PRICING to advertise each entry's own amount."
+    )]
+    CostPlusMultiChain,
+
+    /// `cost-plus` is selected alongside an explicitly configured `OBOLUS_PRICE`. Under cost-plus
+    /// the amount comes from the cost and margin, so `OBOLUS_PRICE` would sit inert — the
+    /// silently-ignored-payment-config surprise the `OBOLUS_ACCEPTS` supersession also guards.
+    #[error(
+        "OBOLUS_PRICING is \"cost-plus\", which sets every amount from OBOLUS_UPSTREAM_COST and \
+         OBOLUS_MARGIN_BPS, but OBOLUS_PRICE is also set and would be silently ignored. Remove \
+         OBOLUS_PRICE, or unset OBOLUS_PRICING to charge that amount instead."
+    )]
+    InertPrice,
+
+    /// Cost-plus's parameters are set, but `cost-plus` is not selected — so they would sit inert. The
+    /// `OBOLUS_TOKEN_ISSUER`-without-a-key shape: configuration that cannot take effect refuses
+    /// rather than being dropped.
+    #[error(
+        "{vars} configure cost-plus pricing, but OBOLUS_PRICING is not \"cost-plus\", so they would \
+         be silently ignored. Set OBOLUS_PRICING=cost-plus to use them, or unset them."
+    )]
+    OrphanedParams { vars: String },
+}
+
+/// Turn the pricing environment into a [`PricingChoice`], or refuse.
+///
+/// `get` returns a variable's value if it is set (`main` passes `|k| std::env::var(k).ok()`).
+/// Taking it as an argument keeps every refusal testable without mutating process-global
+/// environment state, exactly as [`superseded_single_chain_vars`] does for the supersession check.
+///
+/// Presence, not just value, is load-bearing here. `OBOLUS_PRICE` has a default (`"1000"`), so the
+/// inert-amount refusal keys on whether it was *explicitly set* — an operator who never set it must
+/// not be refused on a default they do not know exists. And `OBOLUS_ACCEPTS` / `OBOLUS_PRICE` are
+/// mutually exclusive by the time `main` calls this (the requirements block above refuses both at
+/// once), so at most one inert-amount refusal can fire in the running binary; checking both keeps
+/// this function correct in isolation.
+pub fn select_pricing<F: Fn(&str) -> Option<String>>(
+    get: F,
+) -> Result<PricingChoice, PricingConfigError> {
+    // The orphaned-parameter refusal, shared by the unset and explicit-`static` paths: cost-plus's
+    // parameters set without cost-plus selected would sit inert.
+    let static_or_orphan = |get: &F| -> Result<PricingChoice, PricingConfigError> {
+        let orphaned: Vec<&str> = [UPSTREAM_COST_VAR, MARGIN_BPS_VAR]
+            .into_iter()
+            .filter(|&k| get(k).is_some())
+            .collect();
+        if orphaned.is_empty() {
+            Ok(PricingChoice::Static)
+        } else {
+            Err(PricingConfigError::OrphanedParams { vars: orphaned.join(", ") })
+        }
+    };
+
+    match get(PRICING_VAR) {
+        None => static_or_orphan(&get),
+        Some(raw) => match raw.trim() {
+            "static" => static_or_orphan(&get),
+            "cost-plus" => {
+                // Combination refusals before parameter parsing: a wrong pairing is a more
+                // fundamental misconfiguration than a malformed parameter, and naming it first is
+                // what an operator has to fix first.
+                if get("OBOLUS_ACCEPTS").is_some() {
+                    return Err(PricingConfigError::CostPlusMultiChain);
+                }
+                if get("OBOLUS_PRICE").is_some() {
+                    return Err(PricingConfigError::InertPrice);
+                }
+                let cost = match get(UPSTREAM_COST_VAR) {
+                    None => {
+                        return Err(PricingConfigError::MissingParam {
+                            var: UPSTREAM_COST_VAR,
+                            detail: "the upstream cost each request is marked up from, in atomic \
+                                     units",
+                        })
+                    }
+                    // A direct `u128` parse, which is exactly what `validate_atomic_amount` does —
+                    // but the cost is computed *with*, not advertised verbatim, so we keep the value,
+                    // not the wire string. Zero is admissible as an atomic amount yet refused here;
+                    // see `ZeroCost`.
+                    Some(raw) => match raw.parse::<u128>() {
+                        Ok(0) => return Err(PricingConfigError::ZeroCost),
+                        Ok(cost) => cost,
+                        Err(_) => return Err(PricingConfigError::BadCost { value: raw }),
+                    },
+                };
+                let margin_bps = match get(MARGIN_BPS_VAR) {
+                    None => {
+                        return Err(PricingConfigError::MissingParam {
+                            var: MARGIN_BPS_VAR,
+                            detail: "the margin to add, in basis points (10000 = 100%)",
+                        })
+                    }
+                    Some(raw) => match raw.parse::<u32>() {
+                        Ok(bps) => bps,
+                        Err(_) => return Err(PricingConfigError::BadMargin { value: raw }),
+                    },
+                };
+                Ok(PricingChoice::CostPlus { cost, margin_bps })
+            }
+            _ => Err(PricingConfigError::UnknownRate { value: raw }),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +533,175 @@ mod tests {
     #[test]
     fn no_superseded_vars_when_none_are_set() {
         assert!(superseded_single_chain_vars(|_| false).is_empty());
+    }
+
+    /// A `get` closure over a fixed set of `(var, value)` pairs — the presence/value probe
+    /// `select_pricing` takes, without touching process-global environment state.
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k: &str| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
+    }
+
+    #[test]
+    fn unset_pricing_is_static() {
+        assert_eq!(select_pricing(env(&[])), Ok(PricingChoice::Static));
+    }
+
+    #[test]
+    fn explicit_static_is_static() {
+        assert_eq!(select_pricing(env(&[("OBOLUS_PRICING", "static")])), Ok(PricingChoice::Static));
+    }
+
+    #[test]
+    fn cost_plus_reads_its_cost_and_margin() {
+        let choice = select_pricing(env(&[
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_UPSTREAM_COST", "1000"),
+            ("OBOLUS_MARGIN_BPS", "2500"),
+        ]));
+        assert_eq!(choice, Ok(PricingChoice::CostPlus { cost: 1000, margin_bps: 2500 }));
+    }
+
+    #[test]
+    fn cost_plus_allows_a_zero_margin() {
+        // Break-even is legitimate — a zero margin is a stated choice, not a missing value.
+        let choice = select_pricing(env(&[
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_UPSTREAM_COST", "1000"),
+            ("OBOLUS_MARGIN_BPS", "0"),
+        ]));
+        assert_eq!(choice, Ok(PricingChoice::CostPlus { cost: 1000, margin_bps: 0 }));
+    }
+
+    #[test]
+    fn an_unknown_rate_is_rejected_naming_the_value() {
+        // A typo (or an unexpanded ${VAR} arriving empty) must refuse, never fall back to a price
+        // the operator did not choose.
+        for bad in ["cost_plus", "flat", ""] {
+            let err = select_pricing(env(&[("OBOLUS_PRICING", bad)])).unwrap_err();
+            assert!(
+                matches!(&err, PricingConfigError::UnknownRate { value } if value == bad),
+                "got {err:?} for {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn cost_plus_without_a_cost_is_rejected() {
+        let err = select_pricing(env(&[
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_MARGIN_BPS", "2500"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, PricingConfigError::MissingParam { var: UPSTREAM_COST_VAR, .. }),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn cost_plus_without_a_margin_is_rejected() {
+        let err = select_pricing(env(&[
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_UPSTREAM_COST", "1000"),
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(err, PricingConfigError::MissingParam { var: MARGIN_BPS_VAR, .. }),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn a_bad_cost_is_rejected() {
+        // The same shape validate_atomic_amount rejects for an advertised amount: floats, signs,
+        // separators, and non-numbers are none of them a cost.
+        for bad in ["1.5", "-5", "1_000", "1e3", "lots"] {
+            let err = select_pricing(env(&[
+                ("OBOLUS_PRICING", "cost-plus"),
+                ("OBOLUS_UPSTREAM_COST", bad),
+                ("OBOLUS_MARGIN_BPS", "2500"),
+            ]))
+            .unwrap_err();
+            assert!(
+                matches!(&err, PricingConfigError::BadCost { value } if value == bad),
+                "got {err:?} for {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_cost_is_rejected() {
+        // Admissible as an atomic amount, but refused here: nothing to mark up, and the zero-quote
+        // settle path is out of this rate's scope.
+        let err = select_pricing(env(&[
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_UPSTREAM_COST", "0"),
+            ("OBOLUS_MARGIN_BPS", "2500"),
+        ]))
+        .unwrap_err();
+        assert_eq!(err, PricingConfigError::ZeroCost);
+    }
+
+    #[test]
+    fn a_bad_margin_is_rejected() {
+        for bad in ["2.5", "-1", "25%", "lots"] {
+            let err = select_pricing(env(&[
+                ("OBOLUS_PRICING", "cost-plus"),
+                ("OBOLUS_UPSTREAM_COST", "1000"),
+                ("OBOLUS_MARGIN_BPS", bad),
+            ]))
+            .unwrap_err();
+            assert!(
+                matches!(&err, PricingConfigError::BadMargin { value } if value == bad),
+                "got {err:?} for {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn cost_plus_alongside_obolus_accepts_is_rejected() {
+        // Multi-chain cost-plus is deliberately unsupported: one atomic cost is ambiguous across
+        // networks with different assets. The combination refuses before any amount is advertised.
+        let err = select_pricing(env(&[
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_ACCEPTS", "[]"),
+            ("OBOLUS_UPSTREAM_COST", "1000"),
+            ("OBOLUS_MARGIN_BPS", "2500"),
+        ]))
+        .unwrap_err();
+        assert_eq!(err, PricingConfigError::CostPlusMultiChain);
+    }
+
+    #[test]
+    fn cost_plus_alongside_an_explicit_price_is_rejected() {
+        // OBOLUS_PRICE would sit inert under cost-plus — the silently-ignored-payment-config
+        // surprise the OBOLUS_ACCEPTS supersession also guards. Keyed on explicit presence, so an
+        // operator who never set OBOLUS_PRICE (and gets its "1000" default) is not refused.
+        let err = select_pricing(env(&[
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_PRICE", "1000"),
+            ("OBOLUS_UPSTREAM_COST", "1000"),
+            ("OBOLUS_MARGIN_BPS", "2500"),
+        ]))
+        .unwrap_err();
+        assert_eq!(err, PricingConfigError::InertPrice);
+    }
+
+    #[test]
+    fn cost_plus_params_without_selecting_cost_plus_are_rejected() {
+        // Inert config that looks configured — refused on both the unset and explicit-`static`
+        // paths, naming exactly the parameters that would be ignored.
+        for pricing in [None, Some("static")] {
+            let mut pairs = vec![("OBOLUS_UPSTREAM_COST", "1000"), ("OBOLUS_MARGIN_BPS", "2500")];
+            if let Some(p) = pricing {
+                pairs.push(("OBOLUS_PRICING", p));
+            }
+            let err = select_pricing(env(&pairs)).unwrap_err();
+            assert!(
+                matches!(&err, PricingConfigError::OrphanedParams { vars }
+                    if vars.contains("OBOLUS_UPSTREAM_COST") && vars.contains("OBOLUS_MARGIN_BPS")),
+                "got {err:?} for OBOLUS_PRICING={pricing:?}",
+            );
+        }
     }
 }

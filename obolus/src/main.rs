@@ -30,12 +30,13 @@ use obolus::arming::{
     check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
-    parse_accepts, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
-    SharedOffer,
+    parse_accepts, select_pricing, superseded_single_chain_vars, validated_option, EntryDefect,
+    EntryField, PricingChoice, SharedOffer,
 };
 use obolus::backends::{load_backends, Backends};
 use obolus::facilitator::DelegatedFacilitator;
 use obolus::gateway::{router, Access, Gateway};
+use obolus::pricing::CostPlus;
 use obolus::x402::PaymentRequirements;
 
 /// Deliberately not 8402, which x402 client-side tooling tends to bind.
@@ -309,6 +310,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Which rate prices each request (#57). Unset or `static` keeps the armed per-option amounts;
+    // `cost-plus` determines the amount from a declared upstream cost and margin. Selected here,
+    // before the arming guard and the banner, for the same reason the supersession refusals in the
+    // requirements block are early: a pricing configuration this process will refuse must never
+    // first advertise a price, and cost-plus makes the per-option amount inert — which the banner
+    // below must then not print as if a client would pay it. `OBOLUS_ACCEPTS` and `OBOLUS_PRICE` are
+    // already mutually exclusive by here (the block above refuses both at once), so the inert-amount
+    // refusals inside can fire on at most one of them.
+    let pricing = select_pricing(|k| std::env::var(k).ok())?;
+
     // Obolus holds no key, but the 402 challenge it advertises IS the real-money trigger: a
     // cooperating client reads (network, asset, pay-to) out of it and pays against it. So the guard
     // sits on the advertisement. Fail-closed against a pinned testnet allowlist — a
@@ -366,6 +377,15 @@ async fn main() -> anyhow::Result<()> {
     // is mutated after the guard ran, so they cannot drift.
     let gateway = Gateway::new(facilitator, backends.clone(), armed_requirements)
         .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
+    // Install the selected rate. Static is the default the constructor already holds, so only
+    // cost-plus swaps a determiner in. The arming guard's witness was consumed by `new` above, so a
+    // determiner cannot alter which networks are advertised — it prices the amount and nothing else.
+    let gateway = match pricing {
+        PricingChoice::Static => gateway,
+        PricingChoice::CostPlus { cost, margin_bps } => {
+            gateway.with_price_determiner(Arc::new(CostPlus::new(cost, margin_bps)))
+        }
+    };
 
     // "starting on", not "listening on" — the bind is ~100 lines below and every check between here
     // and there can still refuse. A posture line an operator trusts must be true *where it is
@@ -411,12 +431,35 @@ async fn main() -> anyhow::Result<()> {
          pay-to / asset / network default to non-real placeholders and MUST be overridden for any \
          real network."
     );
+    // The rate line, before the options. Under cost-plus each option's amount is determined by this
+    // rate, not the armed value, so the per-option lines below omit the inert amount and the price
+    // is stated once here. This prints the rate's *parameters*, never a computed quote: the quote is
+    // what the determiner computes per request — and once a cost can vary by backend it is no longer
+    // a single boot-time number — so a quote printed here would be a second source of truth that
+    // could drift from what a client is actually charged. Same standard as the bearer-token line
+    // below, read off the verifier rather than composed here.
+    match pricing {
+        PricingChoice::Static => {}
+        PricingChoice::CostPlus { cost, margin_bps } => eprintln!(
+            "obolus: pricing: cost-plus — every request quoted at upstream cost {cost} atomic \
+             units + {margin_bps} bps margin."
+        ),
+    }
     eprintln!("obolus: advertising {} payment option(s):", requirements.len());
     for r in &requirements {
-        eprintln!(
-            "obolus:   - network {} / asset {} / pay-to {} / {} atomic units",
-            r.network, r.asset, r.pay_to, r.max_amount_required
-        );
+        match pricing {
+            // Static: the armed amount IS the price, so it stays on the option line.
+            PricingChoice::Static => eprintln!(
+                "obolus:   - network {} / asset {} / pay-to {} / {} atomic units",
+                r.network, r.asset, r.pay_to, r.max_amount_required
+            ),
+            // Cost-plus: the armed amount is inert (the rate above determines it), so print the
+            // option without it rather than a number no client would pay.
+            PricingChoice::CostPlus { .. } => eprintln!(
+                "obolus:   - network {} / asset {} / pay-to {} / priced by the cost-plus rate above",
+                r.network, r.asset, r.pay_to
+            ),
+        }
     }
 
     // Computed outside the arming branches on purpose. The placeholder is admitted by
