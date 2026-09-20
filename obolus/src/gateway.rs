@@ -50,8 +50,9 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::access::{bearer_token, TokenPath};
-use crate::backends::{Backends, RouteError};
+use crate::backends::{Backend, Backends, RouteError};
 use crate::facilitator::{Facilitator, FacilitatorError};
+use crate::pricing::{PriceContext, PriceDeterminer, StaticPrice};
 use crate::upstream::{Upstream, UpstreamResponse};
 use crate::arming::ArmedRequirements;
 use crate::x402::{self, PaymentPayload, PaymentRequired, PaymentRequirements, SettlementReceipt};
@@ -93,6 +94,10 @@ pub struct Gateway<F: Facilitator> {
     backends: Arc<Backends>,
     /// Non-empty and unique by `(scheme, network)` — enforced by [`Gateway::new`].
     requirements: Vec<PaymentRequirements>,
+    /// Decides each request's price. Defaults to [`StaticPrice`] (today's fixed per-option amounts);
+    /// [`Gateway::with_price_determiner`] installs a configured rate. Only ever prices the *amount* —
+    /// the option set it prices is `requirements`, so it cannot alter which networks are advertised.
+    price: Arc<dyn PriceDeterminer>,
 }
 
 impl<F: Facilitator> Gateway<F> {
@@ -132,29 +137,61 @@ impl<F: Facilitator> Gateway<F> {
                 }
             }
         }
-        Ok(Self { facilitator, backends, requirements })
+        Ok(Self { facilitator, backends, requirements, price: Arc::new(StaticPrice) })
     }
 
-    /// The advertised option whose `(scheme, network)` this payment matches, if any.
+    /// Install a price determiner in place of the default [`StaticPrice`]. `main` calls this to wire
+    /// a configured rate; every other caller (tests, integration harnesses) gets today's fixed
+    /// per-option pricing unless it opts in, so the seam changes no quote until it is used.
+    pub fn with_price_determiner(mut self, price: Arc<dyn PriceDeterminer>) -> Self {
+        self.price = price;
+        self
+    }
+
+    /// This request's advertised options, each repriced for the routed backend.
     ///
-    /// Unique by construction, so the first match is the only match. Matching on `(scheme, network)`
-    /// and nothing more is not a shortcut — it is the most the opaque envelope lets us see (the
-    /// asset is inside the payload we do not parse), which is exactly why `new` forbids two options
-    /// from sharing the pair.
-    fn accepted_for(&self, payment: &PaymentPayload) -> Option<&PaymentRequirements> {
+    /// The option set is exactly `requirements` — same `(scheme, network)`, asset, and pay-to — and
+    /// only `maxAmountRequired` is replaced, with the determiner's quote for that one option. So the
+    /// arming guard still governs which networks are advertised (a determiner prices an option, it
+    /// cannot add one), and the amount the 402 quotes is the same amount settlement later charges.
+    ///
+    /// Built once per paying request and threaded through the challenge and settle path, so every
+    /// re-challenge quotes the price the client first saw. Never reached on the token path.
+    fn priced(&self, model: Option<&str>, backend: &Backend) -> Vec<PaymentRequirements> {
         self.requirements
             .iter()
-            .find(|r| r.scheme == payment.scheme && r.network == payment.network)
+            .map(|requirement| {
+                let amount = self.price.quote(PriceContext { model, backend, requirement });
+                PaymentRequirements { max_amount_required: amount.to_string(), ..requirement.clone() }
+            })
+            .collect()
     }
 
-    /// A 402 carrying *every* option we accept, optionally with why the last attempt did not qualify.
-    fn challenge(&self, error: Option<String>) -> Response {
-        let mut challenge = PaymentRequired::offering_all(self.requirements.clone());
-        if let Some(error) = error {
-            challenge = challenge.with_error(error);
-        }
-        (StatusCode::PAYMENT_REQUIRED, Json(challenge)).into_response()
+}
+
+/// The advertised option whose `(scheme, network)` this payment matches, if any.
+///
+/// `offered` is this request's priced option set (see [`Gateway::priced`]). Unique by construction —
+/// repricing replaces only the amount, and `Gateway::new` made the `(scheme, network)` pairs unique —
+/// so the first match is the only match. Matching on `(scheme, network)` and nothing more is not a
+/// shortcut: it is the most the opaque envelope lets us see (the asset is inside the payload we do not
+/// parse), which is exactly why `new` forbids two options from sharing the pair.
+fn accepted_for<'a>(
+    offered: &'a [PaymentRequirements],
+    payment: &PaymentPayload,
+) -> Option<&'a PaymentRequirements> {
+    offered.iter().find(|r| r.scheme == payment.scheme && r.network == payment.network)
+}
+
+/// A 402 carrying *every* option offered for this request, optionally with why the last attempt did
+/// not qualify. `offered` is the priced option set (see [`Gateway::priced`]), so the amounts it
+/// quotes are the determined prices, not the raw armed ones.
+fn challenge(offered: &[PaymentRequirements], error: Option<String>) -> Response {
+    let mut challenge = PaymentRequired::offering_all(offered.to_vec());
+    if let Some(error) = error {
+        challenge = challenge.with_error(error);
     }
+    (StatusCode::PAYMENT_REQUIRED, Json(challenge)).into_response()
 }
 
 /// Our fault or the facilitator's — never dressed up as the client's.
@@ -218,31 +255,36 @@ fn route_failure(err: RouteError) -> Response {
 
 /// The paying path. Not an axum handler — [`completion`] is the route, and reaches this when the
 /// caller presented no token we honour.
+///
+/// `priced` is this request's option set with the determined price on each option (see
+/// [`Gateway::priced`]) — built once by [`completion`] on the paying path and used for the
+/// challenge, the paid-option match, and settlement alike, so a client that retries is quoted the
+/// same price it first saw and is charged exactly that.
 async fn paid_completion<F: Facilitator>(
     gateway: Arc<Gateway<F>>,
     upstream: Arc<dyn Upstream>,
+    priced: Vec<PaymentRequirements>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Some(raw) = headers.get(x402::HEADER_PAYMENT) else {
-        return gateway.challenge(None);
+        return challenge(&priced, None);
     };
     let Ok(raw) = raw.to_str() else {
-        return gateway
-            .challenge(Some(format!("{} must be ASCII base64", x402::HEADER_PAYMENT)));
+        return challenge(&priced, Some(format!("{} must be ASCII base64", x402::HEADER_PAYMENT)));
     };
 
     let payment = match x402::decode_payment(raw) {
         Ok(payment) => payment,
-        Err(err) => return gateway.challenge(Some(err.to_string())),
+        Err(err) => return challenge(&priced, Some(err.to_string())),
     };
 
     // Our own policy check, not the facilitator's: which advertised option did the client pay? None
     // → they picked an offer we did not make, so re-challenge with everything we DO accept. This is
     // the only place the paid option is chosen, and the *matched* `requirements` — not "the"
     // requirements — is what we verify and settle against.
-    let Some(requirements) = gateway.accepted_for(&payment) else {
-        return gateway.challenge(Some(format!(
+    let Some(requirements) = accepted_for(&priced, &payment) else {
+        return challenge(&priced, Some(format!(
             "payment offers {}/{}, which is not one of the payment options this resource accepts",
             payment.scheme, payment.network,
         )));
@@ -250,7 +292,7 @@ async fn paid_completion<F: Facilitator>(
 
     match gateway.facilitator.verify(&payment, requirements).await {
         Ok(()) => {}
-        Err(FacilitatorError::Rejected(reason)) => return gateway.challenge(Some(reason)),
+        Err(FacilitatorError::Rejected(reason)) => return challenge(&priced, Some(reason)),
         Err(err @ FacilitatorError::Unavailable(_)) => return upstream_failure(err.to_string()),
     }
 
@@ -272,11 +314,11 @@ async fn paid_completion<F: Facilitator>(
         Ok(receipt) if receipt.success => receipt,
         // A receipt that reports its own failure is a refusal, not a success. Serving the
         // response on the strength of `Ok(_)` alone would give the work away for free.
-        Ok(_) => return gateway.challenge(Some("settlement did not complete".to_string())),
+        Ok(_) => return challenge(&priced, Some("settlement did not complete".to_string())),
         // The same split as verify. Returning 502 for a payment the facilitator actually
         // evaluated and refused would be both a lie and the more dangerous lie: 502 reads as
         // transient, so clients retry it harder than they retry a 402.
-        Err(FacilitatorError::Rejected(reason)) => return gateway.challenge(Some(reason)),
+        Err(FacilitatorError::Rejected(reason)) => return challenge(&priced, Some(reason)),
         Err(err @ FacilitatorError::Unavailable(_)) => return upstream_failure(err.to_string()),
     };
 
@@ -347,10 +389,12 @@ async fn completion<F: Facilitator>(
     // Route before anything else. An unroutable request is refused here — before the token check
     // and before any payment — so it is never charged (Obolus has no refund path), and both the
     // recognised-caller path and the paying path forward to the same backend the model resolves to.
-    let upstream = match access.gateway.backends.route(requested_model(&body).as_deref()) {
-        Ok(backend) => backend.upstream(),
+    let model = requested_model(&body);
+    let backend = match access.gateway.backends.route(model.as_deref()) {
+        Ok(backend) => backend,
         Err(err) => return route_failure(err),
     };
+    let upstream = backend.upstream();
 
     if let (Some(path), Some(token)) = (&access.token, bearer_token(&headers)) {
         match path.verify(token) {
@@ -368,7 +412,12 @@ async fn completion<F: Facilitator>(
             Err(err) => eprintln!("obolus: bearer token not honoured: {err}"),
         }
     }
-    paid_completion(access.gateway.clone(), upstream, headers, body).await
+    // Price this request now — on the paying path only. The token path returned above without ever
+    // calling the determiner, so a recognised caller's request cannot reach `quote` and a determiner
+    // fault can never turn a free, honoured request into a 500. The determined prices are quoted in
+    // the challenge and charged at settlement (see [`paid_completion`]).
+    let priced = access.gateway.priced(model.as_deref(), backend);
+    paid_completion(access.gateway.clone(), upstream, priced, headers, body).await
 }
 
 /// Wire an access surface into an OpenAI-compatible route plus an ungated health check.
@@ -390,6 +439,7 @@ mod tests {
     use crate::access::FakeTokenVerifier;
     use crate::backends::Backend;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
+    use crate::pricing::FlatPrice;
     use crate::upstream::{FakeUpstream, UpstreamCalls};
     use crate::arming::{check_arming, is_provably_testnet};
     use crate::x402::{PaymentPayload, SettlementReceipt, SCHEME_EXACT, X402_VERSION};
@@ -465,6 +515,57 @@ mod tests {
         let gateway =
             Gateway::new(facilitator, one_backend(upstream), armed(vec![requirements()])).unwrap();
         (router(Access::new(gateway, None)), calls)
+    }
+
+    /// Like [`app_with`], but with a price determiner installed in place of the default
+    /// [`StaticPrice`] — for asserting that the determined price, not the raw armed amount, is what
+    /// the challenge quotes and settlement charges.
+    fn app_priced_with(
+        facilitator: FakeFacilitator,
+        upstream: FakeUpstream,
+        price: Arc<dyn PriceDeterminer>,
+    ) -> (Router, FakeCalls) {
+        let calls = facilitator.calls();
+        let gateway = Gateway::new(facilitator, one_backend(upstream), armed(vec![requirements()]))
+            .unwrap()
+            .with_price_determiner(price);
+        (router(Access::new(gateway, None)), calls)
+    }
+
+    #[tokio::test]
+    async fn the_challenge_quotes_the_determined_price_not_the_armed_amount() {
+        // The armed option carries maxAmountRequired = "1000"; a flat determiner of 777 must
+        // override it. This is the whole point of the seam: the 402 quotes the *determined* price.
+        let (app, _) = app_priced_with(
+            FakeFacilitator::accepting(),
+            FakeUpstream::streaming(),
+            Arc::new(FlatPrice::new(777)),
+        );
+        let (status, _, body) = send(app, completion_request(None)).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["accepts"][0]["maxAmountRequired"], serde_json::json!("777"));
+        // The determiner prices only the amount — network and pay-to are still the armed option's,
+        // because a determiner cannot touch which network is advertised.
+        assert_eq!(json["accepts"][0]["network"], serde_json::json!(FIXTURE_NETWORK));
+        assert_eq!(json["accepts"][0]["payTo"], serde_json::json!(FIXTURE_PAY_TO));
+    }
+
+    #[tokio::test]
+    async fn settlement_charges_the_determined_price() {
+        // A paid request must be settled against the determined price, not the armed "1000" — the
+        // challenge and the charge have to agree, or a client pays a number it was never quoted.
+        let (app, calls) = app_priced_with(
+            FakeFacilitator::accepting(),
+            FakeUpstream::streaming(),
+            Arc::new(FlatPrice::new(777)),
+        );
+        let (status, _, _) =
+            send(app, completion_request(Some(&x402::encode_payment(&payment())))).await;
+        assert_eq!(status, StatusCode::OK);
+        let settled = calls.settled_requirements();
+        assert_eq!(settled.len(), 1, "exactly one settlement");
+        assert_eq!(settled[0].max_amount_required, "777", "at the determined price");
     }
 
     fn app(facilitator: FakeFacilitator, upstream: FakeUpstream) -> Router {

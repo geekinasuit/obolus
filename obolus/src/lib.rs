@@ -28,5 +28,6 @@ pub mod backends;
 pub mod config;
 pub mod facilitator;
 pub mod gateway;
+pub mod pricing;
 pub mod upstream;
 pub mod x402;
