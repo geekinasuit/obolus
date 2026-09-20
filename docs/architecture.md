@@ -16,7 +16,7 @@ Obolus is a **payment-gated serving gateway**: a toll booth in front of an AI or
 service. A request that arrives without payment is answered with a real HTTP `402 Payment
 Required` challenge naming what to pay and on which chains. The client pays a small USDC
 micropayment, retries with proof, and the gateway verifies the payment, forwards the request
-to a model backend, streams the answer back, and settles the payment.
+to a model backend, settles the payment, and streams the answer back.
 
 Two properties shape everything below:
 
@@ -190,11 +190,13 @@ flowchart TB
 ### A paid request
 
 The gateway routes first, prices the routed request, challenges, and only forwards once payment
-verifies. Settlement happens after the upstream has served — so a settlement that then *fails*
-(the facilitator is down, the network drops) leaves the operator unpaid for work already
-delivered. The gateway has no refund or retry path for this today; it is the refund / failure
-question named under [planned work](#what-is-planned-and-where-it-goes) and in
-[`pricing.md`](pricing.md), and it is a real gap to weigh before running this in production.
+verifies. It commits the upstream (the `forward` returns once the backend answers `200`, before
+the body streams) and *then* settles — deliberately, so a failed settlement serves nothing and
+charges nothing. The open gap runs the other way: once settlement succeeds the body streams, and a
+stream that then fails partway leaves a client charged for a response they did not fully receive.
+The gateway has no refund or retry path for that today; it is the refund / failure question named
+under [planned work](#what-is-planned-and-where-it-goes) and in [`pricing.md`](pricing.md), and a
+real gap to weigh before running this in production.
 
 ```mermaid
 sequenceDiagram
@@ -213,10 +215,10 @@ sequenceDiagram
   G->>F: verify(payment, requirement)
   F-->>G: ok
   G->>U: forward to routed backend
-  U-->>G: response stream
-  G-->>C: stream answer
+  U-->>G: 200 (answer begins; body not yet streamed)
   G->>F: settle(payment)
   F-->>G: receipt
+  G-->>C: stream answer (receipt in the response header)
 ```
 
 ### The token bypass
