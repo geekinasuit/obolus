@@ -73,12 +73,16 @@ Three properties are load-bearing:
   definition a non-negative integer in atomic units — exactly what a configured amount is
   validated to be. A determiner therefore cannot compute a quote no conforming client could pay,
   and there is no revalidation step to forget.
-- **`quote` must be total.** It runs on the paying request path, where a panic is a 500 charged to
-  no one. Determiners return a price on every input; the fallible cases fail *closed* (see below),
-  never by unwrapping into the hot path.
+- **`quote` must be total, and cheap.** It runs on the request path — including when a 402 is
+  issued to an *unpaid* request, to state the challenge amount — so it is reachable by unpaid
+  traffic. A panic there is a 500 charged to no one; an expensive or blocking `quote` is a
+  denial-of-service surface a custom determiner could open. Determiners return a price on every
+  input, quickly and without blocking; the fallible cases fail *closed* (see below), never by
+  unwrapping into the hot path.
 
-The determiner is called **once per advertised requirement**, and **only on the paying path** —
-the token bypass returns before pricing is ever consulted. It already receives the routed
+The determiner is called **once per advertised requirement**, on **every request except the token
+bypass** — the bypass returns before pricing is ever consulted, but an unpaid request that gets a
+402 is priced, because the challenge has to state the amount. It already receives the routed
 `backend` and the request's `model`, so per-backend and per-model policies have the context they
 need without any further plumbing.
 
@@ -94,7 +98,9 @@ rather than open (serve for free).
 
 **`FlatPrice` — one rate for everything.** Every advertised requirement is quoted the same amount,
 regardless of model, backend, or network. The flat-rate seller's policy: a single price to use
-the gateway, whichever chain the client pays on.
+the gateway, whichever chain the client pays on. It exists as a library rate — the `OBOLUS_PRICING`
+config door (below) does not yet offer a `flat` selector, so an operator reaches it only in code,
+not by configuration.
 
 **`CostPlus` — cost-in, margin-out.** The "run it for money" rate. The operator declares an
 upstream cost and a margin, and every request is quoted:
@@ -190,43 +196,51 @@ resolves it by separating the axes.
   have. Out of scope for the current milestone.
 - **Cross-asset (multi-chain) cost-plus.** The denomination crossing. See below.
 
-### How per-backend cost is declared
+### How per-backend cost will be declared (planned)
 
-Cost is a fact about a backend, so it is declared with the backend. This follows the config model
-already in place, where a multi-backend gateway is defined by a JSON file and a single-backend
-gateway by environment variables:
+> The rest of this section is the **planned** design for per-backend cost — the config shape and
+> the boot refusals it will add. None of it is implemented yet: today cost-plus is gateway-wide
+> and single-chain, as [Configuration](#configuration) above describes. It is written here so the
+> shape is settled before the code lands.
 
-- **Single-backend (no backends file).** The existing `OBOLUS_UPSTREAM_COST` is gateway-wide, which
-  *is* per-backend when there is one backend. Unchanged.
-- **Multi-backend (`OBOLUS_BACKENDS_FILE`).** Each backend entry declares its own `cost`, in
+Cost is a fact about a backend, so it will be declared with the backend. This follows the config
+model already in place, where a multi-backend gateway is defined by a JSON file and a
+single-backend gateway by environment variables:
+
+- **Single-backend (no backends file).** The existing `OBOLUS_UPSTREAM_COST` is gateway-wide,
+  which *is* per-backend when there is one backend — unchanged.
+- **Multi-backend (`OBOLUS_BACKENDS_FILE`).** Each backend entry will declare its own `cost`, in
   atomic units, as a string (an atomic amount can exceed the range a JSON number represents
   exactly, and every other atomic amount in the config is already a string). `OBOLUS_MARGIN_BPS`
-  stays gateway-wide.
+  will stay gateway-wide.
 
-Two boot refusals guard this, consistent with rules already shipped:
+Two boot refusals will guard this, each modeled on a rule already shipped:
 
-- **A backends file set alongside `OBOLUS_UPSTREAM_COST`** is refused, unconditionally: if a file
-  is present, cost comes from the file. This mirrors the existing refusal of a backends file
-  alongside `OBOLUS_UPSTREAM_URL` — the file supersedes the single-backend variables.
+- **A backends file set alongside `OBOLUS_UPSTREAM_COST`** will be refused, unconditionally: if a
+  file is present, cost comes from the file. This mirrors the *existing* refusal of a backends
+  file alongside `OBOLUS_UPSTREAM_URL` — the file supersedes the single-backend variables.
 - **Under cost-plus, every backend in the registry must declare a cost.** A backend without one
   cannot be marked up, and guessing a cost is exactly the fail-open the boot refusals exist to
-  prevent. The refusal names the backends that are missing a cost, so an operator knows what to
-  fix. A malformed or zero per-entry cost is refused where the backend entry is validated (the
-  same place a bad `baseUrl` is caught), naming the offending backend — so the cost-coverage check
-  is the clean question "is a cost present on every backend," not "present and parseable."
+  prevent. The refusal will name the backends that are missing a cost, so an operator knows what
+  to fix. A malformed or zero per-entry cost will be refused where the backend entry is validated
+  (the same place a bad `baseUrl` is caught today), naming the offending backend — so the
+  cost-coverage check is the clean question "is a cost present on every backend," not "present and
+  parseable."
 
-### Where the checks live in the boot sequence
+### Where the checks will live in the boot sequence (planned)
 
-Per-backend cost is declared in the backends file but the rate is selected from the environment,
-so cost *completeness* is a cross-source check: it needs both the parsed registry and the selected
-rate. It cannot live inside `select_pricing`, which sees the environment only. It is a distinct
-validation stage, run after both parses and before the banner.
+Per-backend cost will be declared in the backends file but the rate is selected from the
+environment, so cost *completeness* is a cross-source check: it needs both the parsed registry and
+the selected rate. It cannot live inside `select_pricing`, which sees the environment only. It
+will be a distinct validation stage, run after both parses and before the banner. The diagram
+below is the *planned* sequence; the per-entry-cost parsing and the cross-source coverage check
+are the two stages it adds to today's boot.
 
 ```mermaid
 flowchart TB
-  reqs["parse payment requirements"] --> be["build backends registry<br/>(per-entry cost parsed + validated here:<br/>malformed / zero cost refused, names the id)"]
-  be --> sel["select_pricing (env)<br/>rate + gateway-wide params"]
-  sel --> cov{"cross-source check:<br/>if cost-plus + backends file,<br/>does every backend declare a cost?"}
+  be["build backends registry<br/>(planned: per-entry cost parsed + validated here —<br/>malformed / zero cost refused, names the id)"] --> reqs["parse payment requirements"]
+  reqs --> sel["select_pricing (env)<br/>rate + gateway-wide params"]
+  sel --> cov{"planned cross-source check:<br/>if cost-plus + backends file,<br/>does every backend declare a cost?"}
   cov -->|"no → name the missing ids"| refuse(["refuse to start"])
   cov -->|"yes"| arm["check_arming → witness"]
   arm --> gw["build gateway + install determiner"]

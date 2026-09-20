@@ -109,8 +109,9 @@ admitted, and the check cannot be moved after construction (there is nothing to 
 until it has passed).
 
 **Backends registry (`backends.rs`).** The set of model backends and the routing between them. A
-backend is `(id, kind, base_url, models, precedence, …)`; `kind` is `ollama`,
-`openai-compat`, or `anthropic-compat`. A request naming a model routes to the highest-precedence
+backend is `(id, kind, base_url, models, precedence, …)`; `kind` is `ollama` or `openai-compat`
+today (`anthropic-compat` is a named kind but boot-refused as not-yet-implemented — see the
+planned work below). A request naming a model routes to the highest-precedence
 backend that serves that alias; a backend with an empty `models` list is a *catch-all* that
 serves any request and is legal only as the sole backend. The registry is built at boot from a
 JSON file (`OBOLUS_BACKENDS_FILE`) or, for the single-backend case, synthesized from
@@ -160,7 +161,7 @@ The seams, and what rides behind each:
 |---|---|---|---|
 | Fulfillment | `Facilitator` | Is this payment good, and settle it | delegating (HTTP), test fake |
 | Upstream | `Upstream` | Serve the inference | Ollama / OpenAI-compatible, test fake |
-| Pricing | `PriceDeterminer` | What does this request cost | static, flat, cost-plus |
+| Pricing | `PriceDeterminer` | What does this request cost | static, cost-plus (config-selectable); flat (a library rate, not yet wired to config) |
 
 Planned seams named by the vision but not yet built: telemetry/metrics (out-of-process revenue
 and cost reporting) and feature-flags/kill-switch (per-backend switches and spend caps).
@@ -176,9 +177,9 @@ network it will not honor.
 
 ```mermaid
 flowchart TB
-  start(["obolus starts"]) --> reqs["parse payment requirements<br/>(OBOLUS_ACCEPTS, or single-chain vars)"]
-  reqs --> be["build backends registry<br/>(OBOLUS_BACKENDS_FILE | OBOLUS_UPSTREAM_URL)"]
-  be --> price["select pricing rate<br/>(select_pricing — env only)"]
+  start(["obolus starts"]) --> be["build backends registry<br/>(OBOLUS_BACKENDS_FILE | OBOLUS_UPSTREAM_URL)"]
+  be --> reqs["parse payment requirements<br/>(OBOLUS_ACCEPTS, or single-chain vars)"]
+  reqs --> price["select pricing rate<br/>(select_pricing — env only)"]
   price --> arm{"check_arming:<br/>every network on the allowlist?"}
   arm -->|"no"| refuse(["refuse to start<br/>(no banner, no router)"])
   arm -->|"yes → ArmedRequirements witness"| gw["Gateway::new(facilitator, backends, witness)<br/>+ install price determiner"]
@@ -189,7 +190,11 @@ flowchart TB
 ### A paid request
 
 The gateway routes first, prices the routed request, challenges, and only forwards once payment
-verifies. Settlement happens after the upstream has served.
+verifies. Settlement happens after the upstream has served — so a settlement that then *fails*
+(the facilitator is down, the network drops) leaves the operator unpaid for work already
+delivered. The gateway has no refund or retry path for this today; it is the refund / failure
+question named under [planned work](#what-is-planned-and-where-it-goes) and in
+[`pricing.md`](pricing.md), and it is a real gap to weigh before running this in production.
 
 ```mermaid
 sequenceDiagram
