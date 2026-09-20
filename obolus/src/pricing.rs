@@ -107,9 +107,12 @@ const BPS_PER_WHOLE: u128 = 10_000;
 ///
 /// The "run it for money" rate. An operator states what the request costs them upstream and the
 /// margin they take, and every request is quoted `cost + cost * margin_bps / 10000`. Basis points,
-/// not a percentage or a float: integer arithmetic with sub-percent precision (`250` bps = 2.5%),
-/// so a margin is exact and there is no float in the money path. `0` bps quotes the cost exactly —
-/// a legitimate break-even rate the operator states on purpose.
+/// not a percentage or a float: the margin is an exact integer with sub-percent precision (`250`
+/// bps = 2.5%) and there is no float in the money path. The *markup* is in whole atomic units and
+/// floored, so a markup that works out to less than one atomic unit (a tiny cost, or a tiny margin)
+/// rounds down to zero: the quote is only ever rounded toward the payer, and by less than one
+/// atomic unit. `0` bps quotes the cost exactly — a legitimate break-even rate the operator states
+/// on purpose.
 ///
 /// Gateway-wide by construction here: one declared cost, so — like [`FlatPrice`] — the quote is the
 /// same on every advertised option. It is a distinct type rather than a pre-computed `FlatPrice`
@@ -225,6 +228,17 @@ mod tests {
         // 250 bps = 2.5%, which an integer-percentage margin could not express. 1000 + 25 = 1025.
         let backend = backend();
         assert_eq!(CostPlus::new(1000, 250).quote(ctx(&backend, &requirement("1"))), 1025);
+    }
+
+    #[test]
+    fn cost_plus_floors_a_sub_unit_markup_to_zero() {
+        // The markup is whole atomic units, so when `cost * margin_bps < 10000` the exact markup is
+        // less than one unit and floors to zero — the quote is the bare cost. This rounds toward the
+        // payer (never overcharges) and loses under one atomic unit of margin; it is why the doc
+        // says the margin is exact but the markup is floored, not that every quote is exact.
+        // 3 * 2500 / 10000 = 0.
+        let backend = backend();
+        assert_eq!(CostPlus::new(3, 2500).quote(ctx(&backend, &requirement("1"))), 3);
     }
 
     #[test]
