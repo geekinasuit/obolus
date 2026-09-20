@@ -1,0 +1,574 @@
+//! Turning a declarative backend configuration into the registry of upstreams a gateway serves
+//! from.
+//!
+//! S0 made [`crate::upstream::Upstream`] object-safe so a gateway can hold a runtime-chosen
+//! backend behind `Arc<dyn Upstream>`. This module is where that backend comes *from*: an operator
+//! declares one or more backends — each a `(kind, base URL, optional key reference)` — and this
+//! parses, validates, and constructs the registry at startup.
+//!
+//! Two properties are deliberate and load-bearing:
+//!
+//! * **Config faults fail loud at boot, not at first request.** A malformed or contradictory
+//!   configuration — bad JSON, an unreadable / empty / non-header-safe key file, a non-`http://`
+//!   origin, an unimplemented kind, more than one backend — refuses to start rather than 500-ing
+//!   the first paid request weeks later, the same stance [`crate::config`] takes for the payment
+//!   options. What boot cannot settle without dialing it does not claim to: the `baseUrl` check is
+//!   scheme-only (as it is for `OBOLUS_UPSTREAM_URL`), so a well-formed-but-unreachable origin — or
+//!   an `http://` value carrying an odd path — still surfaces at request time. Reachability is not
+//!   a config property.
+//! * **Keys are *referenced*, never inlined.** A backend names a `keyFile`; the loader reads it —
+//!   through an injected reader, so the whole thing is hermetically testable — and the resolved
+//!   secret lives only inside the [`OllamaUpstream`] that sends it, never in a config struct, a log
+//!   line, or a `Debug`.
+//!
+//! ## Scope in S1
+//!
+//! `ollama` and `openai-compat` are the same wire shape — both POST to `/v1/chat/completions` — so
+//! both are served by [`OllamaUpstream`], the difference being only whether a bearer is attached.
+//! `anthropic-compat` speaks a different wire format and is refused at boot as not-yet-implemented
+//! (it is in the #53 hardening backlog). Declaring **more than one** backend is refused too:
+//! model-based routing across backends is S2 (issue #56), and until a selector exists, silently
+//! serving only one of several declared backends is exactly the surprise fail-loud exists to
+//! prevent. `models` and `precedence` are parsed and carried but nothing reads them yet — S2's
+//! router is their first consumer.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::http::HeaderValue;
+use serde::Deserialize;
+
+use crate::upstream::{OllamaUpstream, Upstream};
+
+/// The wire protocol a backend speaks. A closed set on purpose: an operator's `kind` string is
+/// matched against exactly these, and an unknown one fails to parse rather than defaulting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Kind {
+    /// A local Ollama origin (or any keyless OpenAI-compatible server). No credential is sent.
+    Ollama,
+    /// A hosted OpenAI-compatible API. Same wire shape as [`Ollama`](Kind::Ollama); differs only
+    /// in that it may carry a bearer token read from a `keyFile`.
+    OpenaiCompat,
+    /// Anthropic's Messages API. A different request/response shape from the OpenAI one, so it is
+    /// not served by [`OllamaUpstream`] and is refused at boot until its own upstream lands.
+    AnthropicCompat,
+}
+
+impl std::fmt::Display for Kind {
+    /// The `kind` string an operator writes in the config — not the Rust variant name — so an
+    /// error message names the value they must go and fix.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Kind::Ollama => "ollama",
+            Kind::OpenaiCompat => "openai-compat",
+            Kind::AnthropicCompat => "anthropic-compat",
+        })
+    }
+}
+
+/// One entry in the backend config array, exactly as written.
+///
+/// `deny_unknown_fields` for the reason [`crate::config::AcceptEntry`] uses it: a typo
+/// (`baseURL`, `keyfile`) must fail loudly at startup, not be silently dropped and leave a backend
+/// pointed at a default nobody meant. `models` and `precedence` default to empty/`None` because
+/// S1 does not route on them; declaring them is allowed (a config can be written S2-ready) but
+/// nothing consumes them yet.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BackendEntry {
+    id: String,
+    kind: Kind,
+    base_url: String,
+    #[serde(default)]
+    key_file: Option<String>,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    precedence: Option<i64>,
+}
+
+/// Why a backend configuration could not be turned into a registry. Every arm is a boot-time
+/// refusal; none can arise at request time.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum BackendError {
+    /// Not a JSON array of the expected shape — bad JSON, wrong type, an unknown/missing field, or
+    /// an unrecognised `kind`.
+    #[error(
+        "backend config must be a JSON array of \
+         {{\"id\",\"kind\",\"baseUrl\", optional \"keyFile\"/\"models\"/\"precedence\"}} objects: {0}"
+    )]
+    Malformed(String),
+
+    /// A syntactically valid but empty array. A gateway with no backend has nothing to serve.
+    #[error(
+        "backend config is an empty array: declare at least one backend, or unset the config file \
+         to use the single-backend OBOLUS_UPSTREAM_URL path instead"
+    )]
+    Empty,
+
+    /// More than one backend declared. Refused because S1 has no way to *choose* between them; the
+    /// alternative — serving only one and ignoring the rest — is the silent surprise fail-loud
+    /// exists to prevent. Names S2 so the message does not read as a permanent limit.
+    #[error(
+        "backend config declares {count} backends ({ids}), but routing across multiple backends is \
+         not implemented yet — it arrives in S2 (https://github.com/geekinasuit/obolus/issues/56). \
+         Declare exactly one backend until then."
+    )]
+    MultipleBackends { count: usize, ids: String },
+
+    /// A `kind` whose upstream does not exist yet — `anthropic-compat` in S1.
+    #[error(
+        "backend {id:?}: kind {kind} is not implemented yet — its wire format differs from the \
+         OpenAI-compatible one and is tracked in the hardening backlog \
+         (https://github.com/geekinasuit/obolus/issues/53). Use \"ollama\" or \"openai-compat\"."
+    )]
+    KindNotImplemented { id: String, kind: Kind },
+
+    /// A backend with an empty `id`. The id names the backend in diagnostics and (from S2) in
+    /// routing, so an empty one is a configuration that cannot mean what it says.
+    #[error("backend config has a backend with an empty id; id names the backend and must be set")]
+    EmptyId,
+
+    /// A `baseUrl` that is not an `http://` origin. The upstream client speaks plain HTTP only.
+    #[error(
+        "backend {id:?}: baseUrl must be an http:// origin (got {base_url:?}). The upstream client \
+         speaks plain HTTP only (no TLS is wired), so reach a TLS origin through a local http→https \
+         proxy — the same pattern OBOLUS_FACILITATOR_URL uses."
+    )]
+    BadBaseUrl { id: String, base_url: String },
+
+    /// A `keyFile` on a `kind` that sends no credential. Flagged rather than ignored: an operator
+    /// who set a key expects it to be used, and silently dropping it is the inert-config trap.
+    #[error(
+        "backend {id:?}: kind {kind} sends no credential, so it takes no keyFile. Use \
+         \"openai-compat\" for a keyed API, or remove the keyFile."
+    )]
+    KeyOnKeylessKind { id: String, kind: Kind },
+
+    /// The referenced `keyFile` could not be read. Carries the OS detail and names the file.
+    #[error("backend {id:?}: could not read keyFile {file:?}: {detail}")]
+    KeyFileUnreadable { id: String, file: String, detail: String },
+
+    /// The referenced `keyFile` is present but empty (or whitespace-only) — it reached the process
+    /// carrying no token. The usual causes are an unexpanded `${VAR}` written to it or a truncated
+    /// mount.
+    #[error("backend {id:?}: keyFile {file:?} is empty; it must hold the bearer token sent to the origin")]
+    EmptyKeyFile { id: String, file: String },
+
+    /// The referenced `keyFile` is not UTF-8. A bearer token is ASCII text.
+    #[error("backend {id:?}: keyFile {file:?} is not valid UTF-8; a bearer token is ASCII text")]
+    KeyNotText { id: String, file: String },
+
+    /// The token in `keyFile` is not a valid HTTP header value (a control character, say), so
+    /// `Authorization: Bearer <token>` could not be built. Caught here, at boot, rather than as a
+    /// 500 on the first request that tries to send it.
+    #[error(
+        "backend {id:?}: keyFile {file:?} holds a value that is not a valid HTTP header — a bearer \
+         token is visible ASCII with no control characters"
+    )]
+    KeyNotHeaderSafe { id: String, file: String },
+
+    /// A `models` entry that is empty or whitespace-only. An empty alias names no model.
+    #[error("backend {id:?}: a models entry is empty; a model alias must name a model")]
+    EmptyModelAlias { id: String },
+}
+
+/// The registry of backends a gateway serves from.
+///
+/// In S1 it always holds exactly one backend — [`load_backends`] refuses an empty array and refuses
+/// more than one, and [`single_ollama`](Backends::single_ollama) builds one — so [`sole`] is the
+/// whole read surface. S2 adds a selector over the entries and relaxes the one-backend refusal.
+pub struct Backends {
+    entries: Vec<Backend>,
+}
+
+/// One resolved backend: its declared metadata plus the constructed upstream. The upstream is
+/// private, so a `Backend` can only be obtained from a [`Backends`] built by this module — and a
+/// resolved key, if any, lives inside that upstream and nowhere on this struct.
+pub struct Backend {
+    /// The operator-chosen name, used in diagnostics and (from S2) routing.
+    pub id: String,
+    pub kind: Kind,
+    /// The origin, trailing slash already trimmed by [`OllamaUpstream::new`]; kept for the banner.
+    pub base_url: String,
+    /// Model aliases this backend serves. Parsed and carried; S2's router is the first consumer.
+    pub models: Vec<String>,
+    /// Precedence rank. Parsed and carried; S2's router is the first consumer.
+    pub precedence: Option<i64>,
+    /// Whether a bearer credential is attached — a boolean for the banner, never the key itself.
+    pub has_key: bool,
+    upstream: Arc<dyn Upstream>,
+}
+
+impl Backend {
+    /// A clone of this backend's upstream handle, for wiring into a gateway.
+    pub fn upstream(&self) -> Arc<dyn Upstream> {
+        self.upstream.clone()
+    }
+}
+
+// `Debug` by hand, not derived: `Arc<dyn Upstream>` is not `Debug`, and — more to the point — the
+// upstream is where a resolved bearer lives, so it is deliberately left out. `finish_non_exhaustive`
+// prints the trailing `..` that says a field is hidden. What is shown is metadata only; the
+// credential cannot be reached through this impl.
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Backend")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("base_url", &self.base_url)
+            .field("models", &self.models)
+            .field("precedence", &self.precedence)
+            .field("has_key", &self.has_key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Backends {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Backends").field("entries", &self.entries).finish()
+    }
+}
+
+impl Backends {
+    /// The single-backend shim: the `OBOLUS_UPSTREAM_URL` path expressed as a one-entry registry —
+    /// one keyless Ollama backend — so the N = 1 case is behaviourally identical to before this
+    /// module existed. `base_url`'s scheme is validated by `main` (as it was before), matching the
+    /// exact message an operator on that path already gets.
+    pub fn single_ollama(base_url: &str, head_timeout: Duration) -> Self {
+        let upstream = Arc::new(OllamaUpstream::new(base_url).with_head_timeout(head_timeout));
+        Backends {
+            entries: vec![Backend {
+                id: "default".to_string(),
+                kind: Kind::Ollama,
+                base_url: base_url.trim_end_matches('/').to_string(),
+                models: Vec::new(),
+                precedence: None,
+                has_key: false,
+                upstream,
+            }],
+        }
+    }
+
+    /// The one backend to serve from. S1 guarantees exactly one entry; the assertion documents that
+    /// invariant for the reader and would catch a future constructor that broke it.
+    pub fn sole(&self) -> &Backend {
+        debug_assert_eq!(self.entries.len(), 1, "the S1 registry always holds exactly one backend");
+        &self.entries[0]
+    }
+}
+
+/// Parse a backend-config JSON array, resolve each key reference through `read_key`, and construct
+/// the registry — all at startup. `head_timeout` is applied to every constructed upstream (it is a
+/// process-wide setting, not per-backend, in S1).
+///
+/// `read_key` is injected so the loader is hermetically testable without touching the filesystem;
+/// `main` passes `std::fs::read`. Every referenced key is read here, before the registry is handed
+/// back, so an unreadable one is a boot refusal rather than a mid-rotation surprise.
+pub fn load_backends<R>(
+    raw: &str,
+    head_timeout: Duration,
+    read_key: R,
+) -> Result<Backends, BackendError>
+where
+    R: Fn(&str) -> std::io::Result<Vec<u8>>,
+{
+    let entries: Vec<BackendEntry> =
+        serde_json::from_str(raw).map_err(|e| BackendError::Malformed(e.to_string()))?;
+
+    if entries.is_empty() {
+        return Err(BackendError::Empty);
+    }
+
+    // Refuse more than one before validating any single entry's semantics: with no selector, the
+    // fix for "too many" is "declare one", independent of whether entry 2 also has a bad URL. serde
+    // has already checked every entry's *structure* (types, unknown fields), so a typo in a later
+    // entry was caught at the parse above; what remains is the count.
+    if entries.len() > 1 {
+        let ids =
+            entries.iter().map(|e| format!("{:?}", e.id)).collect::<Vec<_>>().join(", ");
+        return Err(BackendError::MultipleBackends { count: entries.len(), ids });
+    }
+
+    let entry = entries.into_iter().next().expect("length checked to be exactly 1 above");
+    let backend = build_backend(entry, head_timeout, &read_key)?;
+    Ok(Backends { entries: vec![backend] })
+}
+
+/// Validate one entry and construct its upstream. Split out so the per-entry checks live in one
+/// place; S2 will call it once per entry rather than once for the sole one.
+fn build_backend<R>(
+    entry: BackendEntry,
+    head_timeout: Duration,
+    read_key: &R,
+) -> Result<Backend, BackendError>
+where
+    R: Fn(&str) -> std::io::Result<Vec<u8>>,
+{
+    let BackendEntry { id, kind, base_url, key_file, models, precedence } = entry;
+
+    if id.trim().is_empty() {
+        return Err(BackendError::EmptyId);
+    }
+    // http:// only, for the reason main.rs rejects a non-http OBOLUS_UPSTREAM_URL: the client wires
+    // no TLS, so an https:// origin would fail every request. Case-insensitive so `HTTP://` passes.
+    if !base_url.to_ascii_lowercase().starts_with("http://") {
+        return Err(BackendError::BadBaseUrl { id, base_url });
+    }
+    if models.iter().any(|m| m.trim().is_empty()) {
+        return Err(BackendError::EmptyModelAlias { id });
+    }
+
+    let (has_key, upstream): (bool, Arc<dyn Upstream>) = match kind {
+        Kind::AnthropicCompat => return Err(BackendError::KindNotImplemented { id, kind }),
+        Kind::Ollama => {
+            if key_file.is_some() {
+                return Err(BackendError::KeyOnKeylessKind { id, kind });
+            }
+            let upstream = OllamaUpstream::new(&base_url).with_head_timeout(head_timeout);
+            (false, Arc::new(upstream))
+        }
+        Kind::OpenaiCompat => match key_file {
+            // A keyless openai-compatible origin (a local server) is allowed: it is the same wire
+            // shape as ollama, just chosen by an operator who wants that name for it.
+            None => {
+                let upstream = OllamaUpstream::new(&base_url).with_head_timeout(head_timeout);
+                (false, Arc::new(upstream))
+            }
+            Some(path) => {
+                let token = resolve_key(&id, &path, read_key)?;
+                let upstream = OllamaUpstream::new(&base_url)
+                    .with_head_timeout(head_timeout)
+                    .with_bearer_token(token);
+                (true, Arc::new(upstream))
+            }
+        },
+    };
+
+    Ok(Backend {
+        id,
+        kind,
+        base_url: base_url.trim_end_matches('/').to_string(),
+        models,
+        precedence,
+        has_key,
+        upstream,
+    })
+}
+
+/// Read a key file and return the bearer token it holds, validated as a real HTTP header value.
+/// The trailing newline a key file almost always carries is trimmed; a token is not expected to
+/// have significant leading/trailing whitespace.
+fn resolve_key<R>(id: &str, path: &str, read_key: &R) -> Result<String, BackendError>
+where
+    R: Fn(&str) -> std::io::Result<Vec<u8>>,
+{
+    let bytes = read_key(path).map_err(|e| BackendError::KeyFileUnreadable {
+        id: id.to_string(),
+        file: path.to_string(),
+        detail: e.to_string(),
+    })?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| BackendError::KeyNotText { id: id.to_string(), file: path.to_string() })?;
+    let token = text.trim().to_string();
+    if token.is_empty() {
+        return Err(BackendError::EmptyKeyFile { id: id.to_string(), file: path.to_string() });
+    }
+    // Validate exactly what `OllamaUpstream::forward` will build, so an unsendable token is a boot
+    // refusal here rather than a per-request error there.
+    if HeaderValue::from_str(&format!("Bearer {token}")).is_err() {
+        return Err(BackendError::KeyNotHeaderSafe { id: id.to_string(), file: path.to_string() });
+    }
+    Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const T: Duration = Duration::from_secs(600);
+
+    /// A key reader that must not be called — asserts a keyless path reads no file.
+    fn no_key(_: &str) -> std::io::Result<Vec<u8>> {
+        panic!("no key file should be read on this path");
+    }
+
+    /// A key reader returning fixed bytes for any path.
+    fn key_bytes(bytes: &'static [u8]) -> impl Fn(&str) -> std::io::Result<Vec<u8>> {
+        move |_| Ok(bytes.to_vec())
+    }
+
+    /// A key reader that always fails, as a missing or unreadable file would.
+    fn unreadable(_: &str) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))
+    }
+
+    #[test]
+    fn parses_a_single_ollama_backend() {
+        let raw = r#"[{"id":"local","kind":"ollama","baseUrl":"http://127.0.0.1:11434"}]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        let b = registry.sole();
+        assert_eq!(b.id, "local");
+        assert_eq!(b.kind, Kind::Ollama);
+        assert_eq!(b.base_url, "http://127.0.0.1:11434");
+        assert!(!b.has_key, "an ollama backend carries no key");
+    }
+
+    #[test]
+    fn an_empty_array_is_rejected() {
+        assert_eq!(load_backends("[]", T, no_key).unwrap_err(), BackendError::Empty);
+    }
+
+    #[test]
+    fn malformed_json_is_rejected() {
+        let err = load_backends("not json", T, no_key).unwrap_err();
+        assert!(matches!(err, BackendError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_object_that_is_not_an_array_is_rejected() {
+        let raw = r#"{"id":"x","kind":"ollama","baseUrl":"http://h"}"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(err, BackendError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_unknown_field_is_rejected_not_silently_dropped() {
+        // deny_unknown_fields: a typo'd key must fail rather than leave the field defaulted.
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","keyfile":"/k"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(err, BackendError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_unknown_kind_is_rejected() {
+        let raw = r#"[{"id":"x","kind":"vllm","baseUrl":"http://h"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(err, BackendError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn multiple_backends_are_rejected_naming_s2() {
+        let raw = r#"[
+            {"id":"a","kind":"ollama","baseUrl":"http://a"},
+            {"id":"b","kind":"ollama","baseUrl":"http://b"}
+        ]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(&err, BackendError::MultipleBackends { count: 2, .. }), "got {err:?}");
+        let msg = err.to_string();
+        // The message must name both ids and point at S2, so the refusal does not read as permanent.
+        assert!(msg.contains("\"a\"") && msg.contains("\"b\""), "names the ids: {msg}");
+        assert!(msg.contains("issues/56"), "points at S2: {msg}");
+    }
+
+    #[test]
+    fn anthropic_compat_is_rejected_as_not_implemented() {
+        let raw = r#"[{"id":"claude","kind":"anthropic-compat","baseUrl":"http://p"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(
+            matches!(&err, BackendError::KindNotImplemented { kind: Kind::AnthropicCompat, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_http_base_url_is_rejected() {
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"https://secure.example"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(&err, BackendError::BadBaseUrl { .. }), "got {err:?}");
+        assert!(err.to_string().contains("proxy"), "steers to the proxy pattern: {err}");
+    }
+
+    #[test]
+    fn an_empty_id_is_rejected() {
+        let raw = r#"[{"id":"  ","kind":"ollama","baseUrl":"http://h"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert_eq!(err, BackendError::EmptyId);
+    }
+
+    #[test]
+    fn ollama_with_a_key_file_is_rejected() {
+        // A key on the keyless kind is a config mistake, not silently dropped.
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","keyFile":"/k"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(&err, BackendError::KeyOnKeylessKind { kind: Kind::Ollama, .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn openai_compat_without_a_key_is_a_keyless_backend() {
+        let raw = r#"[{"id":"local-oai","kind":"openai-compat","baseUrl":"http://127.0.0.1:8000"}]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        let b = registry.sole();
+        assert_eq!(b.kind, Kind::OpenaiCompat);
+        assert!(!b.has_key, "no keyFile => no credential");
+    }
+
+    #[test]
+    fn openai_compat_resolves_and_carries_its_key() {
+        // The keyed path: the loader reads the referenced file and builds a bearer-carrying
+        // upstream. That the bearer actually reaches the origin is proved in upstream.rs; here we
+        // prove the loader resolves the reference and marks the backend keyed.
+        let raw =
+            r#"[{"id":"gemini","kind":"openai-compat","baseUrl":"http://127.0.0.1:9000","keyFile":"/secrets/gemini"}]"#;
+        let registry = load_backends(raw, T, key_bytes(b"sk-test-abc-123\n")).unwrap();
+        let b = registry.sole();
+        assert_eq!(b.kind, Kind::OpenaiCompat);
+        assert!(b.has_key, "a resolved keyFile => a credential is attached");
+    }
+
+    #[test]
+    fn an_unreadable_key_file_is_rejected_at_load() {
+        // The core of DoD item 4: a key problem is a boot refusal, not a first-request 500.
+        let raw =
+            r#"[{"id":"gemini","kind":"openai-compat","baseUrl":"http://h","keyFile":"/nope"}]"#;
+        let err = load_backends(raw, T, unreadable).unwrap_err();
+        assert!(matches!(&err, BackendError::KeyFileUnreadable { .. }), "got {err:?}");
+        assert!(err.to_string().contains("/nope"), "names the file: {err}");
+    }
+
+    #[test]
+    fn an_empty_key_file_is_rejected() {
+        let raw = r#"[{"id":"g","kind":"openai-compat","baseUrl":"http://h","keyFile":"/k"}]"#;
+        let err = load_backends(raw, T, key_bytes(b"   \n")).unwrap_err();
+        assert!(matches!(&err, BackendError::EmptyKeyFile { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_key_with_a_control_character_is_rejected() {
+        // An embedded newline survives the trim and is not header-safe — caught at boot.
+        let raw = r#"[{"id":"g","kind":"openai-compat","baseUrl":"http://h","keyFile":"/k"}]"#;
+        let err = load_backends(raw, T, key_bytes(b"sk-abc\ndef")).unwrap_err();
+        assert!(matches!(&err, BackendError::KeyNotHeaderSafe { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn models_and_precedence_are_parsed_and_carried() {
+        // They are inert in S1 (routing is S2), but declaring them is allowed and they survive onto
+        // the registry so an S2-ready config parses today.
+        let raw = r#"[{
+            "id":"x","kind":"ollama","baseUrl":"http://h",
+            "models":["llama3","llama3:70b"],"precedence":10
+        }]"#;
+        let registry = load_backends(raw, T, no_key).unwrap();
+        let b = registry.sole();
+        assert_eq!(b.models, vec!["llama3", "llama3:70b"]);
+        assert_eq!(b.precedence, Some(10));
+    }
+
+    #[test]
+    fn an_empty_model_alias_is_rejected() {
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","models":["good",""]}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(matches!(&err, BackendError::EmptyModelAlias { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn the_single_ollama_shim_builds_one_keyless_backend() {
+        let registry = Backends::single_ollama("http://127.0.0.1:11434/", T);
+        let b = registry.sole();
+        assert_eq!(b.kind, Kind::Ollama);
+        assert_eq!(b.base_url, "http://127.0.0.1:11434", "trailing slash trimmed for the banner");
+        assert!(!b.has_key);
+    }
+}

@@ -56,6 +56,7 @@ const OBOLUS_VARS: &[&str] = &[
     "OBOLUS_MAX_TIMEOUT_SECS",
     "OBOLUS_UPSTREAM_URL",
     "OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS",
+    "OBOLUS_BACKENDS_FILE",
     "OBOLUS_RESOURCE",
     "OBOLUS_DESCRIPTION",
     "OBOLUS_ACCEPTS",
@@ -1153,6 +1154,130 @@ fn an_instance_with_no_token_configuration_announces_no_token_path() {
 
     run.must_have_got_past_startup();
     run.must_not_say(TOKEN_ENABLED);
+}
+
+// ---- backend configuration, OBOLUS_BACKENDS_FILE (#55) ----
+//
+// `src/main.rs` is compiled by no test target, so these exec-level runs are the only vantage on
+// whether a backend-config fault refuses at boot rather than surviving to the first paid request —
+// the property the `obolus::backends` unit tests assert at the library level, checked here through
+// the real binary.
+
+#[test]
+fn a_valid_single_backend_config_file_boots_and_names_the_backend() {
+    let path = temp_file(
+        "backends-ollama.json",
+        r#"[{"id":"local","kind":"ollama","baseUrl":"http://127.0.0.1:11434"}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_have_got_past_startup();
+    // The banner is read off the constructed registry, so it names the wired backend and its posture.
+    run.must_say("backend \"local\"");
+    run.must_say("keyless");
+}
+
+#[test]
+fn a_malformed_backend_config_file_refuses_to_start() {
+    let path = temp_file("backends-malformed.json", "{ not json");
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_say("backend config must be a JSON array");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn an_empty_backend_config_file_refuses_to_start() {
+    // Whitespace-only too: an unexpanded ${VAR} written to the file arrives looking like this, and
+    // serde's "EOF while parsing a value" names no remedy the operator can act on.
+    let path = temp_file("backends-empty.json", "   \n");
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_say("is empty");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn a_set_but_empty_backend_config_path_refuses_to_start() {
+    // The variable's own value carries no path — distinct from a file that exists and is empty.
+    let run = run(&[("OBOLUS_BACKENDS_FILE", "")]);
+
+    run.must_say("set but empty");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn the_backend_config_and_the_single_upstream_at_once_refuse_to_start() {
+    // Supersession, as OBOLUS_ACCEPTS has with the single-chain vars: the file wins and the variable
+    // sits inert, so serving a backend the operator did not think they configured must refuse.
+    let path = temp_file(
+        "backends-super.json",
+        r#"[{"id":"local","kind":"ollama","baseUrl":"http://127.0.0.1:11434"}]"#,
+    );
+    let run = run(&[
+        ("OBOLUS_BACKENDS_FILE", &path),
+        ("OBOLUS_UPSTREAM_URL", "http://127.0.0.1:11434"),
+    ]);
+
+    run.must_say("both set");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn multiple_backends_refuse_to_start_and_point_at_s2() {
+    let path = temp_file(
+        "backends-multi.json",
+        r#"[{"id":"a","kind":"ollama","baseUrl":"http://a"},{"id":"b","kind":"ollama","baseUrl":"http://b"}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    // The refusal names S2 so it does not read as a permanent limit.
+    run.must_say("issues/56");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn an_anthropic_compat_backend_refuses_as_not_implemented() {
+    let path = temp_file(
+        "backends-anthropic.json",
+        r#"[{"id":"claude","kind":"anthropic-compat","baseUrl":"http://proxy"}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_say("not implemented yet");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn an_openai_compat_backend_with_an_unreadable_key_file_refuses_to_start() {
+    // The end-to-end form of DoD item 4: a key problem is a boot refusal, not a first-request 500.
+    let path = temp_file(
+        "backends-badkey.json",
+        r#"[{"id":"api","kind":"openai-compat","baseUrl":"http://proxy","keyFile":"/nonexistent/obolus-key"}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_say("could not read keyFile");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn an_openai_compat_backend_with_a_readable_key_boots_and_never_prints_the_key() {
+    // The keyed path boots, the banner reports it keyed — and, the discriminating assertion, the
+    // resolved credential appears nowhere in the startup output. A regression that logged the token
+    // (a stray Debug, a "wired key X" line) would still boot and still say "keyed", so the
+    // must_not_say is what actually guards the secret.
+    let secret = "sk-test-do-not-log-4242";
+    let key = temp_file("obolus-openai-key", &format!("{secret}\n"));
+    let config = format!(
+        r#"[{{"id":"api","kind":"openai-compat","baseUrl":"http://127.0.0.1:9000","keyFile":"{key}"}}]"#
+    );
+    let path = temp_file("backends-keyed.json", &config);
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_have_got_past_startup();
+    run.must_say("keyed");
+    run.must_not_say(secret);
 }
 
 #[test]

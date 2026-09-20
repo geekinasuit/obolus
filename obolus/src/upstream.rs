@@ -18,7 +18,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
+use axum::http::{
+    header::{AUTHORIZATION, CONTENT_TYPE},
+    Request, StatusCode,
+};
 use http_body_util::Full;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -212,8 +215,9 @@ impl Upstream for FakeUpstream {
 /// legitimate completion; the binary exposes `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS` to tune it.
 const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// The real upstream: a streaming reverse proxy to an Ollama server's OpenAI-compatible
-/// `/v1/chat/completions` endpoint.
+/// The real upstream: a streaming reverse proxy to an OpenAI-compatible `/v1/chat/completions`
+/// endpoint. Ollama's `/v1` speaks that shape, and so does any OpenAI-compatible origin — a local
+/// server, or a hosted API reached through the bearer set by [`with_bearer_token`].
 ///
 /// [`forward`](OllamaUpstream::forward) returns the moment the response *head* arrives; the body
 /// then streams lazily as `hyper`'s `Incoming`, so the model's output is never buffered before
@@ -221,8 +225,13 @@ const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// split — see [`crate::gateway`].
 ///
 /// It speaks plain HTTP: Ollama is a local origin (`http://127.0.0.1:11434`). TLS is not wired
-/// here because no hermetic path needs it; a facilitator that lives behind HTTPS is a separate,
-/// later concern (the connector, not this type, is where TLS would enter).
+/// here because no hermetic path needs it; a hosted OpenAI-compatible API behind HTTPS is reached
+/// the same way the facilitator is — through a local http→https proxy — because the connector,
+/// not this type, is where TLS would enter, and that is a separate, later concern.
+///
+/// [`with_bearer_token`](OllamaUpstream::with_bearer_token). The doc type deliberately has no
+/// `Debug` derive: the bearer is a live credential, and a derived `Debug` is the usual way one
+/// leaks into a log line or a panic message.
 pub struct OllamaUpstream {
     /// Origin only — scheme + host + port, no trailing slash, no path
     /// (e.g. `http://127.0.0.1:11434`). The endpoint path is appended per request.
@@ -230,6 +239,10 @@ pub struct OllamaUpstream {
     client: Client<HttpConnector, Full<Bytes>>,
     /// Deadline for the response head to arrive; see [`DEFAULT_HEAD_TIMEOUT`].
     head_timeout: Duration,
+    /// The `Authorization: Bearer …` value sent upstream, if any. `None` for a keyless origin
+    /// (Ollama, a local OpenAI-compatible server). Never logged, never in an error message, never
+    /// `Debug`-formatted — see the type doc.
+    bearer: Option<String>,
 }
 
 impl OllamaUpstream {
@@ -243,13 +256,27 @@ impl OllamaUpstream {
         // always joined with a single leading slash.
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let client = Client::builder(TokioExecutor::new()).build_http::<Full<Bytes>>();
-        Self { base_url, client, head_timeout: DEFAULT_HEAD_TIMEOUT }
+        Self { base_url, client, head_timeout: DEFAULT_HEAD_TIMEOUT, bearer: None }
     }
 
     /// Override the response-head deadline; see [`DEFAULT_HEAD_TIMEOUT`] for what it bounds and
     /// why it stays generous. Tests use it to force the timeout without waiting the default.
     pub fn with_head_timeout(mut self, head_timeout: Duration) -> Self {
         self.head_timeout = head_timeout;
+        self
+    }
+
+    /// Send `Authorization: Bearer <token>` on every request — for a hosted OpenAI-compatible API
+    /// that authenticates. `token` is the credential itself, already read from wherever it was
+    /// referenced; this type only carries and sends it, and never renders it.
+    ///
+    /// The caller must ensure `token` is a valid HTTP header value (visible ASCII, no controls):
+    /// the header is built per request in [`forward`](Self::forward), and an unbuildable value
+    /// surfaces there as an `UpstreamError` on every request rather than at construction. The
+    /// config loader that reads a key file validates this at startup so that failure is a boot
+    /// refusal, not a per-request 500 — see [`crate::backends`].
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer = Some(token.into());
         self
     }
 }
@@ -261,8 +288,15 @@ impl Upstream for OllamaUpstream {
     ) -> Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + '_>> {
         Box::pin(async move {
             let uri = format!("{}/v1/chat/completions", self.base_url);
-            let request = Request::post(uri)
-                .header(CONTENT_TYPE, "application/json")
+            let mut builder = Request::post(uri).header(CONTENT_TYPE, "application/json");
+            if let Some(bearer) = &self.bearer {
+                // The credential lives as one value and is formatted into the header here rather
+                // than stored pre-rendered. `http::Error`'s `Display` names no header value, so the
+                // `{e}` below cannot echo the bearer; the loader also validates it at boot, so an
+                // unbuildable value is refused before any request reaches this line.
+                builder = builder.header(AUTHORIZATION, format!("Bearer {bearer}"));
+            }
+            let request = builder
                 .body(Full::new(body))
                 .map_err(|e| UpstreamError(format!("could not build upstream request: {e}")))?;
 
@@ -348,6 +382,77 @@ mod tests {
         let _ = axum::body::to_bytes(response.body, usize::MAX).await.unwrap();
 
         assert_eq!(seen.lock().unwrap().as_slice(), sent.as_ref());
+    }
+
+    /// Capture the `Authorization` header value the upstream sent (or its absence). Shared so a
+    /// test can serve on it and then read what arrived.
+    async fn serve_capturing_authorization(seen: Arc<Mutex<Option<String>>>) -> String {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    *seen.lock().unwrap() = headers
+                        .get(AUTHORIZATION)
+                        .map(|v| v.to_str().unwrap_or("<non-ascii>").to_string());
+                    "ok"
+                }
+            }),
+        );
+        serve(app).await
+    }
+
+    #[tokio::test]
+    async fn it_sends_the_configured_bearer_token() {
+        // The openai-compat path: a keyed origin must receive `Authorization: Bearer <token>`, or
+        // a hosted API 401s every request. This proves the header is built and sent verbatim.
+        let seen = Arc::new(Mutex::new(None));
+        let base = serve_capturing_authorization(seen.clone()).await;
+
+        let response = OllamaUpstream::new(base)
+            .with_bearer_token("sk-test-secret-123")
+            .forward(Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(response.status, StatusCode::OK);
+        let _ = axum::body::to_bytes(response.body, usize::MAX).await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("Bearer sk-test-secret-123"));
+    }
+
+    #[tokio::test]
+    async fn it_sends_no_authorization_header_by_default() {
+        // The Ollama path: a keyless origin must get NO `Authorization` header. A default that
+        // sent an empty or stray bearer could trip an origin that rejects a malformed one.
+        let seen = Arc::new(Mutex::new(Some("sentinel".to_string())));
+        let base = serve_capturing_authorization(seen.clone()).await;
+
+        let response = OllamaUpstream::new(base).forward(Bytes::new()).await.unwrap();
+        let _ = axum::body::to_bytes(response.body, usize::MAX).await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().as_deref(), None, "no bearer configured => no header");
+    }
+
+    /// Proof of the credential-safety claim on the request-build error, not just a re-derivation of
+    /// it. `with_bearer_token` is a `pub` seam whose doc concedes an unvalidated token can reach the
+    /// `format!("could not build upstream request: {e}")` line — the config loader validates at boot,
+    /// but the library API admits other callers. A header-unsafe token (embedded `DEL`) fails at
+    /// `Request::post(..).body()` before any socket opens, and the error must not carry the token.
+    /// This pins that `http::Error`'s `Display` names no header value at the crate version we build.
+    #[tokio::test]
+    async fn a_header_unsafe_bearer_is_not_echoed_in_the_error() {
+        // `unwrap_err` would require `UpstreamResponse: Debug` (it holds a `Body`, which is not), so
+        // match instead — and a success here is itself the failure to report.
+        let err = match OllamaUpstream::new("http://127.0.0.1:1")
+            .with_bearer_token("sk-secret\u{7f}bad")
+            .forward(Bytes::new())
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a header-unsafe bearer must fail to build the request, not succeed"),
+        };
+        assert!(err.0.contains("could not build upstream request"), "expected the build error: {err}");
+        assert!(!err.0.contains("sk-secret"), "the bearer must never appear in the error: {err}");
     }
 
     #[tokio::test]
