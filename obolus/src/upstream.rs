@@ -9,6 +9,7 @@
 //! purpose — see [`crate::gateway`] for why that split decides when we charge.
 
 use std::future::Future;
+use std::pin::Pin;
 // Used only by the test-only fake below; gated so the `obolus` binary carries neither.
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,13 +37,22 @@ pub struct UpstreamResponse {
 }
 
 /// Forward a request to the guarded service.
+///
+/// Object-safe on purpose. `forward` hands back a boxed future rather than `impl Future` so a
+/// gateway can hold `Arc<dyn Upstream>` and dispatch to a backend chosen at runtime — the seam a
+/// third party plugs a new backend into without patching Obolus. The cost is one allocation per
+/// request, on a path that is already about to do network I/O; the return of that is a heterogeneous
+/// open set of backends where a compile-time type parameter allowed exactly one.
 pub trait Upstream: Send + Sync + 'static {
     /// Send `body` upstream and return as soon as the response *head* is known, without
     /// waiting for the body. The gateway relies on that timing.
+    ///
+    /// The future borrows `self` (the `'_`), so an implementation may read its own fields across
+    /// the await without cloning them out first.
     fn forward(
         &self,
         body: Bytes,
-    ) -> impl Future<Output = Result<UpstreamResponse, UpstreamError>> + Send;
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + '_>>;
 }
 
 /// An in-process upstream for hermetic tests and local development.
@@ -164,22 +174,27 @@ impl FakeUpstream {
 
 #[cfg(test)]
 impl Upstream for FakeUpstream {
-    async fn forward(&self, _body: Bytes) -> Result<UpstreamResponse, UpstreamError> {
-        // Counted before the error arm: reaching an upstream that then refuses is still reaching
-        // it, and the access tests care about arrival, not outcome.
-        self.forwards.0.fetch_add(1, Ordering::SeqCst);
-        if let Some(reason) = &self.error {
-            return Err(UpstreamError(reason.clone()));
-        }
-        let mut chunks: Vec<Result<Bytes, std::io::Error>> =
-            self.chunks.iter().map(|c| Ok(Bytes::from_static(c.as_bytes()))).collect();
-        if let Some(reason) = &self.midstream_error {
-            chunks.push(Err(std::io::Error::other(reason.clone())));
-        }
-        Ok(UpstreamResponse {
-            status: self.status,
-            content_type: self.content_type.clone(),
-            body: Body::from_stream(futures_util::stream::iter(chunks)),
+    fn forward(
+        &self,
+        _body: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + '_>> {
+        Box::pin(async move {
+            // Counted before the error arm: reaching an upstream that then refuses is still reaching
+            // it, and the access tests care about arrival, not outcome.
+            self.forwards.0.fetch_add(1, Ordering::SeqCst);
+            if let Some(reason) = &self.error {
+                return Err(UpstreamError(reason.clone()));
+            }
+            let mut chunks: Vec<Result<Bytes, std::io::Error>> =
+                self.chunks.iter().map(|c| Ok(Bytes::from_static(c.as_bytes()))).collect();
+            if let Some(reason) = &self.midstream_error {
+                chunks.push(Err(std::io::Error::other(reason.clone())));
+            }
+            Ok(UpstreamResponse {
+                status: self.status,
+                content_type: self.content_type.clone(),
+                body: Body::from_stream(futures_util::stream::iter(chunks)),
+            })
         })
     }
 }
@@ -240,41 +255,46 @@ impl OllamaUpstream {
 }
 
 impl Upstream for OllamaUpstream {
-    async fn forward(&self, body: Bytes) -> Result<UpstreamResponse, UpstreamError> {
-        let uri = format!("{}/v1/chat/completions", self.base_url);
-        let request = Request::post(uri)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(body))
-            .map_err(|e| UpstreamError(format!("could not build upstream request: {e}")))?;
+    fn forward(
+        &self,
+        body: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + '_>> {
+        Box::pin(async move {
+            let uri = format!("{}/v1/chat/completions", self.base_url);
+            let request = Request::post(uri)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Full::new(body))
+                .map_err(|e| UpstreamError(format!("could not build upstream request: {e}")))?;
 
-        // Bound the wait for the response *head*. Without this a hung upstream — one that accepted
-        // the connection but never answers — blocks forever between `verify` and `settle`, pinning
-        // the request in the single state where the client has been charged nothing yet is owed a
-        // response. The body is deliberately NOT under this deadline: once the head is in hand the
-        // stream's length is the model's business, not a timeout's. See [`DEFAULT_HEAD_TIMEOUT`]
-        // for why, for a non-streaming upstream request, this is effectively a whole-generation
-        // bound rather than a connection-setup one.
-        let response = tokio::time::timeout(self.head_timeout, self.client.request(request))
-            .await
-            .map_err(|_| {
-                UpstreamError(format!(
-                    "upstream sent no response head within {:?}",
-                    self.head_timeout
-                ))
-            })?
-            .map_err(|e| UpstreamError(format!("could not reach upstream: {e}")))?;
+            // Bound the wait for the response *head*. Without this a hung upstream — one that
+            // accepted the connection but never answers — blocks forever between `verify` and
+            // `settle`, pinning the request in the single state where the client has been charged
+            // nothing yet is owed a response. The body is deliberately NOT under this deadline: once
+            // the head is in hand the stream's length is the model's business, not a timeout's. See
+            // [`DEFAULT_HEAD_TIMEOUT`] for why, for a non-streaming upstream request, this is
+            // effectively a whole-generation bound rather than a connection-setup one.
+            let response = tokio::time::timeout(self.head_timeout, self.client.request(request))
+                .await
+                .map_err(|_| {
+                    UpstreamError(format!(
+                        "upstream sent no response head within {:?}",
+                        self.head_timeout
+                    ))
+                })?
+                .map_err(|e| UpstreamError(format!("could not reach upstream: {e}")))?;
 
-        // Split the head off and hand the still-streaming body straight back. Do NOT await or
-        // collect the body here: the gateway commits payment at head-time, so buffering the body
-        // first would silently turn "charge when the model accepts the request" into "charge only
-        // after the full answer streams" — exactly the property the delayed-chunk test guards.
-        let (parts, incoming) = response.into_parts();
-        let content_type = parts
-            .headers
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.to_string());
-        Ok(UpstreamResponse { status: parts.status, content_type, body: Body::new(incoming) })
+            // Split the head off and hand the still-streaming body straight back. Do NOT await or
+            // collect the body here: the gateway commits payment at head-time, so buffering the body
+            // first would silently turn "charge when the model accepts the request" into "charge only
+            // after the full answer streams" — exactly the property the delayed-chunk test guards.
+            let (parts, incoming) = response.into_parts();
+            let content_type = parts
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
+            Ok(UpstreamResponse { status: parts.status, content_type, body: Body::new(incoming) })
+        })
     }
 }
 
@@ -478,5 +498,54 @@ mod tests {
 
         // Release the parked handler so the serve task does not leak past the test.
         never.notify_one();
+    }
+
+    /// The property S0 exists to deliver: the seam holds more than one *kind* of backend at once.
+    ///
+    /// With `forward` returning `impl Future` the trait was not object-safe, so a collection could
+    /// hold a single compile-time upstream type and no more — the reason `devseller` once reached
+    /// for an enum. Here two *different* concrete implementations sit in one `Vec<Arc<dyn Upstream>>`
+    /// and each is reached by dynamic dispatch. This does not compile at all unless the trait is
+    /// object-safe, and it would return the wrong body if dispatch landed on the wrong entry — so a
+    /// regression to a non-object-safe seam fails to build, and a dispatch bug fails the assertions.
+    #[tokio::test]
+    async fn the_seam_dispatches_across_two_heterogeneous_backends() {
+        // A second upstream that is structurally nothing like the streaming fake: one fixed body,
+        // no chunks, no call counter. Two of the *same* type would prove dispatch but not that the
+        // seam erases the concrete type; a different type behind the same `dyn Upstream` proves both.
+        struct OneShotUpstream(&'static str);
+        impl Upstream for OneShotUpstream {
+            fn forward(
+                &self,
+                _body: Bytes,
+            ) -> Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + '_>>
+            {
+                let marker = self.0;
+                Box::pin(async move {
+                    Ok(UpstreamResponse {
+                        status: StatusCode::OK,
+                        content_type: Some("application/json".to_string()),
+                        body: Body::from(marker),
+                    })
+                })
+            }
+        }
+
+        let fake = FakeUpstream::streaming();
+        let fake_calls = fake.calls();
+        let backends: Vec<Arc<dyn Upstream>> =
+            vec![Arc::new(fake), Arc::new(OneShotUpstream("one-shot-marker"))];
+
+        // Dispatch to the first — the multi-chunk streaming fake — and its own call counter moves.
+        let first = backends[0].forward(Bytes::new()).await.unwrap();
+        let first_body = axum::body::to_bytes(first.body, usize::MAX).await.unwrap();
+        assert_eq!(&first_body[..], FakeUpstream::streamed_text().as_bytes());
+        assert_eq!(fake_calls.count(), 1, "the first backend was the one reached");
+
+        // Dispatch to the second — a different concrete type — and the fake stays untouched.
+        let second = backends[1].forward(Bytes::new()).await.unwrap();
+        let second_body = axum::body::to_bytes(second.body, usize::MAX).await.unwrap();
+        assert_eq!(&second_body[..], b"one-shot-marker");
+        assert_eq!(fake_calls.count(), 1, "reaching the second backend did not touch the first");
     }
 }

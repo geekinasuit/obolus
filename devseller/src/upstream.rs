@@ -4,16 +4,18 @@
 //! flow wants an upstream that answers instantly and identically every time, and does not need a
 //! model on the machine at all. Someone testing an end-to-end integration wants the real thing.
 //!
-//! # Why an enum rather than `Box<dyn Upstream>`
-//!
-//! [`Upstream`] returns `impl Future` from its methods, which makes it not object-safe — there is
-//! no `dyn Upstream` to box. An enum that dispatches to one of two concrete implementations is the
-//! shape that works, and it also keeps the choice visible in the type rather than erased behind a
-//! pointer.
+//! Both are just [`Upstream`] implementations — [`CannedUpstream`] here, and `obolus`'s own
+//! [`OllamaUpstream`](obolus::upstream::OllamaUpstream) for the real path — and `main` picks one at
+//! runtime as an `Arc<dyn Upstream>`. There is no enum dispatching between them: the trait is
+//! object-safe, so the choice lives in the pointer the gateway holds, not in a type this crate has
+//! to name.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
-use obolus::upstream::{OllamaUpstream, Upstream, UpstreamError, UpstreamResponse};
+use obolus::upstream::{Upstream, UpstreamError, UpstreamResponse};
 
 /// The canned completion. Shaped like an OpenAI-compatible non-streaming response, because a
 /// client testing the payment flow still has to parse *something* — and one that cannot be parsed
@@ -23,36 +25,33 @@ use obolus::upstream::{OllamaUpstream, Upstream, UpstreamError, UpstreamResponse
 /// this string in their own output, which is the earliest possible place to notice.
 const CANNED_BODY: &str = r#"{"id":"obolus-devseller","object":"chat.completion","created":0,"model":"obolus-devseller","choices":[{"index":0,"message":{"role":"assistant","content":"This response came from the Obolus development seller, not from a model. Nothing was inferred and no payment settled."},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#;
 
-pub enum DevUpstream {
-    /// A fixed response, served without touching anything outside this process.
-    Canned,
-    /// A real Ollama-compatible origin.
-    Ollama(OllamaUpstream),
-}
+/// A fixed response, served without touching anything outside this process.
+pub struct CannedUpstream;
 
-impl Upstream for DevUpstream {
-    async fn forward(&self, body: Bytes) -> Result<UpstreamResponse, UpstreamError> {
-        match self {
-            DevUpstream::Ollama(ollama) => ollama.forward(body).await,
-            DevUpstream::Canned => Ok(UpstreamResponse {
+impl Upstream for CannedUpstream {
+    fn forward(
+        &self,
+        _body: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<UpstreamResponse, UpstreamError>> + Send + '_>> {
+        Box::pin(async {
+            Ok(UpstreamResponse {
                 status: StatusCode::OK,
                 content_type: Some("application/json".to_string()),
                 body: Body::from(CANNED_BODY),
-            }),
-        }
+            })
+        })
     }
 }
 
 /// How this instance's upstream should be described in the startup banner.
-pub fn describe(upstream: &DevUpstream, url: Option<&str>) -> String {
-    match (upstream, url) {
-        (DevUpstream::Ollama(_), Some(url)) => format!("real inference proxied to {url}"),
-        // Unreachable through `main`, which only builds `Ollama` from a URL — stated as a fallback
-        // rather than an `unwrap` so a future caller cannot turn a banner into a panic.
-        (DevUpstream::Ollama(_), None) => "real inference (origin not recorded)".to_string(),
-        (DevUpstream::Canned, _) => {
-            "a canned response — NO model is contacted and nothing is inferred".to_string()
-        }
+///
+/// Keyed on the configured URL rather than on the upstream value itself: `main` builds the canned
+/// upstream exactly when no `OBOLUS_UPSTREAM_URL` is set, so the presence of a URL *is* the
+/// distinction, and a `dyn Upstream` could not be matched on anyway.
+pub fn describe(url: Option<&str>) -> String {
+    match url {
+        Some(url) => format!("real inference proxied to {url}"),
+        None => "a canned response — NO model is contacted and nothing is inferred".to_string(),
     }
 }
 
@@ -63,7 +62,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_canned_upstream_serves_something_a_client_can_parse() {
-        let response = DevUpstream::Canned
+        let response = CannedUpstream
             .forward(Bytes::from_static(b"{}"))
             .await
             .expect("the canned upstream never fails");
@@ -81,7 +80,7 @@ mod tests {
     async fn the_canned_response_says_it_is_not_a_model() {
         // The one property that must survive any edit to the body: someone who forgets which
         // upstream they configured has to be able to see it in their own output.
-        let response = DevUpstream::Canned.forward(Bytes::from_static(b"{}")).await.unwrap();
+        let response = CannedUpstream.forward(Bytes::from_static(b"{}")).await.unwrap();
         let body = response.body.collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&body);
 
@@ -93,11 +92,8 @@ mod tests {
     fn the_banner_distinguishes_a_real_upstream_from_the_canned_one() {
         // These two lines are how an operator tells whether the answers they are looking at came
         // from a model. Printing the same text for both is the confusion worth preventing.
-        assert!(describe(&DevUpstream::Canned, None).contains("NO model"));
-        let real = describe(
-            &DevUpstream::Ollama(OllamaUpstream::new("http://127.0.0.1:11434")),
-            Some("http://127.0.0.1:11434"),
-        );
+        assert!(describe(None).contains("NO model"));
+        let real = describe(Some("http://127.0.0.1:11434"));
         assert!(real.contains("11434"), "got: {real}");
         assert!(!real.contains("NO model"), "got: {real}");
     }
