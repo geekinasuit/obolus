@@ -24,6 +24,7 @@
 
 pub mod access;
 pub mod arming;
+pub mod backends;
 pub mod config;
 pub mod facilitator;
 pub mod gateway;

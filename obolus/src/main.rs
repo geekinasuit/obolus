@@ -8,7 +8,8 @@
 //!
 //! It delegates settlement to a third-party
 //! x402 facilitator (`OBOLUS_FACILITATOR_URL`, required — the gateway never guesses where money
-//! settles) and proxies inference to a local Ollama origin (`OBOLUS_UPSTREAM_URL`). The payment
+//! settles) and proxies inference to a backend: a single Ollama origin (`OBOLUS_UPSTREAM_URL`) by
+//! default, or the backend declared in `OBOLUS_BACKENDS_FILE` (see [`obolus::backends`]). The payment
 //! placeholders below are deliberately not real addresses and must be overridden for any real
 //! network; there is no mainnet signing path in this crate.
 //!
@@ -31,9 +32,9 @@ use obolus::config::{
     parse_accepts, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
     SharedOffer,
 };
+use obolus::backends::{load_backends, Backends};
 use obolus::facilitator::DelegatedFacilitator;
 use obolus::gateway::{router, Access, Gateway};
-use obolus::upstream::OllamaUpstream;
 use obolus::x402::PaymentRequirements;
 
 /// Deliberately not 8402, which x402 client-side tooling tends to bind.
@@ -153,17 +154,8 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("OBOLUS_FACILITATOR_URL: {e}"))?
         .with_timeout(settle_timeout);
 
-    let upstream_url = env_or("OBOLUS_UPSTREAM_URL", DEFAULT_UPSTREAM_URL);
-    // Fail fast, symmetric with the facilitator URL above. Case-insensitive, so `HTTP://` is
-    // accepted rather than rejected as a typo. Left to request time, a bad scheme 502s every paid
-    // request while /health still reports OK.
-    if !upstream_url.to_ascii_lowercase().starts_with("http://") {
-        anyhow::bail!(
-            "OBOLUS_UPSTREAM_URL must be an http:// origin (got {upstream_url:?}): the upstream \
-             client speaks plain HTTP only (no TLS is wired), so an https:// or schemeless URL \
-             cannot reach the model. Put a local http proxy in front of a TLS upstream if needed."
-        );
-    }
+    // The response-head deadline is process-wide — it bounds the wait for *any* backend's head — so
+    // it is read once here, before the registry is built, and applied to every backend in it.
     let head_timeout_secs =
         env_u64("OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS", DEFAULT_UPSTREAM_HEAD_TIMEOUT_SECS)?;
     if head_timeout_secs == 0 {
@@ -173,8 +165,68 @@ async fn main() -> anyhow::Result<()> {
              answer."
         );
     }
-    let upstream =
-        OllamaUpstream::new(&upstream_url).with_head_timeout(Duration::from_secs(head_timeout_secs));
+    let head_timeout = Duration::from_secs(head_timeout_secs);
+
+    // Where backends come from (#55). `OBOLUS_BACKENDS_FILE`, when set, is a JSON file declaring a
+    // backend — its kind (`ollama` | `openai-compat` | `anthropic-compat`), base URL, an optional
+    // key-file reference, and (parsed but not yet routed on) its models and precedence. It
+    // supersedes the single-backend `OBOLUS_UPSTREAM_URL` exactly as `OBOLUS_ACCEPTS` supersedes the
+    // single-chain payment variables, and refuses to start when both are set for the same reason: an
+    // ignored upstream is a gateway serving a backend the operator did not think they configured.
+    // Unset, the single Ollama backend is built from `OBOLUS_UPSTREAM_URL` — the N = 1 path,
+    // behaviourally identical to before this module. `obolus::backends` fails loud at boot on a
+    // malformed config, an unreadable key file, or a non-http origin, so no such fault survives to
+    // the first paid request.
+    let backends = match std::env::var("OBOLUS_BACKENDS_FILE") {
+        // Set-but-empty first, ahead of the supersession bail below, for the reason the
+        // OBOLUS_ACCEPTS arm gives: that bail is actionable but its premise is false here — the file
+        // path itself never arrived, so nothing supersedes anything.
+        Ok(path) if path.trim().is_empty() => anyhow::bail!(
+            "OBOLUS_BACKENDS_FILE is set but empty: it reached this process carrying no path — an \
+             unexpanded ${{VAR}} or an EnvironmentFile line ending in `=`. Unset it to build a \
+             single backend from OBOLUS_UPSTREAM_URL, or point it at a backend-config JSON file."
+        ),
+        Ok(path) => {
+            // Supersession, like OBOLUS_ACCEPTS: a single-backend variable set alongside the file
+            // would sit inert. Refuse, naming it, rather than silently serving one and ignoring the
+            // config the operator wrote.
+            if std::env::var("OBOLUS_UPSTREAM_URL").is_ok() {
+                anyhow::bail!(
+                    "OBOLUS_BACKENDS_FILE and OBOLUS_UPSTREAM_URL are both set. The config file \
+                     supersedes the single-backend variable, which would then sit inert. Keep \
+                     whichever one you meant."
+                );
+            }
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("OBOLUS_BACKENDS_FILE {path:?}: {e}"))?;
+            if raw.trim().is_empty() {
+                anyhow::bail!(
+                    "OBOLUS_BACKENDS_FILE {path:?} is empty. A backend config is a JSON array of \
+                     backend objects; an empty file declares no backend to serve from."
+                );
+            }
+            load_backends(&raw, head_timeout, |p: &str| std::fs::read(p))
+                .map_err(|e| anyhow::anyhow!("OBOLUS_BACKENDS_FILE {path:?}: {e}"))?
+        }
+        Err(_) => {
+            let upstream_url = env_or("OBOLUS_UPSTREAM_URL", DEFAULT_UPSTREAM_URL);
+            // Fail fast, symmetric with the facilitator URL above. Case-insensitive, so `HTTP://` is
+            // accepted rather than rejected as a typo. Left to request time, a bad scheme 502s every
+            // paid request while /health still reports OK.
+            if !upstream_url.to_ascii_lowercase().starts_with("http://") {
+                anyhow::bail!(
+                    "OBOLUS_UPSTREAM_URL must be an http:// origin (got {upstream_url:?}): the \
+                     upstream client speaks plain HTTP only (no TLS is wired), so an https:// or \
+                     schemeless URL cannot reach the model. Put a local http proxy in front of a \
+                     TLS upstream if needed."
+                );
+            }
+            Backends::single_ollama(&upstream_url, head_timeout)
+        }
+    };
+    // The one backend to serve from. S1 admits exactly one (routing over several is S2); the gateway
+    // holds it exactly as it held the single upstream before.
+    let backend_upstream = backends.sole().upstream();
 
     // The challenge tells the payer WHICH resource they are paying for, so `resource` must be an
     // address they can actually reach. Deriving it from the bind address is only right when that
@@ -311,7 +363,7 @@ async fn main() -> anyhow::Result<()> {
     // advertised" a property of the constructor rather than of this file's ordering. The witness
     // holds its own copy of the option set; `requirements` stays for the banner below, and neither
     // is mutated after the guard ran, so they cannot drift.
-    let gateway = Gateway::new(facilitator, Arc::new(upstream), armed_requirements)
+    let gateway = Gateway::new(facilitator, backend_upstream, armed_requirements)
         .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
 
     // "starting on", not "listening on" — the bind is ~100 lines below and every check between here
@@ -330,7 +382,17 @@ async fn main() -> anyhow::Result<()> {
          every caller unless a bearer-token line below says otherwise."
     );
     eprintln!("obolus: facilitator (verify/settle) -> {facilitator_url}");
-    eprintln!("obolus: upstream (inference) -> {upstream_url}");
+    // Off the constructed registry, not the configuration that built it, so the line describes what
+    // was actually wired. S1 serves exactly one backend; the "keyed"/"keyless" note says whether a
+    // bearer is attached without ever naming the credential.
+    let backend = backends.sole();
+    eprintln!(
+        "obolus: upstream (inference) -> backend {:?} kind {} at {} ({})",
+        backend.id,
+        backend.kind,
+        backend.base_url,
+        if backend.has_key { "keyed" } else { "keyless" }
+    );
     // The unconditional half of the posture: true on every instance, armed or not. The
     // testnet-by-construction claim is NOT stated here — on an armed instance it would be false, and
     // it sits one line above a MAINNET ARMED banner. It is asserted below, where it is checked.
