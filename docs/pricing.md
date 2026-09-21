@@ -127,13 +127,42 @@ one atomic cost is well-defined only against one asset — so the *cost* varies 
 *denomination* does not. How costs are declared, and the boot refusals that keep every backend
 covered, are in [The granularity decision](#the-granularity-decision) below.
 
+**`Promotional` — a time-bounded discount over a base rate.** A promotion is a percentage off,
+active during a `[start, end)` window (Unix seconds, `start` inclusive, `end` exclusive): inside
+the window the quote is the base rate's quote marked *down* by a discount in basis points; outside
+it the base rate applies unchanged. It is a **modifier**, not a rate of its own — `OBOLUS_PRICING`
+still selects the base (`static` or `cost-plus`), and the promotional variables wrap whatever that
+produces.
+
+The discount is a *percentage*, deliberately, not a fixed atomic amount: a percentage is
+asset-agnostic, so one promotion is correct across payment options whose assets carry different
+decimals (where a single atomic number would mean two different real prices), and it composes over
+any base — including the cost-plus money rate. The discounted quote is
+`floor(base * (10000 - discount_bps) / 10000)`, rounded toward the payer by under one atomic unit,
+the same direction as the cost-plus markup floor.
+
+A promotion **never quotes zero of its own accord**, held by two guards together. The config door
+refuses `discount_bps >= 10000` (below): 100% off is *free*, which settles a zero-value
+authorization differently and is a distinct rate (see [#67](https://github.com/geekinasuit/obolus/issues/67)).
+But the floor alone still reaches zero on a *payable* base under a deep sub-100% discount —
+`floor(1000 * (10000 - 9995) / 10000) = 0` at 99.95% off, a discount the door admits — so a
+floored-to-zero quote on a payable base is lifted to one atomic unit (the fail-toward-charging
+direction, matching the fail-closed sentinels elsewhere in the rate). A base that was *already* zero
+(a free static amount) stays zero: that is the base rate's decision, not the promotion's.
+
+The window is compared against the wall clock per request. A scheduled promotion (its window
+entirely in the future) boots and simply discounts nothing until the window opens; a window that
+has *already* closed is refused at boot rather than advertised as a discount no client could get.
+
 ### Planned
 
-**Promotional and free.** A promotional rate (a temporary discount) and a genuinely free rate.
-Free is not just "quote zero" — a zero quote reaches a settle-a-zero-amount path that the paid
-flow does not exercise today, so it needs that path confirmed end-to-end first. It is a distinct
-rate, not a degenerate cost-plus, which is why cost-plus refuses a zero cost rather than treating
-it as free.
+**Free.** A genuinely free rate. Free is not just "quote zero" — a zero quote reaches a
+settle-a-zero-amount path that the paid flow does not exercise today, so it needs that path
+confirmed end-to-end first. It is a distinct rate, not a degenerate cost-plus (which is why
+cost-plus refuses a zero cost) and not a 100%-off promotion (which the promotional door refuses for
+the same reason). Its design — a zero-amount *advertised* option versus a no-challenge bypass that
+mirrors the bearer-token path — is tracked in
+[#67](https://github.com/geekinasuit/obolus/issues/67).
 
 ## Configuration
 
@@ -144,10 +173,17 @@ The pricing rate is selected by environment variables, parsed at boot by `select
 | `OBOLUS_PRICING` | The rate: unset or `static` (the default — each option keeps its own configured amount), or `cost-plus`. |
 | `OBOLUS_UPSTREAM_COST` | Cost-plus, single-backend only: the sole backend's cost, in atomic units. With a backends file the cost is declared per entry instead (a `"cost"` on each backend), and this variable is refused alongside the file. |
 | `OBOLUS_MARGIN_BPS` | Cost-plus only: the gateway-wide margin, in basis points (`10000` = 100%). Required under `cost-plus`. |
+| `OBOLUS_PROMO_DISCOUNT_BPS` | Promotional discount off the selected rate, in basis points (`2500` = 25% off). Set with the two window variables — all three, or none. Must be in `1..10000`: a zero discount and a discount of 100% or more are both refused. |
+| `OBOLUS_PROMO_START` | When the promotional window opens, Unix seconds (inclusive). |
+| `OBOLUS_PROMO_END` | When the promotional window closes, Unix seconds (exclusive). Must be after `OBOLUS_PROMO_START`, and not already in the past at boot. |
 
 The cost is declared where the backend is: `OBOLUS_UPSTREAM_COST` for the single-backend
 (env-configured) gateway, or a per-entry `"cost"` in `OBOLUS_BACKENDS_FILE` for a multi-backend
 one. See [The granularity decision](#the-granularity-decision) for the shape and its refusals.
+
+The promotional variables are a **modifier** layered over whichever rate `OBOLUS_PRICING` selects,
+parsed separately by `select_promo`; they do not change the rate choice, and unset they leave the
+selected rate untouched.
 
 ### Boot refusals
 
@@ -186,6 +222,12 @@ margin is stated once on the rate line and each backend's cost on its own line.
 - **Orphaned cost-plus parameters.** `OBOLUS_UPSTREAM_COST` / `OBOLUS_MARGIN_BPS` set without
   `cost-plus` selected would sit inert — refused rather than dropped. Its per-backend twin: a
   backend that declares a `"cost"` under a non-cost-plus rate is refused too, naming the entry.
+- **Incomplete or invalid promotional window.** The three promotional variables are all-or-none; a
+  partial set is refused, naming what is missing, rather than silently dropped (the `select_promo`
+  twin of orphaned cost-plus parameters). And each of a zero discount (a promotion that discounts
+  nothing is the base rate), a discount of 100% or more (that is *free*, a separate rate), an empty
+  or inverted window (`start >= end`), and a window already closed at boot (`end <= now` — its
+  banner would advertise a discount no client could get) is refused before the banner.
 
 ## The granularity decision
 

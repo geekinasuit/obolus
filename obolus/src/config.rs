@@ -235,6 +235,14 @@ pub const UPSTREAM_COST_VAR: &str = "OBOLUS_UPSTREAM_COST";
 /// Cost-plus's margin, in basis points (10000 = 100%). Required when `OBOLUS_PRICING=cost-plus`.
 pub const MARGIN_BPS_VAR: &str = "OBOLUS_MARGIN_BPS";
 
+/// A promotional discount off the selected rate, in basis points (2500 = 25% off). Set together
+/// with [`PROMO_START_VAR`] and [`PROMO_END_VAR`] — all three or none.
+pub const PROMO_DISCOUNT_BPS_VAR: &str = "OBOLUS_PROMO_DISCOUNT_BPS";
+/// When the promotional window opens, Unix seconds (inclusive). See [`PROMO_DISCOUNT_BPS_VAR`].
+pub const PROMO_START_VAR: &str = "OBOLUS_PROMO_START";
+/// When the promotional window closes, Unix seconds (exclusive). See [`PROMO_DISCOUNT_BPS_VAR`].
+pub const PROMO_END_VAR: &str = "OBOLUS_PROMO_END";
+
 /// The pricing rate an operator selected, ready for `main` to build a determiner from. A plain data
 /// value, not a determiner: the determiner types live in [`crate::pricing`], and keeping the config
 /// door's output free of them lets this parse and its refusals be unit-tested without wiring a
@@ -478,6 +486,144 @@ pub fn require_backend_costs(
             }
         }
     }
+}
+
+/// A promotional discount an operator configured, ready for `main` to wrap the base determiner with.
+/// A plain data value like [`PricingChoice`]: the [`crate::pricing::Promotional`] determiner is
+/// built from it in `main`, so this parse and its refusals are unit-testable without a gateway.
+///
+/// A promotion is a *modifier* on whichever rate [`PricingChoice`] selected, not a rate of its own —
+/// it discounts a percentage off that rate during a window — so it is parsed separately here and
+/// carries no `PricingChoice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromoConfig {
+    /// Basis points off the base rate during the window (2500 = 25% off). Always in `1..10000`: a
+    /// zero discount and a 100%-or-more discount are both refused (see [`PromoConfigError`]).
+    pub discount_bps: u32,
+    /// When the window opens, Unix seconds, inclusive.
+    pub start: u64,
+    /// When the window closes, Unix seconds, exclusive. Always strictly after `start` and after the
+    /// boot instant.
+    pub end: u64,
+}
+
+/// Why a promotional configuration could not be turned into a [`PromoConfig`]. Each is a boot
+/// refusal, the same posture the pricing door holds: a gateway that advertised a promotional window
+/// it would not honour — or one that discounts nothing, or everything — is worse than one that will
+/// not start.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PromoConfigError {
+    /// Some of the three promo variables are set and some are not. A promotion needs all three (a
+    /// discount and both window bounds); a partial set cannot describe one, and dropping the partial
+    /// config silently is the surprise the pricing door's `OrphanedParams` also guards against.
+    #[error(
+        "a promotional discount needs all of OBOLUS_PROMO_DISCOUNT_BPS, OBOLUS_PROMO_START and \
+         OBOLUS_PROMO_END; set: {present}; missing: {missing}. Set all three to run a promotion, or \
+         unset the rest."
+    )]
+    Incomplete { present: String, missing: String },
+
+    /// The discount is not a whole number of basis points.
+    #[error(
+        "OBOLUS_PROMO_DISCOUNT_BPS {value:?} is not a whole number of basis points \
+         (2500 = 25% off, 250 = 2.5% off)."
+    )]
+    BadDiscount { value: String },
+
+    /// The discount is zero. A promotion that discounts nothing quotes exactly the base rate, so it
+    /// advertises a promotional window that changes no price — inert config, refused rather than
+    /// dropped, the same rule as `OBOLUS_UPSTREAM_COST=0`.
+    #[error(
+        "OBOLUS_PROMO_DISCOUNT_BPS is 0: a promotion that discounts nothing is the base rate. Set \
+         the basis points to discount (2500 = 25% off), or unset the promotional variables."
+    )]
+    ZeroDiscount,
+
+    /// The discount is 100% or more. That makes the request free, and a free rate settles a
+    /// zero-value authorization differently from a paid one; it is configured separately, not as a
+    /// promotion, so this door only admits a discount that still leaves an amount to pay.
+    #[error(
+        "OBOLUS_PROMO_DISCOUNT_BPS is {value}: 10000 bps is 100% off, which makes the request free. \
+         A free rate settles differently and is configured separately, not as a promotion. Set a \
+         discount below 10000."
+    )]
+    DiscountTooLarge { value: u32 },
+
+    /// A window bound is not a non-negative integer of Unix seconds.
+    #[error("{var} {value:?} is not a Unix timestamp in whole seconds.")]
+    BadTimestamp { var: &'static str, value: String },
+
+    /// The window is empty or inverted: `start` is not strictly before `end`. A window that never
+    /// opens cannot be a promotion.
+    #[error(
+        "OBOLUS_PROMO_START ({start}) is not before OBOLUS_PROMO_END ({end}): a promotional window \
+         must open before it closes."
+    )]
+    EmptyWindow { start: u64, end: u64 },
+
+    /// The window closed before boot. Its discount could never apply, yet the banner would advertise
+    /// a promotion — the advertise-what-you-won't-charge trap the arming banner also refuses. A
+    /// window still open, or one entirely in the future, is fine; only an already-closed one refuses.
+    #[error(
+        "OBOLUS_PROMO_END ({end}) is at or before now ({now}, Unix seconds): the promotional window \
+         has already closed, so its discount could never apply. Set a window that has not ended, or \
+         unset the promotional variables."
+    )]
+    AlreadyEnded { end: u64, now: u64 },
+}
+
+/// Turn the promotional environment into an optional [`PromoConfig`], or refuse.
+///
+/// `get` reads a variable's value as [`select_pricing`] does. `now_unix` is the boot instant in Unix
+/// seconds, passed in rather than read here so every refusal — including the already-closed-window
+/// one — is deterministically testable; `main` reads the wall clock once and passes it.
+///
+/// Returns `Ok(None)` when no promotional variable is set — the common case, no promotion. All three
+/// set and valid returns `Ok(Some(_))`; anything between is a refusal.
+pub fn select_promo<F: Fn(&str) -> Option<String>>(
+    get: F,
+    now_unix: u64,
+) -> Result<Option<PromoConfig>, PromoConfigError> {
+    let vars = [PROMO_DISCOUNT_BPS_VAR, PROMO_START_VAR, PROMO_END_VAR];
+    let present: Vec<&str> = vars.into_iter().filter(|&k| get(k).is_some()).collect();
+    if present.is_empty() {
+        return Ok(None);
+    }
+    if present.len() < vars.len() {
+        let missing: Vec<&str> = vars.into_iter().filter(|&k| get(k).is_none()).collect();
+        return Err(PromoConfigError::Incomplete {
+            present: present.join(", "),
+            missing: missing.join(", "),
+        });
+    }
+
+    // All three present. Parse without trimming, as the cost and margin parses do: a value with
+    // stray whitespace is a malformed value, refused, not silently accepted.
+    let discount_raw = get(PROMO_DISCOUNT_BPS_VAR).expect("present checked above");
+    let discount_bps = match discount_raw.parse::<u32>() {
+        Ok(bps) => bps,
+        Err(_) => return Err(PromoConfigError::BadDiscount { value: discount_raw }),
+    };
+    if discount_bps == 0 {
+        return Err(PromoConfigError::ZeroDiscount);
+    }
+    if discount_bps >= 10_000 {
+        return Err(PromoConfigError::DiscountTooLarge { value: discount_bps });
+    }
+
+    let parse_ts = |var: &'static str| -> Result<u64, PromoConfigError> {
+        let raw = get(var).expect("present checked above");
+        raw.parse::<u64>().map_err(|_| PromoConfigError::BadTimestamp { var, value: raw })
+    };
+    let start = parse_ts(PROMO_START_VAR)?;
+    let end = parse_ts(PROMO_END_VAR)?;
+    if start >= end {
+        return Err(PromoConfigError::EmptyWindow { start, end });
+    }
+    if end <= now_unix {
+        return Err(PromoConfigError::AlreadyEnded { end, now: now_unix });
+    }
+    Ok(Some(PromoConfig { discount_bps, start, end }))
 }
 
 #[cfg(test)]
@@ -845,5 +991,183 @@ mod tests {
             matches!(&err, PricingConfigError::InertBackendCost { ids } if ids == "priced"),
             "got {err:?}",
         );
+    }
+
+    // The boot instant these promo tests place windows relative to. Fixed, so every refusal —
+    // including the already-closed-window one — is deterministic.
+    const NOW: u64 = 1_000;
+
+    #[test]
+    fn no_promo_vars_is_no_promotion() {
+        assert_eq!(select_promo(env(&[]), NOW), Ok(None));
+    }
+
+    #[test]
+    fn all_three_promo_vars_parse_to_a_config() {
+        // A window entirely in the future (a scheduled promo): valid, boots.
+        let got = select_promo(
+            env(&[
+                ("OBOLUS_PROMO_DISCOUNT_BPS", "2500"),
+                ("OBOLUS_PROMO_START", "2000"),
+                ("OBOLUS_PROMO_END", "3000"),
+            ]),
+            NOW,
+        );
+        assert_eq!(got, Ok(Some(PromoConfig { discount_bps: 2500, start: 2000, end: 3000 })));
+    }
+
+    #[test]
+    fn a_currently_open_window_is_accepted() {
+        // now (1000) sits inside [500, 1500): a promo live at boot.
+        let got = select_promo(
+            env(&[
+                ("OBOLUS_PROMO_DISCOUNT_BPS", "2500"),
+                ("OBOLUS_PROMO_START", "500"),
+                ("OBOLUS_PROMO_END", "1500"),
+            ]),
+            NOW,
+        );
+        assert_eq!(got, Ok(Some(PromoConfig { discount_bps: 2500, start: 500, end: 1500 })));
+    }
+
+    #[test]
+    fn a_partial_promo_config_is_refused_naming_what_is_missing() {
+        // Only the discount, no window — cannot describe a promotion, must not be silently dropped.
+        let err =
+            select_promo(env(&[("OBOLUS_PROMO_DISCOUNT_BPS", "2500")]), NOW).unwrap_err();
+        assert!(
+            matches!(&err, PromoConfigError::Incomplete { present, missing }
+                if present == "OBOLUS_PROMO_DISCOUNT_BPS"
+                    && missing == "OBOLUS_PROMO_START, OBOLUS_PROMO_END"),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn a_bad_discount_is_refused() {
+        for bad in ["2.5", "-1", "25%", "", "lots"] {
+            let err = select_promo(
+                env(&[
+                    ("OBOLUS_PROMO_DISCOUNT_BPS", bad),
+                    ("OBOLUS_PROMO_START", "2000"),
+                    ("OBOLUS_PROMO_END", "3000"),
+                ]),
+                NOW,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, PromoConfigError::BadDiscount { value } if value == bad),
+                "got {err:?} for {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_discount_is_refused() {
+        // A promo that discounts nothing is the base rate — inert config, refused like a zero cost.
+        let err = select_promo(
+            env(&[
+                ("OBOLUS_PROMO_DISCOUNT_BPS", "0"),
+                ("OBOLUS_PROMO_START", "2000"),
+                ("OBOLUS_PROMO_END", "3000"),
+            ]),
+            NOW,
+        )
+        .unwrap_err();
+        assert_eq!(err, PromoConfigError::ZeroDiscount);
+    }
+
+    #[test]
+    fn a_hundred_percent_or_more_discount_is_refused() {
+        // 10000 bps = 100% off = free, a separate rate; anything larger too.
+        for bad in ["10000", "10001", "50000"] {
+            let n: u32 = bad.parse().unwrap();
+            let err = select_promo(
+                env(&[
+                    ("OBOLUS_PROMO_DISCOUNT_BPS", bad),
+                    ("OBOLUS_PROMO_START", "2000"),
+                    ("OBOLUS_PROMO_END", "3000"),
+                ]),
+                NOW,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, PromoConfigError::DiscountTooLarge { value } if value == n),
+                "got {err:?} for {bad}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_window_bound_is_refused_naming_the_variable() {
+        let start_err = select_promo(
+            env(&[
+                ("OBOLUS_PROMO_DISCOUNT_BPS", "2500"),
+                ("OBOLUS_PROMO_START", "not-a-time"),
+                ("OBOLUS_PROMO_END", "3000"),
+            ]),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&start_err, PromoConfigError::BadTimestamp { var, value }
+                if *var == PROMO_START_VAR && value == "not-a-time"),
+            "got {start_err:?}",
+        );
+        let end_err = select_promo(
+            env(&[
+                ("OBOLUS_PROMO_DISCOUNT_BPS", "2500"),
+                ("OBOLUS_PROMO_START", "2000"),
+                ("OBOLUS_PROMO_END", "nope"),
+            ]),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&end_err, PromoConfigError::BadTimestamp { var, value }
+                if *var == PROMO_END_VAR && value == "nope"),
+            "got {end_err:?}",
+        );
+    }
+
+    #[test]
+    fn an_empty_or_inverted_window_is_refused() {
+        // start == end (empty) and start > end (inverted) both fail: a window that never opens.
+        for (start, end) in [("3000", "3000"), ("3000", "2000")] {
+            let err = select_promo(
+                env(&[
+                    ("OBOLUS_PROMO_DISCOUNT_BPS", "2500"),
+                    ("OBOLUS_PROMO_START", start),
+                    ("OBOLUS_PROMO_END", end),
+                ]),
+                NOW,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, PromoConfigError::EmptyWindow { .. }),
+                "got {err:?} for [{start}, {end})",
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_that_closed_before_boot_is_refused() {
+        // end at or before now (1000): the discount could never apply, yet the banner would
+        // advertise it. Both the exact boundary (end == now) and a past end refuse.
+        for end in ["1000", "500"] {
+            let err = select_promo(
+                env(&[
+                    ("OBOLUS_PROMO_DISCOUNT_BPS", "2500"),
+                    ("OBOLUS_PROMO_START", "100"),
+                    ("OBOLUS_PROMO_END", end),
+                ]),
+                NOW,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, PromoConfigError::AlreadyEnded { .. }),
+                "got {err:?} for end {end}",
+            );
+        }
     }
 }
