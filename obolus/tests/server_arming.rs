@@ -672,6 +672,70 @@ fn single_backend_cost_plus_without_a_cost_refuses_naming_the_sole_backend() {
 }
 
 #[test]
+fn a_promotional_discount_is_named_in_the_banner() {
+    // A valid promotion over the default (static) rate boots. The banner names the promotional rate
+    // and its parameters — the discount and the window — never a computed post-discount amount. The
+    // window [0, far-future) is open at boot, so `select_promo` admits it and the discount is live.
+    let run = run(&[
+        ("OBOLUS_PROMO_DISCOUNT_BPS", "2500"),
+        ("OBOLUS_PROMO_START", "0"),
+        ("OBOLUS_PROMO_END", "9999999999"),
+    ]);
+
+    run.must_have_got_past_startup();
+    run.must_say("pricing: promotional");
+    run.must_say("2500 bps off the rate above");
+    run.must_say("during [0, 9999999999)");
+}
+
+#[test]
+fn a_promotional_discount_composes_over_cost_plus_in_the_banner() {
+    // The promo is a modifier, not a rate of its own: the cost-plus rate line and the promotional
+    // line both appear in the same banner, the promo discounting whatever cost-plus quotes. This is
+    // the payoff of a percentage discount over a fixed amount — it layers over the money rate.
+    let run = run(&[
+        ("OBOLUS_PRICING", "cost-plus"),
+        ("OBOLUS_UPSTREAM_COST", "1000"),
+        ("OBOLUS_MARGIN_BPS", "2500"),
+        ("OBOLUS_PROMO_DISCOUNT_BPS", "2000"),
+        ("OBOLUS_PROMO_START", "0"),
+        ("OBOLUS_PROMO_END", "9999999999"),
+    ]);
+
+    run.must_have_got_past_startup();
+    run.must_say("pricing: cost-plus");
+    run.must_say("pricing: promotional");
+    run.must_say("2000 bps off the rate above");
+}
+
+#[test]
+fn a_partial_promotional_config_refuses_before_advertising_anything() {
+    // Only the discount, no window — a promotion cannot be described from it, and a config about to
+    // abort must never first advertise a price, like every other payment-config refusal.
+    let run = run(&[("OBOLUS_PROMO_DISCOUNT_BPS", "2500")]);
+
+    run.must_say("needs all of OBOLUS_PROMO_DISCOUNT_BPS");
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn a_promotional_window_that_already_closed_refuses_before_advertising_anything() {
+    // A window whose end is before now could never discount anything, yet its banner would advertise
+    // a promotion — the advertise-what-you-won't-charge trap. End "1" (1970) is always past. Refuses
+    // at boot, before advertising.
+    let run = run(&[
+        ("OBOLUS_PROMO_DISCOUNT_BPS", "2500"),
+        ("OBOLUS_PROMO_START", "0"),
+        ("OBOLUS_PROMO_END", "1"),
+    ]);
+
+    run.must_say("has already closed");
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
 fn the_backend_config_and_the_upstream_cost_at_once_refuse_to_start() {
     // The cost twin of the OBOLUS_UPSTREAM_URL supersession: OBOLUS_UPSTREAM_COST is the
     // single-backend cost, so alongside a file (where cost is per-entry) it would sit inert. Refused

@@ -258,8 +258,9 @@ These hold today; each is easy to break while improving something nearby.
 The near-term milestone is "someone can run this for money": the object-safe backend seam,
 structured multi-backend config, model-identity routing, the pricing seam, and minimal
 revenue/cost telemetry — all still stateless. The subsystem currently growing is **pricing**:
-per-backend cost-plus has landed (each backend declares its own cost; the margin stays
-gateway-wide), on the seam and registry already described; promotional/free rates and cross-asset
+per-backend cost-plus and a time-bounded promotional discount over it have landed (each backend
+declares its own cost, the margin stays gateway-wide, and a promotion is a percentage off during a
+window), on the seam and registry already described; a genuinely free rate and cross-asset
 (multi-chain) cost-plus are the remaining steps. See [`pricing.md`](pricing.md) for that design.
 
 Sequenced after the stateless core: an admin UX and the stateless→stateful transition,

@@ -439,7 +439,7 @@ mod tests {
     use crate::access::FakeTokenVerifier;
     use crate::backends::Backend;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
-    use crate::pricing::{CostPlus, FlatPrice};
+    use crate::pricing::{CostPlus, FlatPrice, Promotional, StaticPrice};
     use crate::upstream::{FakeUpstream, UpstreamCalls};
     use crate::arming::{check_arming, is_provably_testnet};
     use crate::x402::{PaymentPayload, SettlementReceipt, SCHEME_EXACT, X402_VERSION};
@@ -572,6 +572,30 @@ mod tests {
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["accepts"][0]["maxAmountRequired"], serde_json::json!("1250"));
+    }
+
+    #[tokio::test]
+    async fn a_promotional_rate_discounts_the_challenge() {
+        // The promo modifier reaching a real 402 through the seam — the analogue of the cost-plus
+        // challenge test above, and the coverage the per-rate house pattern requires. A determiner
+        // installed and quoting in isolation is not the same as one whose discounted amount actually
+        // lands in the advertised challenge; this asserts the latter. Promotional wraps the default
+        // StaticPrice (which quotes the armed "1000") with an open window [0, u64::MAX) so the
+        // discount is live, and 2500 bps off 1000 must quote 750 — not the armed amount, not the
+        // undiscounted base.
+        let (app, _) = app_priced_with(
+            FakeFacilitator::accepting(),
+            FakeUpstream::streaming(),
+            Arc::new(Promotional::new(2500, 0, u64::MAX, Arc::new(StaticPrice))),
+        );
+        let (status, _, body) = send(app, completion_request(None)).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["accepts"][0]["maxAmountRequired"], serde_json::json!("750"));
+        // The discount prices only the amount — the armed network and pay-to are untouched, as for
+        // every determiner.
+        assert_eq!(json["accepts"][0]["network"], serde_json::json!(FIXTURE_NETWORK));
+        assert_eq!(json["accepts"][0]["payTo"], serde_json::json!(FIXTURE_PAY_TO));
     }
 
     #[tokio::test]

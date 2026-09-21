@@ -23,6 +23,8 @@
 
 use crate::backends::Backend;
 use crate::x402::PaymentRequirements;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What a single quote is about: the model the request named (or `None`), the backend it routed to,
 /// and the advertised payment requirement being priced.
@@ -151,6 +153,92 @@ impl PriceDeterminer for CostPlus {
     }
 }
 
+/// A time-bounded promotional discount layered over a base rate.
+///
+/// A promotion is a percentage off for a while: during the `[start, end)` window (Unix seconds,
+/// `start` inclusive, `end` exclusive) the quote is the base rate's quote marked *down* by
+/// `discount_bps` basis points; outside the window the base rate applies unchanged.
+///
+/// It discounts a *percentage*, deliberately, not a fixed atomic amount. A percentage is
+/// asset-agnostic, so the same promo is correct across payment options whose assets have different
+/// decimals — where one fixed atomic number would mean two different real prices — and it composes
+/// over any base rate. So `promotional` is a *modifier*, not a rate of its own: `OBOLUS_PRICING`
+/// still selects the base (`static` or `cost-plus`) and the promo wraps whatever that produced.
+///
+/// The discounted quote is `base * (10000 - discount_bps) / 10000`, floored to whole atomic units —
+/// the same direction as the [`CostPlus`] markup floor, rounding toward the payer by under one unit.
+/// The config door refuses `discount_bps >= 10000` ([`crate::config`]): 100% off is a free rate,
+/// which drives verify/settle differently and is tracked separately. But the floor alone can still
+/// reach zero on a *payable* base — a deep (sub-100%) discount on a small amount — so `quote` clamps
+/// a floored-to-zero result back to one atomic unit whenever the base was payable: a promotion never
+/// quotes zero of its own accord, and never slips into the free rate's settle path by rounding. A
+/// base that was already zero stays zero. The arithmetic saturates throughout, so `quote` is total
+/// even for a `discount_bps >= 10000` that reached this determiner past the config door.
+pub struct Promotional {
+    discount_bps: u32,
+    start: u64,
+    end: u64,
+    /// The rate the discount is taken off — the determiner `OBOLUS_PRICING` selected.
+    base: Arc<dyn PriceDeterminer>,
+    /// Reads the current Unix time in seconds, per quote. Injected so tests can pin "now" and probe
+    /// the window boundary exactly; production reads the wall clock. Kept off [`PriceContext`] so the
+    /// seam signature — and every other determiner — is untouched by promotional's need for a clock.
+    now: Box<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl Promotional {
+    /// A promotion of `discount_bps` basis points off `base`, active during `[start, end)` (Unix
+    /// seconds). Reads the wall clock per quote. The config door guarantees `discount_bps < 10000`
+    /// and `start < end` before this is constructed.
+    pub fn new(discount_bps: u32, start: u64, end: u64, base: Arc<dyn PriceDeterminer>) -> Self {
+        Self {
+            discount_bps,
+            start,
+            end,
+            base,
+            // Before the epoch is impossible for a real clock; if it somehow reads so, `0` sorts
+            // before any sane window start, so the base rate applies — a clock fault never invents a
+            // discount.
+            now: Box::new(|| {
+                SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+            }),
+        }
+    }
+}
+
+impl PriceDeterminer for Promotional {
+    fn quote(&self, ctx: PriceContext<'_>) -> u128 {
+        // The base rate prices first; the promo only ever marks its result down. Computed before the
+        // window check so a per-backend or per-model base still sees every field it keys on.
+        let base = self.base.quote(ctx);
+        let now = (self.now)();
+        if self.start <= now && now < self.end {
+            // `discount_bps < 10000` on the configured path, so `kept` is in [1, 10000] and the
+            // discounted quote never exceeds `base`. `saturating_sub` keeps `quote` total for a
+            // caller that bypassed the config door: a `discount_bps >= 10000` there yields `kept` 0
+            // rather than an underflow panic on the paying path.
+            let kept = BPS_PER_WHOLE.saturating_sub(self.discount_bps as u128);
+            let discounted = base.saturating_mul(kept) / BPS_PER_WHOLE;
+            // A promotion never turns a *payable* request free. The floor above reaches zero for a
+            // deep discount on a small base — `1000 * 5 / 10000 = 0` at 99.95% off, and 99.95% is a
+            // discount the config door admits (it refuses only `>= 100%`) — and for a
+            // `discount_bps >= 10000` that reached this determiner past the door. Zero is the *free*
+            // rate's amount, and free drives a settle path this rate deliberately does not exercise
+            // (#67); a promo sliding into it by rounding would cross that boundary silently and
+            // unpriced. So a base that was payable but floored to zero quotes one atomic unit — the
+            // fail-toward-charging direction, matching the `u128::MAX` sentinels elsewhere in this
+            // file. A base already zero stays zero: that is the base rate's decision, not the promo's.
+            if base > 0 && discounted == 0 {
+                1
+            } else {
+                discounted
+            }
+        } else {
+            base
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +363,119 @@ mod tests {
         // the unpayable maximum, never zero (which would give the work away).
         let backend = backend(); // no cost declared
         assert_eq!(CostPlus::new(2500).quote(ctx(&backend, &requirement("1"))), u128::MAX);
+    }
+
+    /// A promotion whose clock is pinned to `now`, so a test can place "now" exactly relative to the
+    /// window. Sets the private `now` field directly (a child module reaches its parent's privates),
+    /// which is why the production struct needs no test-only constructor.
+    fn promo_at(
+        now: u64,
+        discount_bps: u32,
+        start: u64,
+        end: u64,
+        base: Arc<dyn PriceDeterminer>,
+    ) -> Promotional {
+        Promotional { discount_bps, start, end, base, now: Box::new(move || now) }
+    }
+
+    fn flat(amount: u128) -> Arc<dyn PriceDeterminer> {
+        Arc::new(FlatPrice::new(amount))
+    }
+
+    #[test]
+    fn promotional_discounts_the_base_inside_the_window() {
+        // 25% off a flat 1000 → 750, with now (150) inside [100, 200).
+        let backend = backend();
+        let promo = promo_at(150, 2500, 100, 200, flat(1000));
+        assert_eq!(promo.quote(ctx(&backend, &requirement("1"))), 750);
+    }
+
+    #[test]
+    fn promotional_window_start_is_inclusive_and_end_is_exclusive() {
+        // The boundary semantics `[start, end)` promises: at start the discount is on, at end it is
+        // off. Charging the discounted price for one extra second past `end`, or withholding it at
+        // the first instant of the promo, would both be wrong.
+        let backend = backend();
+        let at_start = promo_at(100, 2500, 100, 200, flat(1000));
+        let at_end = promo_at(200, 2500, 100, 200, flat(1000));
+        assert_eq!(at_start.quote(ctx(&backend, &requirement("1"))), 750);
+        assert_eq!(at_end.quote(ctx(&backend, &requirement("1"))), 1000);
+    }
+
+    #[test]
+    fn promotional_leaves_the_base_untouched_outside_the_window() {
+        // Before the window opens and after it closes, the base rate is quoted with no discount.
+        let backend = backend();
+        let before = promo_at(99, 2500, 100, 200, flat(1000));
+        let after = promo_at(250, 2500, 100, 200, flat(1000));
+        assert_eq!(before.quote(ctx(&backend, &requirement("1"))), 1000);
+        assert_eq!(after.quote(ctx(&backend, &requirement("1"))), 1000);
+    }
+
+    #[test]
+    fn promotional_composes_over_cost_plus() {
+        // The promo discounts whatever the base produced, not the requirement's own amount: cost-plus
+        // quotes 1250 (cost 1000 + 25% margin), then 20% off inside the window → 1000. This is the
+        // point of a percentage modifier — it layers over the money rate, which a fixed promo amount
+        // could not do across assets.
+        let backend = backend().with_cost(1000);
+        let inside = promo_at(150, 2000, 100, 200, Arc::new(CostPlus::new(2500)));
+        let outside = promo_at(250, 2000, 100, 200, Arc::new(CostPlus::new(2500)));
+        assert_eq!(inside.quote(ctx(&backend, &requirement("1"))), 1000);
+        assert_eq!(outside.quote(ctx(&backend, &requirement("1"))), 1250);
+    }
+
+    #[test]
+    fn promotional_floors_a_sub_unit_discount_toward_the_payer() {
+        // base 3, 25% off = 2.25, floored to 2 — the same rounding direction as the cost-plus markup
+        // floor: the payer gets the lower whole unit, never overcharged, losing under one unit.
+        let backend = backend();
+        let promo = promo_at(150, 2500, 100, 200, flat(3));
+        assert_eq!(promo.quote(ctx(&backend, &requirement("1"))), 2);
+    }
+
+    #[test]
+    fn promotional_never_floors_a_payable_base_to_zero() {
+        // A deep but sub-100% discount on a small base: 99.95% off (9995 bps, which the config door
+        // admits — it refuses only >= 10000) of 1000 is `1000 * 5 / 10000 = 0` by the raw floor. A
+        // promotion must not quote zero and slide into the free rate's settle path, so the payable
+        // base floors to one atomic unit, not zero.
+        let backend = backend();
+        let promo = promo_at(150, 9995, 100, 200, flat(1000));
+        assert_eq!(promo.quote(ctx(&backend, &requirement("1"))), 1);
+    }
+
+    #[test]
+    fn promotional_leaves_an_already_free_base_at_zero() {
+        // The clamp lifts only a base that *was* payable. A base that already quotes zero is the
+        // base rate's own decision (a free static amount, say) and passes through untouched — the
+        // promo does not invent a charge where the base made none.
+        let backend = backend();
+        let promo = promo_at(150, 2500, 100, 200, flat(0));
+        assert_eq!(promo.quote(ctx(&backend, &requirement("1"))), 0);
+    }
+
+    #[test]
+    fn promotional_bypassing_the_config_door_fails_toward_charging_not_free() {
+        // The config door refuses `discount_bps >= 10000`, but the determiner must stay total and
+        // fail-closed if one reaches it anyway (a future unvalidated caller). 100%-off of a payable
+        // base yields `kept == 0` → a raw zero, clamped to one atomic unit: the fail-toward-charging
+        // direction, never a silent giveaway.
+        let backend = backend();
+        let promo = promo_at(150, 10_000, 100, 200, flat(1000));
+        assert_eq!(promo.quote(ctx(&backend, &requirement("1"))), 1);
+    }
+
+    #[test]
+    fn promotional_new_reads_the_wall_clock() {
+        // `new` (not the pinned-clock helper) must consult the real clock. A window that ended in
+        // 1970 never covers now, so the base stands; a window open until u64::MAX always covers now,
+        // so the discount applies. Together they prove the production clock is wired, without pinning
+        // it — the one test that exercises the `SystemTime` path.
+        let backend = backend();
+        let ended = Promotional::new(2500, 0, 1, flat(1000));
+        let open = Promotional::new(2500, 0, u64::MAX, flat(1000));
+        assert_eq!(ended.quote(ctx(&backend, &requirement("1"))), 1000);
+        assert_eq!(open.quote(ctx(&backend, &requirement("1"))), 750);
     }
 }

@@ -21,7 +21,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use obolus::access::{
     parse_token_keys, PublicKeyTokenVerifier, TokenKeyEntry, TokenPath, SINGLE_KEY_VAR,
@@ -30,13 +30,14 @@ use obolus::arming::{
     check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
-    parse_accepts, require_backend_costs, select_pricing, superseded_single_chain_vars,
-    validated_option, EntryDefect, EntryField, PricingChoice, SharedOffer,
+    parse_accepts, require_backend_costs, select_pricing, select_promo,
+    superseded_single_chain_vars, validated_option, EntryDefect, EntryField, PricingChoice,
+    SharedOffer,
 };
 use obolus::backends::{load_backends, Backends};
 use obolus::facilitator::DelegatedFacilitator;
 use obolus::gateway::{router, Access, Gateway};
-use obolus::pricing::CostPlus;
+use obolus::pricing::{CostPlus, PriceDeterminer, Promotional, StaticPrice};
 use obolus::x402::PaymentRequirements;
 
 /// Deliberately not 8402, which x402 client-side tooling tends to bind.
@@ -332,6 +333,15 @@ async fn main() -> anyhow::Result<()> {
     // refusals inside can fire on at most one of them.
     let pricing = select_pricing(|k| std::env::var(k).ok())?;
 
+    // A promotional discount, if one is configured, layered over whichever rate `select_pricing`
+    // chose (see [`obolus::pricing::Promotional`]). Parsed here, beside the rate and before the
+    // banner, for the same reason the rate is: a promotional window this process will refuse — one
+    // that discounts nothing, everything, or has already closed — must never first be advertised.
+    // The boot instant is read once and passed in, so the already-closed-window refusal is a pure
+    // function of its inputs (the config door reads no clock of its own).
+    let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let promo = select_promo(|k| std::env::var(k).ok(), now_unix)?;
+
     // Land the single-backend cost on the sole backend, and check the whole registry against the
     // rate — both before the `Arc` seal, the arming guard, and the banner, for the same reason
     // `select_pricing` sits here: a pricing configuration this process will refuse must never first
@@ -410,17 +420,25 @@ async fn main() -> anyhow::Result<()> {
     // is mutated after the guard ran, so they cannot drift.
     let gateway = Gateway::new(facilitator, backends.clone(), armed_requirements)
         .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
-    // Install the selected rate. Static is the default the constructor already holds, so only
-    // cost-plus swaps a determiner in. The arming guard's witness was consumed by `new` above, so a
-    // determiner cannot alter which networks are advertised — it prices the amount and nothing else.
-    let gateway = match pricing {
-        PricingChoice::Static => gateway,
-        PricingChoice::CostPlus { margin_bps, .. } => {
-            // The cost is not here: it lives on each backend and the determiner reads it per
-            // request (see `CostPlus`). The margin is the gateway-wide half.
-            gateway.with_price_determiner(Arc::new(CostPlus::new(margin_bps)))
-        }
+    // Install the selected rate, wrapped in the promotional discount if one is configured. The
+    // arming guard's witness was consumed by `new` above, so no determiner — base or wrapped — can
+    // alter which networks are advertised; it prices the amount and nothing else.
+    //
+    // The base is built explicitly even for static (which the constructor already defaults to) so a
+    // promotion has a determiner to wrap uniformly: `Promotional` discounts whatever its base quotes,
+    // static or cost-plus alike. Installing `StaticPrice` explicitly is the same behaviour as the
+    // default.
+    let base: Arc<dyn PriceDeterminer> = match pricing {
+        PricingChoice::Static => Arc::new(StaticPrice),
+        // The cost is not here: it lives on each backend and the determiner reads it per request
+        // (see `CostPlus`). The margin is the gateway-wide half.
+        PricingChoice::CostPlus { margin_bps, .. } => Arc::new(CostPlus::new(margin_bps)),
     };
+    let determiner: Arc<dyn PriceDeterminer> = match promo {
+        None => base,
+        Some(p) => Arc::new(Promotional::new(p.discount_bps, p.start, p.end, base)),
+    };
+    let gateway = gateway.with_price_determiner(determiner);
 
     // "starting on", not "listening on" — the bind is ~100 lines below and every check between here
     // and there can still refuse. A posture line an operator trusts must be true *where it is
@@ -487,6 +505,17 @@ async fn main() -> anyhow::Result<()> {
             "obolus: pricing: cost-plus — every request quoted at its backend's declared cost \
              + {margin_bps} bps margin (each backend's cost is on its line above)."
         ),
+    }
+    // The promotional line, when a discount is configured. Its parameters, like the rate line: the
+    // discount and the window bounds, never a computed post-discount amount (that is per-request and,
+    // over cost-plus, per-backend). Printed only inside the window's lifetime — `select_promo`
+    // already refused a window that closed before boot — so this never advertises a spent promotion.
+    if let Some(p) = promo {
+        eprintln!(
+            "obolus: pricing: promotional — {} bps off the rate above during [{}, {}) (Unix \
+             seconds); outside that window the rate above applies.",
+            p.discount_bps, p.start, p.end
+        );
     }
     eprintln!("obolus: advertising {} payment option(s):", requirements.len());
     for r in &requirements {
