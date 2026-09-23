@@ -53,6 +53,7 @@ use crate::access::{bearer_token, TokenPath};
 use crate::backends::{Backend, Backends, RouteError};
 use crate::facilitator::{Facilitator, FacilitatorError};
 use crate::pricing::{PriceContext, PriceDeterminer, StaticPrice};
+use crate::telemetry::{AccessPath, NoTelemetry, Offer, Outcome, Recorder, Telemetry, Trace};
 use crate::upstream::{Upstream, UpstreamResponse};
 use crate::arming::ArmedRequirements;
 use crate::x402::{self, PaymentPayload, PaymentRequired, PaymentRequirements, SettlementReceipt};
@@ -98,6 +99,9 @@ pub struct Gateway<F: Facilitator> {
     /// [`Gateway::with_price_determiner`] installs a configured rate. Only ever prices the *amount* —
     /// the option set it prices is `requirements`, so it cannot alter which networks are advertised.
     price: Arc<dyn PriceDeterminer>,
+    /// Where each request's [`crate::telemetry::RequestEvent`] goes. Defaults to [`NoTelemetry`];
+    /// [`Gateway::with_telemetry`] installs a sink.
+    telemetry: Arc<dyn Telemetry>,
 }
 
 impl<F: Facilitator> Gateway<F> {
@@ -137,7 +141,20 @@ impl<F: Facilitator> Gateway<F> {
                 }
             }
         }
-        Ok(Self { facilitator, backends, requirements, price: Arc::new(StaticPrice) })
+        Ok(Self {
+            facilitator,
+            backends,
+            requirements,
+            price: Arc::new(StaticPrice),
+            telemetry: Arc::new(NoTelemetry),
+        })
+    }
+
+    /// Install a telemetry sink in place of the default [`NoTelemetry`]. Every request that reaches
+    /// the completion handler is then recorded to it exactly once — see [`crate::telemetry`].
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn Telemetry>) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// Install a price determiner in place of the default [`StaticPrice`]. `main` calls this to wire
@@ -260,23 +277,31 @@ fn route_failure(err: RouteError) -> Response {
 /// [`Gateway::priced`]) — built once by [`completion`] on the paying path and used for the
 /// challenge, the paid-option match, and settlement alike, so a client that retries is quoted the
 /// same price it first saw and is charged exactly that.
+///
+/// Returns the response together with how the request ended, so that every exit has to name an
+/// [`Outcome`] — the compiler, not a reviewer, holds "each request is recorded as something". The
+/// facts gathered on the way (which option was paid, whether the upstream ran) go into `trace`.
 async fn paid_completion<F: Facilitator>(
     gateway: Arc<Gateway<F>>,
     upstream: Arc<dyn Upstream>,
     priced: Vec<PaymentRequirements>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response {
+    trace: &mut Trace,
+) -> (Response, Outcome) {
+    trace.offers = priced.iter().map(Offer::from).collect();
+
     let Some(raw) = headers.get(x402::HEADER_PAYMENT) else {
-        return challenge(&priced, None);
+        return (challenge(&priced, None), Outcome::PaymentRequired);
     };
     let Ok(raw) = raw.to_str() else {
-        return challenge(&priced, Some(format!("{} must be ASCII base64", x402::HEADER_PAYMENT)));
+        let error = format!("{} must be ASCII base64", x402::HEADER_PAYMENT);
+        return (challenge(&priced, Some(error)), Outcome::PaymentMalformed);
     };
 
     let payment = match x402::decode_payment(raw) {
         Ok(payment) => payment,
-        Err(err) => return challenge(&priced, Some(err.to_string())),
+        Err(err) => return (challenge(&priced, Some(err.to_string())), Outcome::PaymentMalformed),
     };
 
     // Our own policy check, not the facilitator's: which advertised option did the client pay? None
@@ -284,45 +309,62 @@ async fn paid_completion<F: Facilitator>(
     // the only place the paid option is chosen, and the *matched* `requirements` — not "the"
     // requirements — is what we verify and settle against.
     let Some(requirements) = accepted_for(&priced, &payment) else {
-        return challenge(&priced, Some(format!(
+        let error = format!(
             "payment offers {}/{}, which is not one of the payment options this resource accepts",
             payment.scheme, payment.network,
-        )));
+        );
+        return (challenge(&priced, Some(error)), Outcome::OptionUnmatched);
     };
+    trace.paid = Some(Offer::from(requirements));
 
     match gateway.facilitator.verify(&payment, requirements).await {
         Ok(()) => {}
-        Err(FacilitatorError::Rejected(reason)) => return challenge(&priced, Some(reason)),
-        Err(err @ FacilitatorError::Unavailable(_)) => return upstream_failure(err.to_string()),
+        Err(FacilitatorError::Rejected(reason)) => {
+            return (challenge(&priced, Some(reason)), Outcome::VerifyRejected)
+        }
+        Err(err @ FacilitatorError::Unavailable(_)) => {
+            return (upstream_failure(err.to_string()), Outcome::VerifyUnavailable)
+        }
     }
 
     // Payment is good. Commit the upstream BEFORE charging.
+    trace.upstream_invoked = true;
     let response = match upstream.forward(body).await {
         Ok(response) => response,
-        Err(err) => return upstream_failure(err.to_string()),
+        Err(err) => return (upstream_failure(err.to_string()), Outcome::UpstreamUnavailable),
     };
+    trace.upstream_status = Some(response.status.as_u16());
     if !response.status.is_success() {
         // The upstream refused: charge nothing, and hand its answer back the same way every other
         // response here is built. Constructing it as `(status, body)` instead drops the upstream's
         // content type, so an identical `503 {"error":..}` reaches a paying client untyped and a
         // token-holder as `application/json` — a divergence between the paid and unpaid paths on
         // the very axis this module exists to close.
-        return proxy_response(response, None);
+        return (proxy_response(response, None), Outcome::UpstreamRefused);
     }
 
+    trace.settle_attempted = true;
     let receipt = match gateway.facilitator.settle(&payment, requirements).await {
         Ok(receipt) if receipt.success => receipt,
         // A receipt that reports its own failure is a refusal, not a success. Serving the
         // response on the strength of `Ok(_)` alone would give the work away for free.
-        Ok(_) => return challenge(&priced, Some("settlement did not complete".to_string())),
+        Ok(_) => {
+            let error = "settlement did not complete".to_string();
+            return (challenge(&priced, Some(error)), Outcome::SettleRejected);
+        }
         // The same split as verify. Returning 502 for a payment the facilitator actually
         // evaluated and refused would be both a lie and the more dangerous lie: 502 reads as
         // transient, so clients retry it harder than they retry a 402.
-        Err(FacilitatorError::Rejected(reason)) => return challenge(&priced, Some(reason)),
-        Err(err @ FacilitatorError::Unavailable(_)) => return upstream_failure(err.to_string()),
+        Err(FacilitatorError::Rejected(reason)) => {
+            return (challenge(&priced, Some(reason)), Outcome::SettleRejected)
+        }
+        Err(err @ FacilitatorError::Unavailable(_)) => {
+            return (upstream_failure(err.to_string()), Outcome::SettleUnavailable)
+        }
     };
+    trace.transaction = receipt.transaction.clone();
 
-    proxy_response(response, Some(&receipt))
+    (proxy_response(response, Some(&receipt)), Outcome::Settled)
 }
 
 /// Turn an upstream response into the client's, attaching a receipt only if the client paid.
@@ -380,30 +422,61 @@ impl<F: Facilitator> Access<F> {
     }
 }
 
-/// Serve a caller we recognise; charge one we do not.
+/// Serve a caller we recognise; charge one we do not — and record what happened.
+///
+/// The route itself only records: [`serve`] decides the response and the outcome, and the
+/// [`Recorder`] emits the request's one event when it is dropped. That drop happens here on a
+/// finished request, and wherever the future is suspended on one the server cancels because the
+/// client went away — so a request is recorded exactly once either way.
 async fn completion<F: Facilitator>(
     State(access): State<Arc<Access<F>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let mut recorder = Recorder::new(access.gateway.telemetry.clone());
+    let (response, outcome) = serve(&access, headers, body, &mut recorder.trace).await;
+    recorder.complete(outcome);
+    response
+}
+
+async fn serve<F: Facilitator>(
+    access: &Arc<Access<F>>,
+    headers: HeaderMap,
+    body: Bytes,
+    trace: &mut Trace,
+) -> (Response, Outcome) {
     // Route before anything else. An unroutable request is refused here — before the token check
     // and before any payment — so it is never charged (Obolus has no refund path), and both the
     // recognised-caller path and the paying path forward to the same backend the model resolves to.
     let model = requested_model(&body);
+    trace.model = model.clone();
     let backend = match access.gateway.backends.route(model.as_deref()) {
         Ok(backend) => backend,
-        Err(err) => return route_failure(err),
+        Err(err) => return (route_failure(err), Outcome::Unroutable),
     };
+    trace.backend = Some(backend.id.clone());
+    trace.backend_cost = backend.cost;
     let upstream = backend.upstream();
 
     if let (Some(path), Some(token)) = (&access.token, bearer_token(&headers)) {
         match path.verify(token) {
             Ok(()) => {
+                trace.access = Some(AccessPath::Token);
+                trace.upstream_invoked = true;
                 let response = match upstream.forward(body).await {
                     Ok(response) => response,
-                    Err(err) => return upstream_failure(err.to_string()),
+                    Err(err) => {
+                        return (upstream_failure(err.to_string()), Outcome::UpstreamUnavailable)
+                    }
                 };
-                return proxy_response(response, None);
+                trace.upstream_status = Some(response.status.as_u16());
+                // Proxied either way; the outcome only says which it was.
+                let outcome = if response.status.is_success() {
+                    Outcome::Served
+                } else {
+                    Outcome::UpstreamRefused
+                };
+                return (proxy_response(response, None), outcome);
             }
             // Every failure lands here, including a verifier that could not evaluate the token at
             // all, and every one of them continues to the paying path. The response then says
@@ -416,8 +489,9 @@ async fn completion<F: Facilitator>(
     // calling the determiner, so a recognised caller's request cannot reach `quote` and a determiner
     // fault can never turn a free, honoured request into a 500. The determined prices are quoted in
     // the challenge and charged at settlement (see [`paid_completion`]).
+    trace.access = Some(AccessPath::Payment);
     let priced = access.gateway.priced(model.as_deref(), backend);
-    paid_completion(access.gateway.clone(), upstream, priced, headers, body).await
+    paid_completion(access.gateway.clone(), upstream, priced, headers, body, trace).await
 }
 
 /// Wire an access surface into an OpenAI-compatible route plus an ungated health check.
@@ -440,6 +514,7 @@ mod tests {
     use crate::backends::Backend;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
     use crate::pricing::{CostPlus, FlatPrice, Promotional, StaticPrice};
+    use crate::telemetry::{FakeTelemetry, RequestEvent};
     use crate::upstream::{FakeUpstream, UpstreamCalls};
     use crate::arming::{check_arming, is_provably_testnet};
     use crate::x402::{PaymentPayload, SettlementReceipt, SCHEME_EXACT, X402_VERSION};
@@ -1367,5 +1442,404 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(a_calls.count() + b_calls.count(), 0, "no backend was reached");
         assert_eq!(calls.verifies(), 0, "and nothing was charged");
+    }
+
+    // ---- telemetry (#58) ----
+
+    /// The declared cost of the backend every telemetry test routes to — distinct from the armed
+    /// amount (1000), so a test can tell cost from revenue in the record.
+    const TEST_COST: u128 = 800;
+
+    /// A gateway over one costed catch-all backend, recording to a fake sink, with the token path on
+    /// when `verifier` is given.
+    fn app_recording(
+        facilitator: FakeFacilitator,
+        upstream: FakeUpstream,
+        verifier: Option<FakeTokenVerifier>,
+    ) -> (Router, FakeTelemetry) {
+        let sink = FakeTelemetry::default();
+        let backend =
+            Backend::for_test("default", vec![], None, Arc::new(upstream)).with_cost(TEST_COST);
+        let gateway = Gateway::new(
+            facilitator,
+            Arc::new(Backends::from_parts(vec![backend])),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
+        .with_telemetry(Arc::new(sink.clone()));
+        let token = verifier.map(|verifier| TokenPath::new(Arc::new(verifier)));
+        (router(Access::new(gateway, token)), sink)
+    }
+
+    /// Send `request` and return the one event it produced. [`FakeTelemetry::only`] fails the test
+    /// on zero or several, so every test below also checks "recorded exactly once".
+    async fn recorded(
+        facilitator: FakeFacilitator,
+        upstream: FakeUpstream,
+        request: Request<Body>,
+    ) -> RequestEvent {
+        let (app, sink) = app_recording(facilitator, upstream, None);
+        send(app, request).await;
+        sink.only()
+    }
+
+    fn paid_request() -> Request<Body> {
+        completion_request(Some(&x402::encode_payment(&payment())))
+    }
+
+    fn quoted() -> Offer {
+        Offer::from(&requirements())
+    }
+
+    #[tokio::test]
+    async fn a_settled_request_records_revenue_cost_and_the_transaction() {
+        let event =
+            recorded(FakeFacilitator::accepting(), FakeUpstream::streaming(), paid_request()).await;
+        assert_eq!(
+            event,
+            RequestEvent {
+                ts_ms: event.ts_ms,
+                outcome: Outcome::Settled,
+                access: Some(AccessPath::Payment),
+                backend: Some("default".to_string()),
+                model: Some("test".to_string()),
+                offers: vec![quoted()],
+                paid: Some(quoted()),
+                upstream_invoked: true,
+                upstream_status: Some(200),
+                cost: Some(TEST_COST.to_string()),
+                revenue: Some("1000".to_string()),
+                transaction: Some("0xTEST-TX-HASH-NOT-A-REAL-TRANSACTION".to_string()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_recorded_offer_is_the_determined_price_not_the_armed_amount() {
+        let sink = FakeTelemetry::default();
+        let gateway = Gateway::new(
+            FakeFacilitator::accepting(),
+            one_backend(FakeUpstream::streaming()),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
+        .with_price_determiner(Arc::new(FlatPrice::new(777)))
+        .with_telemetry(Arc::new(sink.clone()));
+        send(router(Access::new(gateway, None)), paid_request()).await;
+        let event = sink.only();
+        assert_eq!(event.offers[0].amount, "777");
+        assert_eq!(event.revenue.as_deref(), Some("777"), "revenue is what settlement charged");
+    }
+
+    #[tokio::test]
+    async fn an_unpaid_request_records_the_quote_and_costs_nothing() {
+        let event =
+            recorded(FakeFacilitator::accepting(), FakeUpstream::streaming(), completion_request(None))
+                .await;
+        assert_eq!(event.outcome, Outcome::PaymentRequired);
+        assert_eq!(event.offers, vec![quoted()], "the price quoted is recorded");
+        assert_eq!(event.paid, None);
+        assert!(!event.upstream_invoked);
+        assert_eq!(event.cost.as_deref(), Some("0"));
+        assert_eq!(event.revenue.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_payment_is_recorded_as_such() {
+        let request = completion_request(Some("not-base64!!"));
+        let event = recorded(FakeFacilitator::accepting(), FakeUpstream::streaming(), request).await;
+        assert_eq!(event.outcome, Outcome::PaymentMalformed);
+        assert!(!event.upstream_invoked);
+    }
+
+    #[tokio::test]
+    async fn a_payment_for_an_unoffered_option_is_recorded_as_unmatched() {
+        let elsewhere = PaymentPayload { network: "some-other-network".to_string(), ..payment() };
+        let request = completion_request(Some(&x402::encode_payment(&elsewhere)));
+        let event = recorded(FakeFacilitator::accepting(), FakeUpstream::streaming(), request).await;
+        assert_eq!(event.outcome, Outcome::OptionUnmatched);
+        assert_eq!(event.paid, None);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_verify_records_the_paid_option_but_no_cost() {
+        let event =
+            recorded(FakeFacilitator::rejecting("bad sig"), FakeUpstream::streaming(), paid_request())
+                .await;
+        assert_eq!(event.outcome, Outcome::VerifyRejected);
+        assert_eq!(event.paid, Some(quoted()));
+        assert!(!event.upstream_invoked);
+        assert_eq!(event.cost.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_verify_is_recorded_as_such() {
+        let facilitator = FakeFacilitator::unavailable("connection refused");
+        let event = recorded(facilitator, FakeUpstream::streaming(), paid_request()).await;
+        assert_eq!(event.outcome, Outcome::VerifyUnavailable);
+        assert!(!event.upstream_invoked);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_upstream_still_costs_what_was_declared() {
+        // The forward was attempted; whether the backend billed for it is not knowable from here, so
+        // the declared cost is charged against the request.
+        let upstream = FakeUpstream::unreachable("connection refused");
+        let event = recorded(FakeFacilitator::accepting(), upstream, paid_request()).await;
+        assert_eq!(event.outcome, Outcome::UpstreamUnavailable);
+        assert!(event.upstream_invoked);
+        assert_eq!(event.upstream_status, None);
+        assert_eq!(event.cost, Some(TEST_COST.to_string()));
+        assert_eq!(event.revenue.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn a_refusing_upstream_is_recorded_with_its_status() {
+        let upstream = FakeUpstream::refusing(StatusCode::SERVICE_UNAVAILABLE);
+        let event = recorded(FakeFacilitator::accepting(), upstream, paid_request()).await;
+        assert_eq!(event.outcome, Outcome::UpstreamRefused);
+        assert_eq!(event.upstream_status, Some(503));
+        assert_eq!(event.revenue.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_settlement_records_the_cost_with_no_revenue() {
+        // The loss case: the backend served, the charge did not land.
+        let facilitator = FakeFacilitator::rejecting_settlement("insufficient funds");
+        let event = recorded(facilitator, FakeUpstream::streaming(), paid_request()).await;
+        assert_eq!(event.outcome, Outcome::SettleRejected);
+        assert_eq!(event.cost, Some(TEST_COST.to_string()));
+        assert_eq!(event.revenue.as_deref(), Some("0"));
+        assert_eq!(event.transaction, None);
+    }
+
+    #[tokio::test]
+    async fn an_unsuccessful_receipt_is_recorded_as_a_rejected_settlement() {
+        let facilitator = FakeFacilitator::returning_unsuccessful_receipt();
+        let event = recorded(facilitator, FakeUpstream::streaming(), paid_request()).await;
+        assert_eq!(event.outcome, Outcome::SettleRejected);
+        assert_eq!(event.revenue.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_settlement_leaves_revenue_unknown() {
+        let facilitator = FakeFacilitator::failing_settlement("timed out");
+        let event = recorded(facilitator, FakeUpstream::streaming(), paid_request()).await;
+        assert_eq!(event.outcome, Outcome::SettleUnavailable);
+        assert_eq!(event.revenue, None);
+        assert_eq!(event.cost, Some(TEST_COST.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_midstream_failure_after_settlement_is_still_recorded_as_settled() {
+        // The same known gap `a_midstream_failure_after_settlement_is_a_known_gap` pins for the
+        // response: the charge landed at head time, and the record says what the ledger says.
+        let (app, sink) =
+            app_recording(FakeFacilitator::accepting(), FakeUpstream::failing_midstream(), None);
+        send_partial(app, paid_request()).await;
+        assert_eq!(sink.only().outcome, Outcome::Settled);
+    }
+
+    #[tokio::test]
+    async fn an_unroutable_request_is_recorded_with_its_model_and_no_backend() {
+        let sink = FakeTelemetry::default();
+        let backends = Arc::new(Backends::from_parts(vec![Backend::for_test(
+            "a",
+            vec!["llama3"],
+            None,
+            Arc::new(FakeUpstream::streaming()),
+        )]));
+        let gateway = Gateway::new(FakeFacilitator::accepting(), backends, armed(vec![requirements()]))
+            .unwrap()
+            .with_telemetry(Arc::new(sink.clone()));
+        send(router(Access::new(gateway, None)), paid_request_for_model("gpt-4")).await;
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::Unroutable);
+        assert_eq!(event.access, None);
+        assert_eq!(event.backend, None);
+        assert_eq!(event.model.as_deref(), Some("gpt-4"));
+        assert!(event.offers.is_empty(), "nothing was quoted");
+        assert_eq!(event.cost.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn a_token_request_costs_but_earns_nothing() {
+        let (app, sink) = app_recording(
+            FakeFacilitator::accepting(),
+            FakeUpstream::streaming(),
+            Some(FakeTokenVerifier::honouring(HONOURED)),
+        );
+        send(app, tokened_request(HONOURED)).await;
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::Served);
+        assert_eq!(event.access, Some(AccessPath::Token));
+        assert!(event.offers.is_empty(), "the token path is never priced");
+        assert_eq!(event.cost, Some(TEST_COST.to_string()));
+        assert_eq!(event.revenue.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn a_token_request_to_an_unreachable_upstream_is_recorded_on_the_token_path() {
+        let (app, sink) = app_recording(
+            FakeFacilitator::accepting(),
+            FakeUpstream::unreachable("connection refused"),
+            Some(FakeTokenVerifier::honouring(HONOURED)),
+        );
+        send(app, tokened_request(HONOURED)).await;
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::UpstreamUnavailable);
+        assert_eq!(event.access, Some(AccessPath::Token));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_recorded_once_on_the_paying_path() {
+        let (app, sink) = app_recording(
+            FakeFacilitator::accepting(),
+            FakeUpstream::streaming(),
+            Some(FakeTokenVerifier::honouring(HONOURED)),
+        );
+        send(app, tokened_request("not-the-honoured-token")).await;
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::PaymentRequired);
+        assert_eq!(event.access, Some(AccessPath::Payment));
+    }
+
+    /// A facilitator that accepts every payment and whose `settle` never returns, or — with
+    /// `hang_verify` — whose `verify` never returns. Stands in for a request the client abandons
+    /// while that call is in flight.
+    struct Hanging {
+        hang_verify: bool,
+    }
+
+    impl Facilitator for Hanging {
+        fn verify(
+            &self,
+            _payment: &PaymentPayload,
+            _requirements: &PaymentRequirements,
+        ) -> impl std::future::Future<Output = Result<(), FacilitatorError>> + Send {
+            let hang = self.hang_verify;
+            async move {
+                if hang {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+        }
+
+        fn settle(
+            &self,
+            _payment: &PaymentPayload,
+            _requirements: &PaymentRequirements,
+        ) -> impl std::future::Future<Output = Result<SettlementReceipt, FacilitatorError>> + Send
+        {
+            std::future::pending()
+        }
+    }
+
+    fn hanging_app(hang_verify: bool) -> (Router, FakeTelemetry) {
+        let sink = FakeTelemetry::default();
+        let backend = Backend::for_test("default", vec![], None, Arc::new(FakeUpstream::streaming()))
+            .with_cost(TEST_COST);
+        let gateway = Gateway::new(
+            Hanging { hang_verify },
+            Arc::new(Backends::from_parts(vec![backend])),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
+        .with_telemetry(Arc::new(sink.clone()));
+        (router(Access::new(gateway, None)), sink)
+    }
+
+    #[tokio::test]
+    async fn a_request_cancelled_mid_settle_is_recorded_abandoned_with_revenue_unknown() {
+        // Dropping the in-flight future is what the server does to a handler whose client left.
+        let (app, sink) = hanging_app(false);
+        let in_flight =
+            tokio::time::timeout(std::time::Duration::from_millis(100), app.oneshot(paid_request()))
+                .await;
+        assert!(in_flight.is_err(), "settle never returns, so the request was still in flight");
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::Abandoned);
+        assert_eq!(event.revenue, None, "the settle call may have landed");
+        assert_eq!(event.cost, Some(TEST_COST.to_string()), "the upstream had already run");
+        assert_eq!(event.paid, Some(quoted()));
+    }
+
+    #[tokio::test]
+    async fn a_request_cancelled_before_settle_is_recorded_abandoned_with_no_revenue() {
+        let (app, sink) = hanging_app(true);
+        let in_flight =
+            tokio::time::timeout(std::time::Duration::from_millis(100), app.oneshot(paid_request()))
+                .await;
+        assert!(in_flight.is_err(), "verify never returns, so the request was still in flight");
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::Abandoned);
+        assert_eq!(event.revenue.as_deref(), Some("0"), "nothing was charged before settle");
+        assert_eq!(event.cost.as_deref(), Some("0"), "the upstream never ran");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_disconnects_mid_settle_is_still_recorded() {
+        // The real server, not `oneshot`: this is the claim that hyper drops a handler whose client
+        // closed the connection, and that the drop reaches the recorder. `oneshot` always runs the
+        // handler to completion, so only a live connection can show it.
+        use tokio::io::AsyncWriteExt as _;
+        let (app, sink) = hanging_app(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let body = r#"{"model":"test","messages":[]}"#;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
+             {}: {}\r\ncontent-length: {}\r\n\r\n{body}",
+            x402::HEADER_PAYMENT,
+            x402::encode_payment(&payment()),
+            body.len(),
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        // Let the request reach the hanging settle, then leave.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(sink.events().is_empty(), "nothing is recorded while the request is in flight");
+        drop(client);
+
+        let recorded = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if !sink.events().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(recorded.is_ok(), "the server never dropped the abandoned handler");
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::Abandoned);
+        assert_eq!(event.revenue, None);
+    }
+
+    struct PanickingSink;
+
+    impl Telemetry for PanickingSink {
+        fn record(&self, _event: RequestEvent) {
+            panic!("a sink fault");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_sink_does_not_fail_a_paid_request() {
+        // The client paid; a telemetry fault must not cost them the answer or the receipt.
+        let gateway = Gateway::new(
+            FakeFacilitator::accepting(),
+            one_backend(FakeUpstream::streaming()),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
+        .with_telemetry(Arc::new(PanickingSink));
+        let (status, headers, body) = send(router(Access::new(gateway, None)), paid_request()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.contains_key(x402::HEADER_PAYMENT_RESPONSE));
+        assert_eq!(body, FakeUpstream::streamed_text());
     }
 }
