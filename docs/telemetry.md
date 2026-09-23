@@ -10,13 +10,30 @@ vocabulary from [`pricing.md`](pricing.md). It marks what is built today and wha
 ## Status
 
 - **Built:** the `Telemetry` seam, the per-request event, the accounting rules, the JSON line
-  format, and a test sink that asserts the event stream in hermetic tests.
-- **Next:** the default sink the `obolus` binary installs — one JSON line per request on stdout,
-  written off the request path and dropping (and counting) lines rather than ever blocking a
-  request. Until it lands, the binary records nothing: a `Gateway` defaults to a no-op sink. Tracked
-  in [#58](https://github.com/geekinasuit/obolus/issues/58).
+  format, a test sink that asserts the event stream in hermetic tests, and the default sink the
+  `obolus` binary installs — one JSON line per request on stdout, written off the request path, and
+  dropping (and counting) lines rather than ever blocking a request.
 - **Out of scope:** OpenTelemetry, Kafka, and database transports. The seam is shaped for them; see
   [Adding a transport](#adding-a-transport).
+
+## Turning it on
+
+The binary writes the stream to **stdout** by default. Nothing else goes to stdout — the startup
+banner and every diagnostic go to stderr — so stdout can be piped straight into a collector.
+
+| `OBOLUS_TELEMETRY` | Effect |
+|---|---|
+| unset, or `stdout` | One JSON line per request on stdout. |
+| `off` | Nothing is recorded. |
+
+Any other value is refused at startup, before the gateway advertises anything, so a typo cannot
+silently leave telemetry on or off. The startup banner names the sink in use on a line beginning
+`obolus: telemetry:`.
+
+Every request that reaches the completion handler writes a line, including an unpaid one answered
+with a 402 challenge. So anyone who can reach the gateway can make it write lines, as fast as it
+will answer them. The queue bounds the memory that costs, but the disk behind stdout is the
+operator's to rotate or cap. `off` is the switch for a deployment that does not want the stream.
 
 ## The seam
 
@@ -121,17 +138,23 @@ The details that matter:
 ## The line format
 
 A sink that writes text writes each event as one line of JSON. This is the contract an operator's
-tooling reads. The example below is a copy of the line the test
-`the_json_line_matches_the_documented_schema` (in `obolus/src/telemetry.rs`) pins the code to, so
-that test is the authority if the two ever disagree.
+tooling reads. The stream carries two kinds of line, told apart by `kind`: one `request` line per
+request, and an occasional `dropped` line reporting lines the sink had to discard.
+
+### Request lines
+
+The example below is a copy of the line the test `the_json_line_matches_the_documented_schema` (in
+`obolus/src/telemetry.rs`) pins the code to, so that test is the authority if the two ever
+disagree.
 
 ```json
-{"v":1,"ts_ms":1700000000000,"outcome":"settled","access":"payment","backend":"local","model":"llama3","offers":[{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"}],"paid":{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"},"upstream_invoked":true,"upstream_status":200,"cost":"800","revenue":"1000","transaction":"0xTEST-TX"}
+{"v":1,"kind":"request","ts_ms":1700000000000,"outcome":"settled","access":"payment","backend":"local","model":"llama3","offers":[{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"}],"paid":{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"},"upstream_invoked":true,"upstream_status":200,"cost":"800","revenue":"1000","transaction":"0xTEST-TX"}
 ```
 
 | Key | Type | Meaning |
 |---|---|---|
 | `v` | integer | Line format version, currently `1`. Bumped when a field changes meaning or is removed. Adding a field does not bump it, so ignore keys you do not know. |
+| `kind` | string | `"request"`. |
 | `ts_ms` | integer | Unix milliseconds when the event was recorded, stamped once by the gateway rather than by each sink. |
 | `outcome` | string | One of the outcomes above. |
 | `access` | string \| null | `"payment"` or `"token"`; `null` only for `unroutable`, which is decided first. |
@@ -145,9 +168,34 @@ that test is the authority if the two ever disagree.
 | `revenue` | string \| null | See [Cost and revenue](#cost-and-revenue). |
 | `transaction` | string \| null | The settlement transaction, on `settled` when the facilitator reported one. |
 
-Every key is always present, `null` where it does not apply, so a consumer reads a fixed set of
-keys. Every amount is a decimal string of atomic units, the same shape as `maxAmountRequired`,
-because an amount can exceed what a JSON number holds exactly.
+Every key is always present on a request line, `null` where it does not apply, so a consumer reads
+a fixed set of keys. Every amount is a decimal string of atomic units, the same shape as
+`maxAmountRequired`, because an amount can exceed what a JSON number holds exactly.
+
+### Dropped lines
+
+```json
+{"v":1,"kind":"dropped","ts_ms":1700000000000,"dropped":7}
+```
+
+The sink queues events and writes them from a thread of its own, so that a slow or stuck stdout
+never holds up a request. When the queue is full, a new event is discarded rather than waited for,
+and counted. The count is written as a `dropped` line before the next request line, or within about
+a second if no request follows. `dropped` is the number of request events lost since the previous
+`dropped` line, and `ts_ms` is when the count was written. The test
+`a_dropped_line_matches_the_documented_schema` pins this line.
+
+A `dropped` line says how many events were lost, not which ones. Some of the request lines written
+just after it may have been queued before those events were lost. So totals summed over a stretch of
+the stream that contains `dropped` lines are lower bounds.
+
+A consumer that sums revenue or cost must filter on `kind` rather than assume every line is a
+request.
+
+The queue holds 1024 events. The only part of an event a caller controls is the model name, cut to
+256 bytes; the rest comes from configuration or the facilitator. So a full queue holds on the order
+of a megabyte, however hard it is driven. Events still queued when the process exits are lost, and
+a process that is killed does not write a `dropped` line for them.
 
 ### What is never recorded
 
@@ -174,13 +222,19 @@ denomination bridge that pricing has not built yet.
 ## Adding a transport
 
 A transport is a `Telemetry` implementation that serializes the event (or maps its fields onto its
-own schema) and ships it. To keep the request path safe, it should take the shape the default sink
-is being built to:
+own schema) and ships it. `LineSink` in `obolus/src/telemetry.rs` is the pattern to follow:
 
-- `record` enqueues onto a bounded channel with a non-blocking send, and returns;
-- a dedicated thread or task drains the channel into the transport;
-- a full channel drops the event and counts the drop, and the count is reported somewhere the
-  operator will see it, so loss is never silent.
+- `record` offers the event to a bounded channel with a non-blocking send, and returns;
+- a dedicated thread drains the channel, serializes each event there rather than on the request
+  path, and writes it;
+- a full channel drops the event and counts the drop, and the count goes into the stream itself, so
+  loss is never silent;
+- a failed write is reported once on stderr, and the thread keeps draining, so the queue never backs
+  up into `record`.
+
+`LineSink::spawn` takes any `std::io::Write`, so a transport that is a byte stream — a file, a
+socket, a pipe to a collector — needs no new sink at all. A transport with its own schema implements
+`Telemetry` and also overrides `description`, which is the text the startup banner prints for it.
 
 Events still in the queue when the process exits are lost. A transport that must not lose events
 belongs out of process, which is the direction [`vision.md`](vision.md) sets for telemetry.

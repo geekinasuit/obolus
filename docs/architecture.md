@@ -144,7 +144,9 @@ revenue against cost. The completion route records exactly one `RequestEvent` pe
 reaches its handler —
 outcome, routed backend and model, the prices quoted, the option paid, whether the upstream ran,
 and the derived cost and revenue — through a `Telemetry::record` that cannot fail the request.
-See [`telemetry.md`](telemetry.md).
+The binary installs a sink that writes each event as one JSON line on stdout from a thread of its
+own, dropping and counting events rather than ever making a request wait; `OBOLUS_TELEMETRY=off`
+removes it. See [`telemetry.md`](telemetry.md).
 
 **Token path (`access.rs`).** An optional operator-issued bearer-token bypass. A request carrying
 a token the operator's public keys verify is served without payment. This path verifies operator
@@ -173,7 +175,7 @@ The seams, and what rides behind each:
 | Fulfillment | `Facilitator` | Is this payment good, and settle it | delegating (HTTP), test fake |
 | Upstream | `Upstream` | Serve the inference | Ollama / OpenAI-compatible, test fake |
 | Pricing | `PriceDeterminer` | What does this request cost | static, cost-plus (config-selectable; cost-plus is per-backend, single-chain); flat (a library rate, not yet wired to config) |
-| Telemetry | `Telemetry` | What happened to this request | no-op (the default), test fake; a JSON-lines stdout sink for the binary is next |
+| Telemetry | `Telemetry` | What happened to this request | JSON lines on stdout (the binary's default), off (config-selectable); no-op (a library `Gateway`'s default), test fake |
 
 A planned seam named by the vision but not yet built: feature-flags/kill-switch (per-backend
 switches and spend caps).
@@ -196,8 +198,8 @@ flowchart TB
   cov -->|"no → name the offending ids"| refuse(["refuse to start<br/>(no banner, no router)"])
   cov -->|"yes"| arm{"check_arming:<br/>every network on the allowlist?"}
   arm -->|"no"| refuse
-  arm -->|"yes → ArmedRequirements witness"| gw["Gateway::new(facilitator, backends, witness)<br/>+ install price determiner"]
-  gw --> banner["print banner<br/>(advertised options, pricing rate, token path)"]
+  arm -->|"yes → ArmedRequirements witness"| gw["Gateway::new(facilitator, backends, witness)<br/>+ install price determiner and telemetry sink"]
+  gw --> banner["print banner<br/>(advertised options, pricing rate, token path, telemetry)"]
   banner --> serve(["serve HTTP"])
 ```
 
@@ -275,8 +277,8 @@ per-backend cost-plus and a time-bounded promotional discount over it have lande
 declares its own cost, the margin stays gateway-wide, and a promotion is a percentage off during a
 window), on the seam and registry already described; a genuinely free rate and cross-asset
 (multi-chain) cost-plus are the remaining steps. See [`pricing.md`](pricing.md) for that design.
-Telemetry has its seam and per-request event; the default sink the binary installs is next — see
-[`telemetry.md`](telemetry.md).
+Telemetry records one event per request and writes it as a JSON line on stdout; OpenTelemetry,
+Kafka, and database transports are later work — see [`telemetry.md`](telemetry.md).
 
 Sequenced after the stateless core: an admin UX and the stateless→stateful transition,
 feature-flags / kill-switch, client-key pass-through, Anthropic-compatible routing,

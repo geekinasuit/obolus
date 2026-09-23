@@ -626,9 +626,68 @@ pub fn select_promo<F: Fn(&str) -> Option<String>>(
     Ok(Some(PromoConfig { discount_bps, start, end }))
 }
 
+/// Where request telemetry goes: `stdout` (the default) or `off`. See `docs/telemetry.md`.
+pub const TELEMETRY_VAR: &str = "OBOLUS_TELEMETRY";
+
+/// The telemetry sink an operator selected. Plain data, like [`PricingChoice`], so the door's
+/// refusals are testable without starting a writer thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryChoice {
+    /// One JSON line per request on stdout ([`crate::telemetry::LineSink`]).
+    Stdout,
+    /// No telemetry ([`crate::telemetry::NoTelemetry`]).
+    Off,
+}
+
+/// Why the telemetry selection was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TelemetryConfigError {
+    #[error("OBOLUS_TELEMETRY={value:?} is not a telemetry sink; use \"stdout\" or \"off\"")]
+    Unknown { value: String },
+}
+
+/// Select the telemetry sink. Unset is `stdout`: an operator running this for money should see
+/// revenue against cost without having to ask for it. An unrecognised value is refused rather than
+/// read as either default — a typo of `off` must not leave telemetry on, nor one of `stdout` turn it
+/// off.
+pub fn select_telemetry<F: Fn(&str) -> Option<String>>(
+    get: F,
+) -> Result<TelemetryChoice, TelemetryConfigError> {
+    match get(TELEMETRY_VAR) {
+        None => Ok(TelemetryChoice::Stdout),
+        Some(raw) => match raw.trim() {
+            "stdout" => Ok(TelemetryChoice::Stdout),
+            "off" => Ok(TelemetryChoice::Off),
+            _ => Err(TelemetryConfigError::Unknown { value: raw }),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn telemetry_env(value: Option<&str>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |key| (key == TELEMETRY_VAR).then(|| value.map(str::to_string)).flatten()
+    }
+
+    #[test]
+    fn unset_telemetry_is_stdout() {
+        assert_eq!(select_telemetry(telemetry_env(None)), Ok(TelemetryChoice::Stdout));
+    }
+
+    #[test]
+    fn telemetry_can_be_selected_or_switched_off() {
+        assert_eq!(select_telemetry(telemetry_env(Some("stdout"))), Ok(TelemetryChoice::Stdout));
+        assert_eq!(select_telemetry(telemetry_env(Some("off"))), Ok(TelemetryChoice::Off));
+    }
+
+    #[test]
+    fn an_unknown_telemetry_value_is_refused_naming_it() {
+        let err = select_telemetry(telemetry_env(Some("of"))).unwrap_err();
+        assert_eq!(err, TelemetryConfigError::Unknown { value: "of".to_string() });
+        assert!(err.to_string().contains("\"of\""), "{err}");
+    }
 
     fn shared() -> SharedOffer {
         SharedOffer {

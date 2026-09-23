@@ -41,9 +41,12 @@
 //! a panicking sink. A sink that needs I/O must hand the event off rather than perform it on the
 //! request path — the contract below says so, and the default sink is the no-op [`NoTelemetry`].
 
+use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -67,6 +70,12 @@ pub const MAX_MODEL_BYTES: usize = 256;
 /// wait when that queue is full.
 pub trait Telemetry: Send + Sync {
     fn record(&self, event: RequestEvent);
+
+    /// What this sink does with an event, for the startup banner. Read off the installed sink, so the
+    /// banner describes what is wired rather than what was configured.
+    fn description(&self) -> &str {
+        "a custom sink"
+    }
 }
 
 /// The default sink: records nothing. A gateway emits no telemetry until one is installed with
@@ -75,6 +84,10 @@ pub struct NoTelemetry;
 
 impl Telemetry for NoTelemetry {
     fn record(&self, _event: RequestEvent) {}
+
+    fn description(&self) -> &str {
+        "off; no request events are recorded"
+    }
 }
 
 /// Hand `event` to `sink`, containing a panic so that a faulty sink cannot fail the request whose
@@ -240,15 +253,17 @@ impl Trace {
     }
 }
 
-fn bounded_model(mut model: String) -> String {
-    if model.len() > MAX_MODEL_BYTES {
-        let mut end = MAX_MODEL_BYTES;
-        while !model.is_char_boundary(end) {
-            end -= 1;
-        }
-        model.truncate(end);
+fn bounded_model(model: String) -> String {
+    if model.len() <= MAX_MODEL_BYTES {
+        return model;
     }
-    model
+    let mut end = MAX_MODEL_BYTES;
+    while !model.is_char_boundary(end) {
+        end -= 1;
+    }
+    // A copy rather than `truncate`, which keeps the whole original allocation: the bound is on the
+    // memory an event holds while it waits in a sink's queue, not just the length it reports.
+    model[..end].to_string()
 }
 
 /// Records one request's event when it is dropped.
@@ -297,19 +312,152 @@ fn now_ms() -> u64 {
 #[derive(Serialize)]
 struct Line<'a> {
     v: u32,
+    kind: &'static str,
     #[serde(flatten)]
     event: &'a RequestEvent,
 }
 
-/// `event` as one line of JSON, stamped with the schema version. No trailing newline. This is the
-/// wire form `docs/telemetry.md` documents.
+/// `event` as one `"kind":"request"` line of JSON, stamped with the schema version. No trailing
+/// newline. This is the wire form `docs/telemetry.md` documents.
 pub fn json_line(event: &RequestEvent) -> String {
     // Every field is a string, integer, bool, enum, or a sequence of those, so serialization has no
     // failure mode here; the fallback exists so that this function is total, not because it is
     // reachable.
-    serde_json::to_string(&Line { v: SCHEMA_VERSION, event }).unwrap_or_else(|_| {
-        format!("{{\"v\":{SCHEMA_VERSION},\"ts_ms\":{},\"outcome\":null}}", event.ts_ms)
+    serde_json::to_string(&Line { v: SCHEMA_VERSION, kind: "request", event }).unwrap_or_else(|_| {
+        format!(
+            "{{\"v\":{SCHEMA_VERSION},\"kind\":\"request\",\"ts_ms\":{},\"outcome\":null}}",
+            event.ts_ms
+        )
     })
+}
+
+/// A `"kind":"dropped"` line: `count` request events were lost before this point in the stream.
+pub fn dropped_line(count: u64, ts_ms: u64) -> String {
+    format!("{{\"v\":{SCHEMA_VERSION},\"kind\":\"dropped\",\"ts_ms\":{ts_ms},\"dropped\":{count}}}")
+}
+
+/// The queue depth the binary's stdout sink uses. The only field a caller controls is the model
+/// name, capped at [`MAX_MODEL_BYTES`]; the rest comes from configuration or the facilitator. So a
+/// full queue holds on the order of a megabyte of pending events, not an amount traffic can grow.
+pub const DEFAULT_QUEUE: usize = 1024;
+
+/// How often an idle line sink reports drops that no later event has carried out.
+pub const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A sink that writes each event as one JSON line, off the request path.
+///
+/// [`Telemetry::record`] only offers the event to a bounded queue and returns; a dedicated thread
+/// drains the queue into the writer. When the queue is full — the writer is slower than traffic, or
+/// stuck — the event is dropped and counted rather than waited for, and the count is written into
+/// the same stream as a `"kind":"dropped"` line before the next event, or within
+/// [`DROP_REPORT_INTERVAL`] if none follows. So loss is never silent, and the request path never
+/// waits on I/O. Events still queued when the process exits are lost.
+pub struct LineSink {
+    tx: SyncSender<RequestEvent>,
+    dropped: Arc<AtomicU64>,
+    /// Set once the writer thread is gone, so its disappearance is reported once, not per event.
+    orphaned: AtomicBool,
+    description: String,
+}
+
+impl LineSink {
+    /// One JSON line per request on the process's stdout.
+    pub fn stdout() -> std::io::Result<Self> {
+        Self::spawn(std::io::stdout(), "stdout", DEFAULT_QUEUE, DROP_REPORT_INTERVAL)
+    }
+
+    /// A sink writing to `writer` (named `target` in its description) through a queue of
+    /// `capacity` events, reporting idle drops every `report_every`.
+    pub fn spawn<W: Write + Send + 'static>(
+        writer: W,
+        target: &str,
+        capacity: usize,
+        report_every: Duration,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = sync_channel(capacity);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let counter = dropped.clone();
+        let target_name = target.to_string();
+        std::thread::Builder::new()
+            .name("obolus-telemetry".to_string())
+            .spawn(move || drain(rx, writer, counter, &target_name, report_every))?;
+        Ok(Self {
+            tx,
+            dropped,
+            orphaned: AtomicBool::new(false),
+            description: format!(
+                "one JSON line per request on {target}, through a queue of {capacity} events; when \
+                 the queue is full, events are dropped and counted in the stream, never waited on"
+            ),
+        })
+    }
+}
+
+impl Telemetry for LineSink {
+    fn record(&self, event: RequestEvent) {
+        match self.tx.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            // The writer thread is gone, so nothing will ever report these; say so once, here.
+            Err(TrySendError::Disconnected(_)) => {
+                if !self.orphaned.swap(true, Ordering::Relaxed) {
+                    warn("obolus: telemetry writer stopped; request events are being lost");
+                }
+            }
+        }
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+}
+
+/// The writer thread: drain events into `writer`, one line each, preceded by a `dropped` line
+/// whenever events were lost since the last write. Serialization happens here, not in `record`, so
+/// the request path does no formatting work.
+fn drain<W: Write>(
+    rx: Receiver<RequestEvent>,
+    mut writer: W,
+    dropped: Arc<AtomicU64>,
+    target: &str,
+    report_every: Duration,
+) {
+    let mut failed = false;
+    let mut write = |line: &str, writer: &mut W| {
+        let result = writeln!(writer, "{line}").and_then(|()| writer.flush());
+        // A closed stdout is an error here, not a signal: Rust ignores SIGPIPE. Report the first
+        // failure where an operator will see it, and keep draining so `record` never backs up.
+        if let Err(err) = result {
+            if !failed {
+                failed = true;
+                warn(&format!(
+                    "obolus: telemetry write to {target} failed ({err}); events are being lost"
+                ));
+            }
+        }
+    };
+    loop {
+        let next = rx.recv_timeout(report_every);
+        // Checked on every wake, event or timeout, so drops that no later event carries out are
+        // still reported within `report_every`.
+        let lost = dropped.swap(0, Ordering::Relaxed);
+        if lost > 0 {
+            write(&dropped_line(lost, now_ms()), &mut writer);
+        }
+        match next {
+            Ok(event) => write(&json_line(&event), &mut writer),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// A line on stderr that cannot panic. `eprintln!` panics when stderr is unwritable, which would
+/// kill the writer thread or, on the request path, lean on [`record`]'s containment.
+fn warn(message: &str) {
+    let _ = writeln!(std::io::stderr(), "{message}");
 }
 
 /// A sink that keeps every event it is handed, for asserting the stream in tests. Test-only, like
@@ -442,6 +590,15 @@ mod tests {
     }
 
     #[test]
+    fn a_long_model_does_not_keep_its_original_allocation() {
+        // The model comes from the request body, which may be megabytes. An event can wait in a
+        // sink's queue, so what bounds its memory is the capacity it holds, not the length it shows.
+        let trace = Trace { model: Some("m".repeat(1 << 20)), ..Trace::default() };
+        let recorded = trace.finish(Outcome::Unroutable, TS).model.unwrap();
+        assert!(recorded.capacity() <= MAX_MODEL_BYTES, "capacity {}", recorded.capacity());
+    }
+
+    #[test]
     fn a_short_model_is_kept_verbatim() {
         let trace = Trace { model: Some("llama3".to_string()), ..Trace::default() };
         assert_eq!(trace.finish(Outcome::Unroutable, TS).model.as_deref(), Some("llama3"));
@@ -455,7 +612,7 @@ mod tests {
         assert_eq!(
             line,
             concat!(
-                r#"{"v":1,"ts_ms":1700000000000,"outcome":"settled","access":"payment","#,
+                r#"{"v":1,"kind":"request","ts_ms":1700000000000,"outcome":"settled","access":"payment","#,
                 r#""backend":"local","model":"llama3","#,
                 r#""offers":[{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"}],"#,
                 r#""paid":{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"},"#,
@@ -472,7 +629,7 @@ mod tests {
         assert_eq!(
             line,
             concat!(
-                r#"{"v":1,"ts_ms":0,"outcome":"unroutable","access":null,"backend":null,"model":null,"#,
+                r#"{"v":1,"kind":"request","ts_ms":0,"outcome":"unroutable","access":null,"backend":null,"model":null,"#,
                 r#""offers":[],"paid":null,"upstream_invoked":false,"upstream_status":null,"#,
                 r#""cost":"0","revenue":"0","transaction":null}"#,
             )
@@ -509,6 +666,204 @@ mod tests {
         let event = sink.only();
         assert_eq!(event.outcome, Outcome::Abandoned);
         assert!(event.upstream_invoked, "the facts gathered before the drop are kept");
+    }
+
+    #[test]
+    fn a_dropped_line_matches_the_documented_schema() {
+        assert_eq!(
+            dropped_line(7, TS),
+            r#"{"v":1,"kind":"dropped","ts_ms":1700000000000,"dropped":7}"#
+        );
+    }
+
+    // ---- LineSink ----
+
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::Mutex;
+
+    /// A writer that appends to a shared buffer the test can read.
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Shared {
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Wait (bounded) until `pred` holds over the lines written so far.
+        fn wait_for(&self, pred: impl Fn(&[String]) -> bool) -> Vec<String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let lines = self.lines();
+                if pred(&lines) {
+                    return lines;
+                }
+                assert!(std::time::Instant::now() < deadline, "timed out; lines so far: {lines:#?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer whose first write announces itself and then blocks until released — a stuck stdout.
+    struct Gated {
+        inner: Shared,
+        entered: Option<Sender<()>>,
+        release: Option<Receiver<()>>,
+    }
+
+    impl Write for Gated {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                entered.send(()).unwrap();
+            }
+            if let Some(release) = self.release.take() {
+                let _ = release.recv();
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn event(outcome: Outcome) -> RequestEvent {
+        Trace::default().finish(outcome, TS)
+    }
+
+    /// Record `count` events on a separate thread and fail if they have not all returned within a
+    /// deadline — so a `record` that blocks on a stuck writer fails the test instead of hanging it.
+    fn record_within(sink: &Arc<LineSink>, count: u64, outcome: Outcome) {
+        let recorder = sink.clone();
+        let (done_tx, done_rx) = channel();
+        std::thread::spawn(move || {
+            for _ in 0..count {
+                recorder.record(event(outcome));
+            }
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("record blocked on a stuck writer");
+    }
+
+    #[test]
+    fn a_line_sink_writes_one_json_line_per_event() {
+        let out = Shared::default();
+        let sink = LineSink::spawn(out.clone(), "a buffer", 8, Duration::from_secs(60)).unwrap();
+        sink.record(event(Outcome::PaymentRequired));
+        sink.record(event(Outcome::Unroutable));
+        let lines = out.wait_for(|lines| lines.len() == 2);
+        assert_eq!(lines[0], json_line(&event(Outcome::PaymentRequired)));
+        assert_eq!(lines[1], json_line(&event(Outcome::Unroutable)));
+    }
+
+    #[test]
+    fn a_stuck_writer_never_blocks_record_and_every_drop_is_counted() {
+        const CAPACITY: usize = 4;
+        const OVERFLOW: u64 = 5;
+        let out = Shared::default();
+        let (entered_tx, entered_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let writer = Gated { inner: out.clone(), entered: Some(entered_tx), release: Some(release_rx) };
+        let sink =
+            Arc::new(LineSink::spawn(writer, "a stuck writer", CAPACITY, Duration::from_secs(60)).unwrap());
+
+        // The first event reaches the writer, which then sticks: the queue is now empty and the
+        // writer is not draining it.
+        record_within(&sink, 1, Outcome::Served);
+        entered_rx.recv_timeout(Duration::from_secs(5)).expect("the writer took the first event");
+
+        // Fill the queue, then overflow it.
+        record_within(&sink, CAPACITY as u64 + OVERFLOW, Outcome::PaymentRequired);
+
+        release_tx.send(()).unwrap();
+        let expected_dropped = dropped_line(OVERFLOW, 0);
+        let lines = out.wait_for(|lines| lines.len() == 2 + CAPACITY);
+        // The line after the stuck event reports exactly the overflow, before the queued events.
+        assert_eq!(lines[0], json_line(&event(Outcome::Served)));
+        assert!(
+            lines[1].starts_with(r#"{"v":1,"kind":"dropped","#)
+                && lines[1].ends_with(&format!(r#""dropped":{OVERFLOW}}}"#)),
+            "expected a drop report of {OVERFLOW} like {expected_dropped}; got {}",
+            lines[1]
+        );
+        assert!(lines[2..].iter().all(|line| *line == json_line(&event(Outcome::PaymentRequired))));
+    }
+
+    #[test]
+    fn drops_are_reported_even_when_no_event_follows() {
+        // A drop counted after the writer has drained the queue: a recorder that found the queue
+        // full, then was preempted before counting. No event follows to carry the count out, and
+        // the queue is empty, so only the idle wake can report it.
+        let out = Shared::default();
+        let sink = LineSink::spawn(out.clone(), "stdout", 4, Duration::from_millis(20)).unwrap();
+        sink.dropped.fetch_add(3, Ordering::Relaxed);
+        let lines = out.wait_for(|lines| lines.iter().any(|line| line.contains(r#""kind":"dropped""#)));
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert!(lines[0].ends_with(r#""dropped":3}"#), "{lines:#?}");
+    }
+
+    /// A writer whose every write fails, and which says when the first one has been attempted.
+    struct Broken {
+        failed: Option<Sender<()>>,
+    }
+
+    impl Write for Broken {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(failed) = self.failed.take() {
+                let _ = failed.send(());
+            }
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_writer_keeps_draining_so_record_never_backs_up() {
+        // Were the writer thread to stop on a write error — exit, or stay alive stuck retrying — a
+        // capacity-1 queue would fill at once and every later event would be dropped, and the drop
+        // count would never be collected again. A writer that keeps draining collects it on its next
+        // wake, so the count returning to zero is what shows it is still draining. The overflow is
+        // recorded only after the first write has failed, so a writer that wedges on that failure is
+        // certain to leave drops behind rather than having collected them all before it wedged.
+        let (failed_tx, failed_rx) = channel();
+        let writer = Broken { failed: Some(failed_tx) };
+        let sink = LineSink::spawn(writer, "a closed pipe", 1, Duration::from_millis(20)).unwrap();
+        sink.record(event(Outcome::Served));
+        failed_rx.recv_timeout(Duration::from_secs(5)).expect("the writer never attempted a write");
+        for _ in 0..50 {
+            sink.record(event(Outcome::Served));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while sink.dropped.load(Ordering::Relaxed) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer stopped draining after a write error"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!sink.orphaned.load(Ordering::Relaxed), "the writer thread must survive write errors");
+    }
+
+    #[test]
+    fn a_line_sink_describes_where_it_writes() {
+        let sink = LineSink::spawn(Shared::default(), "stdout", 16, DROP_REPORT_INTERVAL).unwrap();
+        assert!(sink.description().contains("on stdout"), "{}", sink.description());
+        assert!(sink.description().contains("16 events"), "{}", sink.description());
     }
 
     #[test]
