@@ -30,14 +30,15 @@ use obolus::arming::{
     check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
-    parse_accepts, require_backend_costs, select_pricing, select_promo,
+    parse_accepts, require_backend_costs, select_pricing, select_promo, select_telemetry,
     superseded_single_chain_vars, validated_option, EntryDefect, EntryField, PricingChoice,
-    SharedOffer,
+    SharedOffer, TelemetryChoice,
 };
 use obolus::backends::{load_backends, Backends};
 use obolus::facilitator::DelegatedFacilitator;
 use obolus::gateway::{router, Access, Gateway};
 use obolus::pricing::{CostPlus, PriceDeterminer, Promotional, StaticPrice};
+use obolus::telemetry::LineSink;
 use obolus::x402::PaymentRequirements;
 
 /// Deliberately not 8402, which x402 client-side tooling tends to bind.
@@ -341,6 +342,11 @@ async fn main() -> anyhow::Result<()> {
     // function of its inputs (the config door reads no clock of its own).
     let now_unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let promo = select_promo(|k| std::env::var(k).ok(), now_unix)?;
+
+    // The telemetry sink, selected here with the other refusable doors so an unrecognised value
+    // stops the process before any banner line. The writer thread is started later, once nothing
+    // else can refuse.
+    let telemetry = select_telemetry(|k| std::env::var(k).ok())?;
 
     // Land the single-backend cost on the sole backend, and check the whole registry against the
     // rate — both before the `Arc` seal, the arming guard, and the banner, for the same reason
@@ -751,6 +757,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Installed last, after every refusal: starting the writer thread is the one side effect of
+    // selecting a sink, and a process that is about to refuse has nothing to record.
+    let gateway = match telemetry {
+        TelemetryChoice::Stdout => gateway.with_telemetry(Arc::new(LineSink::stdout()?)),
+        TelemetryChoice::Off => gateway,
+    };
     let access = Access::new(gateway, token);
 
     // Read off the access surface, not off the configuration that built it — and printed before
@@ -771,15 +783,21 @@ async fn main() -> anyhow::Result<()> {
              token still get the 402 challenge — the paying path is unchanged."
         );
     }
+    // Off the routed `Access`, like the token line above, so it describes the sink requests will
+    // actually be recorded to. `tests/server_arming.rs` asserts it.
+    eprintln!("obolus: telemetry: {}", access.telemetry());
 
     let app = router(access);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // The only line in this startup sequence entitled to say this, because it is the only one
-    // printed after the socket exists. `tests/server_arming.rs` never observes it — that harness
+    // printed after the socket exists. The address is the listener's own, so a port-0 bind names the
+    // port it actually got. The arming harness in `tests/server_arming.rs` never observes it — it
     // holds the child's port so `bind` always fails, which is how those tests terminate at all — so
-    // its discriminator is `starting on` above. See that file's `PAST_STARTUP`.
-    eprintln!("obolus: listening on http://{addr}");
+    // its discriminator is `starting on` above (see that file's `PAST_STARTUP`); the telemetry
+    // tests there bind port 0 and read the port from this line.
+    let bound = listener.local_addr()?;
+    eprintln!("obolus: listening on http://{bound}");
     axum::serve(listener, app).await?;
     Ok(())
 }

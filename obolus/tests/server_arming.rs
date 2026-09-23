@@ -72,6 +72,7 @@ const OBOLUS_VARS: &[&str] = &[
     "OBOLUS_TOKEN_KEYS",
     "OBOLUS_TOKEN_ISSUER",
     "OBOLUS_TOKEN_AUDIENCE",
+    "OBOLUS_TELEMETRY",
 ];
 
 /// Base mainnet — a real chain id, on no testnet allowlist. The point of the guard.
@@ -426,19 +427,25 @@ fn run_without(remove: &[&str], vars: &[(&str, &str)]) -> Run {
 
 /// [`run`] for values a `&str` cannot express — which is exactly one shape, a non-UTF-8 value,
 /// and exactly one test needs it.
-fn run_os(remove: &[&str], vars: &[(&str, &std::ffi::OsStr)]) -> Run {
-    // Both halves of the dual build, because both are supposed to pass. Bazel passes the path
-    // through the rule's `env`; cargo sets `CARGO_BIN_EXE_<bin>` at compile time. `option_env!`
-    // rather than `env!` because the latter is a compile error under Bazel, where cargo's variable
-    // does not exist. The explicit variable wins where both are available, so pointing this suite at
-    // some other build of the binary stays possible.
-    let bin = std::env::var("OBOLUS_SERVER_BIN")
+/// The `obolus` binary under test.
+///
+/// Both halves of the dual build, because both are supposed to pass. Bazel passes the path through
+/// the rule's `env`; cargo sets `CARGO_BIN_EXE_<bin>` at compile time. `option_env!` rather than
+/// `env!` because the latter is a compile error under Bazel, where cargo's variable does not exist.
+/// The explicit variable wins where both are available, so pointing this suite at some other build
+/// of the binary stays possible.
+fn server_bin() -> String {
+    std::env::var("OBOLUS_SERVER_BIN")
         .ok()
         .or_else(|| option_env!("CARGO_BIN_EXE_obolus").map(str::to_string))
         .expect(
             "no obolus server binary to run: OBOLUS_SERVER_BIN is unset (Bazel sets it from the \
              rule's env — see BUILD.bazel) and this was not built by cargo either",
-        );
+        )
+}
+
+fn run_os(remove: &[&str], vars: &[(&str, &std::ffi::OsStr)]) -> Run {
+    let bin = server_bin();
 
     // Occupy a loopback port and hand it to the child so that bind — the last statement of
     // startup — always fails. See the module docs.
@@ -1504,6 +1511,165 @@ fn an_openai_compat_backend_with_a_readable_key_boots_and_never_prints_the_key()
     run.must_have_got_past_startup();
     run.must_say("keyed");
     run.must_not_say(secret);
+}
+
+// ---- telemetry (#58) ----
+
+#[test]
+fn telemetry_defaults_to_one_json_line_per_request_on_stdout() {
+    // Read off the sink the routed `Access` holds, so this line proves the sink reached the router —
+    // the same standard as the bearer-token banner.
+    let run = run(&[]);
+    run.must_have_got_past_startup();
+    run.must_say("obolus: telemetry: one JSON line per request on stdout");
+}
+
+#[test]
+fn telemetry_can_be_switched_off() {
+    let run = run(&[("OBOLUS_TELEMETRY", "off")]);
+    run.must_have_got_past_startup();
+    run.must_say("obolus: telemetry: off");
+    run.must_not_say("one JSON line per request");
+}
+
+#[test]
+fn an_unknown_telemetry_value_refuses_before_advertising_anything() {
+    // A typo of `off` must not leave telemetry on, nor one of `stdout` switch it off.
+    let run = run(&[("OBOLUS_TELEMETRY", "of")]);
+    run.must_say("is not a telemetry sink");
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+/// A running `obolus` that actually serves — unlike [`run`], whose child always dies at `bind`.
+/// For the tests that need a request to flow. Killed on drop, so a failing assertion cannot leave
+/// the process behind.
+///
+/// Hermetic by what it is asked to do: it binds loopback port 0, and the requests these tests send
+/// carry no payment, so the gateway answers with a challenge without dialing the facilitator (a
+/// discard-port URL) or the upstream.
+struct Live {
+    child: std::process::Child,
+    addr: String,
+    stdout: std::sync::mpsc::Receiver<String>,
+    /// Held for the life of the process, though nothing reads it after startup: dropping it ends
+    /// the forwarding thread, which closes the pipe, and the server's next stderr line would then
+    /// fail with EPIPE — which `eprintln!` turns into a panic.
+    stderr: std::sync::mpsc::Receiver<String>,
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Live {
+    /// The next line the process writes to stdout, if one arrives within `wait`.
+    fn next_stdout_line(&self, wait: std::time::Duration) -> Option<String> {
+        self.stdout.recv_timeout(wait).ok()
+    }
+}
+
+/// Forward each line `reader` produces to a channel, on a thread, so no read can block a test.
+fn lines_to_channel(reader: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
+    use std::io::BufRead as _;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(reader).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn serve_live(vars: &[(&str, &str)]) -> Live {
+    let mut cmd = Command::new(server_bin());
+    for (key, _) in std::env::vars() {
+        if key.starts_with(OBOLUS_PREFIX) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env("OBOLUS_ADDR", "127.0.0.1:0");
+    cmd.env("OBOLUS_FACILITATOR_URL", "http://127.0.0.1:9/facilitator");
+    for (key, value) in vars {
+        cmd.env(key, value);
+    }
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("start the server binary");
+    let stdout = lines_to_channel(child.stdout.take().expect("piped stdout"));
+    let stderr = lines_to_channel(child.stderr.take().expect("piped stderr"));
+    let mut live = Live { child, addr: String::new(), stdout, stderr };
+
+    // The bound address comes from the post-bind line, which names the port the listener actually
+    // got. Every wait is bounded; the lines seen so far go into the failure message, so a child that
+    // refused or crashed says why rather than timing out mutely.
+    const LISTENING: &str = "obolus: listening on http://";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut seen = Vec::new();
+    while live.addr.is_empty() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match live.stderr.recv_timeout(left) {
+            Ok(line) => {
+                if let Some(addr) = line.strip_prefix(LISTENING) {
+                    live.addr = addr.to_string();
+                }
+                seen.push(line);
+            }
+            Err(_) => panic!("the server never reported listening; stderr so far:\n{}", seen.join("\n")),
+        }
+    }
+    live
+}
+
+/// POST an unpaid completion request and return the raw HTTP response.
+fn post_unpaid(addr: &str) -> String {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::net::TcpStream::connect(addr).expect("connect to the server");
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+    let body = r#"{"model":"test","messages":[]}"#;
+    write!(
+        stream,
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read the response");
+    response
+}
+
+#[test]
+fn a_request_to_the_running_binary_is_recorded_as_one_json_line_on_stdout() {
+    // The end-to-end claim the library tests cannot make: `main` installs the stdout sink, the
+    // writer thread drains it, and a real request produces a real line. Matched by substring —
+    // this target is std-only — on the discriminator and the fields this request determines.
+    let live = serve_live(&[]);
+    let response = post_unpaid(&live.addr);
+    assert!(response.starts_with("HTTP/1.1 402"), "expected a challenge; got:\n{response}");
+
+    let line = live
+        .next_stdout_line(std::time::Duration::from_secs(10))
+        .expect("no telemetry line on stdout");
+    assert!(line.starts_with(r#"{"v":1,"kind":"request","#), "{line}");
+    assert!(line.contains(r#""outcome":"payment_required""#), "{line}");
+    assert!(line.contains(r#""access":"payment""#), "{line}");
+    assert!(line.contains(r#""revenue":"0""#), "{line}");
+    assert!(line.contains(r#""upstream_invoked":false"#), "{line}");
+}
+
+#[test]
+fn with_telemetry_off_the_running_binary_writes_nothing_to_stdout() {
+    let live = serve_live(&[("OBOLUS_TELEMETRY", "off")]);
+    let response = post_unpaid(&live.addr);
+    assert!(response.starts_with("HTTP/1.1 402"), "expected a challenge; got:\n{response}");
+    // A line, were one written, arrives within milliseconds of the response; a second is ample.
+    let line = live.next_stdout_line(std::time::Duration::from_secs(1));
+    assert_eq!(line, None, "telemetry is off, yet stdout carried a line");
 }
 
 #[test]

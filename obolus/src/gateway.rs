@@ -157,6 +157,12 @@ impl<F: Facilitator> Gateway<F> {
         self
     }
 
+    /// How the installed telemetry sink describes itself — read off the sink this gateway will
+    /// actually record to, for `main`'s banner.
+    pub fn telemetry(&self) -> &str {
+        self.telemetry.description()
+    }
+
     /// Install a price determiner in place of the default [`StaticPrice`]. `main` calls this to wire
     /// a configured rate; every other caller (tests, integration harnesses) gets today's fixed
     /// per-option pricing unless it opts in, so the seam changes no quote until it is used.
@@ -419,6 +425,12 @@ impl<F: Facilitator> Access<F> {
     /// could not have printed otherwise — see `tests/server_arming.rs`.
     pub fn token_path(&self) -> Option<&str> {
         self.token.as_ref().map(TokenPath::description)
+    }
+
+    /// How the telemetry sink this instance will actually record to describes itself. Same reason
+    /// as [`Access::token_path`]: the banner is keyed on the routed value, not the configuration.
+    pub fn telemetry(&self) -> &str {
+        self.gateway.telemetry()
     }
 }
 
