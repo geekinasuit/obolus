@@ -8,7 +8,8 @@ the near-term work is growing into.
 For *why* the product exists and where it is headed, see [`vision.md`](vision.md). For the
 payment protocol itself, if HTTP 402 / x402 is new to you, start with
 [`x402-ecosystem.html`](x402-ecosystem.html). For the pricing subsystem in depth, see
-[`pricing.md`](pricing.md).
+[`pricing.md`](pricing.md); for what is recorded about each request, see
+[`telemetry.md`](telemetry.md).
 
 ## What Obolus is
 
@@ -75,6 +76,7 @@ flowchart TB
     pricing["<b>Price determiner</b> (seam)<br/>what to quote<br/>(pricing.rs)"]
     x402["<b>x402 protocol</b><br/>challenge / envelope / amounts<br/>(x402.rs)"]
     token["<b>Token path</b><br/>operator-issued bearer bypass<br/>(access.rs)"]
+    telemetry["<b>Telemetry</b> (seam)<br/>one event per request<br/>(telemetry.rs)"]
   end
 
   facilitator["<b>Facilitator</b> (seam)<br/>verify + settle payment<br/>(facilitator.rs)"]
@@ -88,6 +90,7 @@ flowchart TB
   gateway --> pricing
   gateway --> x402
   gateway --> token
+  gateway --> telemetry
   arming -->|"witness required to<br/>construct a Gateway"| gateway
   gateway --> facilitator
   gateway --> upstream
@@ -96,9 +99,10 @@ flowchart TB
 ```
 
 **Gateway (`gateway.rs`).** The orchestrator. It holds the routing registry, the facilitator
-seam, the price determiner, and the armed requirements witness, and it drives one request from
-arrival to settled response. It is generic over the facilitator type (`Gateway<F: Facilitator>`)
-and holds the upstreams and the price determiner as trait objects.
+seam, the price determiner, the telemetry sink, and the armed requirements witness, and it drives
+one request from arrival to settled response. It is generic over the facilitator type
+(`Gateway<F: Facilitator>`) and holds the upstreams, the price determiner, and the telemetry sink
+as trait objects.
 
 **Arming guard (`arming.rs`).** The sole authority over which payment networks the gateway may
 advertise. `check_arming` checks every requested network against an allowlist transcribed from
@@ -135,6 +139,13 @@ payment requirement. This is the subject of [`pricing.md`](pricing.md); the shor
 `PriceDeterminer::quote(PriceContext) -> u128` trait, called once per advertised requirement and
 only on the paying path.
 
+**Telemetry seam (`telemetry.rs`).** Recording what happened to each request, for reckoning
+revenue against cost. The completion route records exactly one `RequestEvent` per request that
+reaches its handler —
+outcome, routed backend and model, the prices quoted, the option paid, whether the upstream ran,
+and the derived cost and revenue — through a `Telemetry::record` that cannot fail the request.
+See [`telemetry.md`](telemetry.md).
+
 **Token path (`access.rs`).** An optional operator-issued bearer-token bypass. A request carrying
 a token the operator's public keys verify is served without payment. This path verifies operator
 signatures (it checks a signature, it cannot mint one) and reaches no chain, so it sits outside
@@ -162,9 +173,10 @@ The seams, and what rides behind each:
 | Fulfillment | `Facilitator` | Is this payment good, and settle it | delegating (HTTP), test fake |
 | Upstream | `Upstream` | Serve the inference | Ollama / OpenAI-compatible, test fake |
 | Pricing | `PriceDeterminer` | What does this request cost | static, cost-plus (config-selectable; cost-plus is per-backend, single-chain); flat (a library rate, not yet wired to config) |
+| Telemetry | `Telemetry` | What happened to this request | no-op (the default), test fake; a JSON-lines stdout sink for the binary is next |
 
-Planned seams named by the vision but not yet built: telemetry/metrics (out-of-process revenue
-and cost reporting) and feature-flags/kill-switch (per-backend switches and spend caps).
+A planned seam named by the vision but not yet built: feature-flags/kill-switch (per-backend
+switches and spend caps).
 
 ## Key flows
 
@@ -220,6 +232,7 @@ sequenceDiagram
   U-->>G: 200 OK (body not yet streamed)
   G->>F: settle(payment)
   F-->>G: receipt
+  G->>G: record one telemetry event
   G-->>C: stream answer (receipt in the response header)
 ```
 
@@ -262,6 +275,8 @@ per-backend cost-plus and a time-bounded promotional discount over it have lande
 declares its own cost, the margin stays gateway-wide, and a promotion is a percentage off during a
 window), on the seam and registry already described; a genuinely free rate and cross-asset
 (multi-chain) cost-plus are the remaining steps. See [`pricing.md`](pricing.md) for that design.
+Telemetry has its seam and per-request event; the default sink the binary installs is next — see
+[`telemetry.md`](telemetry.md).
 
 Sequenced after the stateless core: an admin UX and the stateless→stateful transition,
 feature-flags / kill-switch, client-key pass-through, Anthropic-compatible routing,

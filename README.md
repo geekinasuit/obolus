@@ -42,10 +42,12 @@ without crypto, and A1's types are built to preserve it.
 | `obolus/src/facilitator.rs` | The `Facilitator` seam + `DelegatedFacilitator` (real HTTP) + the test-only `FakeFacilitator` |
 | `obolus/src/upstream.rs` | The `Upstream` seam + `OllamaUpstream` (real HTTP proxy) + the test-only `FakeUpstream` |
 | `obolus/src/gateway.rs` | Route wiring, and the decision of *when we charge* |
+| `obolus/src/telemetry.rs` | The `Telemetry` seam, the one event recorded per request, and the test-only `FakeTelemetry` |
 | `obolus/src/main.rs` | The `obolus` binary, wired to the real facilitator + Ollama upstream (env-configured); testnet-by-construction |
 | `docs/x402-ecosystem.html` | **Orientation:** what x402 is, who the participants are, the Bazaar discovery layer, and where Obolus sits on the rail. Start here if the protocol is new to you — this README assumes it |
 | `docs/architecture.md` | **The map:** what Obolus is, the components and seams it is built from, and the paths a request takes — for a reader with no prior context |
 | `docs/pricing.md` | **Pricing design:** how a request's price is decided — the cost-vs-quote denomination frame, the rate structures, the config, and the granularity decision |
+| `docs/telemetry.md` | **Telemetry design:** the one event recorded per request, how its cost and revenue are derived, and the line format an operator's tooling reads |
 | `docs/vision.md` | Product vision and the settled design directions the seams are built to honor |
 
 ## Build and test
