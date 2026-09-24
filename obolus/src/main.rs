@@ -30,9 +30,9 @@ use obolus::arming::{
     check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
-    parse_accepts, require_backend_costs, select_pricing, select_promo, select_telemetry,
-    superseded_single_chain_vars, validated_option, EntryDefect, EntryField, PricingChoice,
-    SharedOffer, TelemetryChoice,
+    parse_accepts, parse_extra, require_backend_costs, select_pricing, select_promo,
+    select_telemetry, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
+    PricingChoice, SharedOffer, TelemetryChoice, EXTRA_VAR,
 };
 use obolus::backends::{load_backends, Backends};
 use obolus::facilitator::DelegatedFacilitator;
@@ -117,6 +117,9 @@ fn single_chain_defect(defect: EntryDefect) -> anyhow::Error {
              receiving address."
         ),
         EntryDefect::BadAmount(detail) => anyhow::anyhow!("OBOLUS_PRICE: {detail}"),
+        EntryDefect::MissingTokenDomain { .. } => {
+            anyhow::anyhow!("OBOLUS_NETWORK names an EVM chain, so OBOLUS_EXTRA must carry the token domain: {defect}")
+        }
     }
 }
 
@@ -258,8 +261,8 @@ async fn main() -> anyhow::Result<()> {
     // One Obolus can advertise several chains at once. `OBOLUS_ACCEPTS`, when set, is a
     // JSON array of `{network, asset, payTo, amount, extra?}` — the client picks one from the 402
     // and pays it. Unset, we build the single option from OBOLUS_NETWORK / OBOLUS_ASSET /
-    // OBOLUS_PAY_TO / OBOLUS_PRICE. The `(scheme, network)` uniqueness of the resulting set is
-    // enforced by `Gateway::new` below, not here.
+    // OBOLUS_PAY_TO / OBOLUS_PRICE / OBOLUS_EXTRA. The `(scheme, network)` uniqueness of the
+    // resulting set is enforced by `Gateway::new` below, not here.
     let requirements: Vec<PaymentRequirements> = match std::env::var("OBOLUS_ACCEPTS") {
         Ok(raw) => {
             // Set but empty, first — before the supersession bail below and before `parse_accepts`.
@@ -284,7 +287,8 @@ async fn main() -> anyhow::Result<()> {
                      `=`, an empty ConfigMap key. Set-but-empty is not the same as unset here: an \
                      empty array still takes precedence, so it would configure nothing while \
                      silencing everything. Unset it to configure a single chain with \
-                     OBOLUS_NETWORK / OBOLUS_ASSET / OBOLUS_PAY_TO / OBOLUS_PRICE instead, or give \
+                     OBOLUS_NETWORK / OBOLUS_ASSET / OBOLUS_PAY_TO / OBOLUS_PRICE / OBOLUS_EXTRA \
+                     instead, or give \
                      it a JSON array of \
                      {{\"network\",\"asset\",\"payTo\",\"amount\"}} objects."
                 );
@@ -313,12 +317,13 @@ async fn main() -> anyhow::Result<()> {
             //
             // An unset variable still takes its placeholder default — that is the un-configured
             // state, which boots and says so. What is rejected here is set-but-empty.
+            let extra = parse_extra(std::env::var(EXTRA_VAR).ok().as_deref())?;
             vec![validated_option(
                 env_or("OBOLUS_NETWORK", PLACEHOLDER_NETWORK),
                 env_or("OBOLUS_ASSET", PLACEHOLDER_ASSET),
                 env_or("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO),
                 &env_or("OBOLUS_PRICE", "1000"),
-                None,
+                extra,
                 &shared,
             )
             .map_err(single_chain_defect)?]

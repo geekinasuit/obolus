@@ -22,33 +22,25 @@
 //! token contract's EIP-712 domain: `name`, `version`, `chainId`, `verifyingContract`. Two of the
 //! four are already in the payment requirements — `verifyingContract` *is* the advertised asset,
 //! and `chainId` is the CAIP-2 network's reference. The other two are properties of the token
-//! contract. x402 v2's EVM `exact` scheme carries them in the option's `extra`, but this seller
-//! does not read them from there yet (#72): they are configuration here, and startup refuses an
-//! advertised `extra` that names different ones, since a client signs under what it is shown. Every
-//! rejection renders the domain it used: a misconfigured `name` produces a signature that does not
-//! recover, and "bad signature" with no domain printed is precisely the dead end this crate exists
-//! to help someone out of.
+//! contract, which x402 v2's EVM `exact` scheme carries in the option's `extra` as `name` and
+//! `version`. They are read from the option this seller **offered** — never from the `accepted`
+//! option in the payment, which the client wrote.
+//!
+//! # What that means this seller cannot catch
+//!
+//! A client that follows the challenge signs under the same `extra` this seller verifies under, so
+//! the two always agree. A `name` or `version` that is wrong for the real token contract therefore
+//! passes here, and fails only when a real facilitator settles against the chain. Verification here
+//! proves a client signs what it is shown; it does not prove what it is shown is right. That is the
+//! shared-misunderstanding case the repository's own invariants put outside anything we author, and
+//! only a real testnet settle closes it.
+//!
+//! Every rejection renders the domain it used: "bad signature" with no domain printed is precisely
+//! the dead end this crate exists to help someone out of.
 
 use eip3009::{decode_hex_array, Authorization, Eip712Domain};
 use obolus::x402::{PaymentPayload, PaymentRequirements};
 use serde_json::Value;
-
-/// The `name` and `version` halves of the token contract's EIP-712 domain — the two fields this
-/// seller is told by configuration rather than reading them from the advertised `extra`.
-///
-/// Defaults to the Base Sepolia USDC values, which is what the specification's own example was
-/// signed under, so a client following the spec's worked example verifies out of the box.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TokenDomain {
-    pub name: String,
-    pub version: String,
-}
-
-impl Default for TokenDomain {
-    fn default() -> Self {
-        Self { name: "USDC".to_string(), version: "2".to_string() }
-    }
-}
 
 /// A decoded `exact`-scheme EVM payload: the authorization and the signature over it.
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +103,15 @@ pub enum VerifyError {
     )]
     UnusableNetwork { network: String },
 
+    /// The offered option's `extra` has no usable `name` or `version`. Startup refuses such an EVM
+    /// option (`obolus::config::validated_option`), so reaching this means an option was built some
+    /// other way.
+    #[error(
+        "cannot verify against the option on {network:?}: its extra has no non-empty string \
+         {key:?}, and that is half of the EIP-712 domain a signature is checked under"
+    )]
+    MissingTokenDomain { network: String, key: &'static str },
+
     #[error("payment names scheme {got:?}; this resource is advertised as {want:?}")]
     SchemeMismatch { got: String, want: String },
 
@@ -131,14 +132,15 @@ pub enum VerifyError {
     )]
     AmountMismatch { got: u128, want: u128 },
 
-    /// Renders the domain, deliberately. Without it this says only "bad signature", and the
-    /// likeliest cause is a `name`/`version` mismatch the payer cannot see from the outside.
+    /// Renders the domain, deliberately. Without it this says only "bad signature". The domain is
+    /// the one this seller advertised, so a client that followed the challenge signed under the
+    /// same one; the message says so rather than blaming configuration a client cannot see.
     #[error(
         "signature does not recover to the authorizing party.\n  authorization.from: {expected}\n  \
-         recovered:          {recovered}\n  verified under EIP-712 domain: {domain}\n  If the \
-         payer signed correctly, the domain above is wrong — name and version are properties of \
-         the token contract, and this seller takes them from OBOLUS_DEV_TOKEN_NAME and \
-         OBOLUS_DEV_TOKEN_VERSION. Set those to match the contract the payer signed against."
+         recovered:          {recovered}\n  verified under EIP-712 domain: {domain}\n  That is \
+         the domain this seller advertised (extra.name and extra.version, the asset, the chain \
+         id). A client that signs under the challenge's extra agrees with it, so check that the \
+         client signed under the advertised extra, over this exact authorization."
     )]
     NotRecovered { expected: String, recovered: String, domain: String },
 
@@ -187,16 +189,32 @@ pub fn parse_exact_payload(payload: &Value) -> Result<ExactPayload, VerifyError>
     })
 }
 
-/// Build the EIP-712 domain to verify under, from what was advertised plus the two configured
-/// token fields.
-pub fn domain_for(
-    requirements: &PaymentRequirements,
-    token: &TokenDomain,
-) -> Result<Eip712Domain, VerifyError> {
+/// Build the EIP-712 domain to verify under, entirely from the option this seller offered.
+///
+/// Takes the offered requirements, not the payment: the payment's `accepted.extra` is the client's,
+/// and may carry keys of its own. Verifying under anything the client wrote would let it choose the
+/// domain its own signature is checked against.
+pub fn domain_for(requirements: &PaymentRequirements) -> Result<Eip712Domain, VerifyError> {
+    // The chain first: a non-EVM option has no EIP-712 domain at all, so asking it for a token
+    // name would send the operator to add one before telling them the option cannot be verified.
+    let chain_id = chain_id_of(&requirements.network)?;
+    let token_field = |key: &'static str| {
+        requirements
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| VerifyError::MissingTokenDomain {
+                network: requirements.network.clone(),
+                key,
+            })
+    };
     Ok(Eip712Domain {
-        name: token.name.clone(),
-        version: token.version.clone(),
-        chain_id: chain_id_of(&requirements.network)?,
+        name: token_field("name")?,
+        version: token_field("version")?,
+        chain_id,
         verifying_contract: decode_hex_array::<20>(&requirements.asset)
             .map_err(|_| VerifyError::UnusableAsset { asset: requirements.asset.clone() })?,
     })

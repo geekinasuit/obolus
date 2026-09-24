@@ -107,9 +107,10 @@ Configuration is by environment variable:
 | `OBOLUS_NETWORK` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_PAY_TO` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_ASSET` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
+| `OBOLUS_EXTRA` | unset | The single-chain option's `extra`: a JSON object, advertised as given. **Required when `OBOLUS_NETWORK` is an `eip155:` chain** — x402's `exact` scheme there defaults to EIP-3009 transfers, which need the token's EIP-712 domain as non-empty strings `name` and `version` (USDC on Base Sepolia: `{"name":"USDC","version":"2"}`), and a client without them cannot sign. Missing either, set-but-empty, or not a JSON object is a startup error. In a shell, single-quote the value — `OBOLUS_EXTRA='{"name":"USDC","version":"2"}'` — since unquoted the shell strips the JSON's double quotes (and, where the assignment is an argument, as to `env`, brace expansion splits it at the comma) before Obolus sees it. Obolus cannot tell whether the domain is right for the token contract: a wrong one boots, and every payment then fails at the facilitator. |
 | `OBOLUS_DESCRIPTION` | `One inference request` | Free text shown in the challenge. |
 | `OBOLUS_ALLOW_MAINNET` | unset | **Arming value.** Unset, Obolus refuses to start if **any** advertised `network` is not on its pinned testnet allowlist — a mainnet id, a typo, or a testnet x402 added after this build. To advertise one anyway, set this to **exactly the network id(s) to arm**, comma-separated (`eip155:8453`, or `eip155:8453,eip155:1`); the startup log then carries a `*** MAINNET ARMED ***` banner naming every armed network. The value must name every advertised unproven network and nothing else: an id the gateway does not advertise, or one already on the allowlist, is a startup refusal, and so is the retired boolean form `1`. Comparison is byte-exact, so a typo in the value fails closed. See [Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network). |
-| `OBOLUS_ACCEPTS` | unset | **Multi-chain override.** A JSON array of `{"network","asset","payTo","amount"}` objects (plus an optional `extra` object, advertised as given) — one per chain — advertised together in a single 402; the client picks one to pay. When set it **supersedes** the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` vars — and setting both at once is a **startup error** (the single-chain values would be inert, so the server refuses rather than advertise a config you did not intend). At most one entry per `(scheme, network)`; see [Advertising more than one chain](#advertising-more-than-one-chain). |
+| `OBOLUS_ACCEPTS` | unset | **Multi-chain override.** A JSON array of `{"network","asset","payTo","amount"}` objects (plus an `extra` object, advertised as given, which an `eip155:` entry must carry with the token's `name` and `version`) — one per chain — advertised together in a single 402; the client picks one to pay. When set it **supersedes** the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` / `OBOLUS_EXTRA` vars — and setting both at once is a **startup error** (the single-chain values would be inert, so the server refuses rather than advertise a config you did not intend). At most one entry per `(scheme, network)`; see [Advertising more than one chain](#advertising-more-than-one-chain). |
 | `OBOLUS_TOKEN_PUBKEY_FILE` | unset | **Turns the bearer-token path on.** Path to an Ed25519 **public** key in PEM (`openssl pkey -pubout`). Unset, there is no token path at all and every caller pays — the previous behaviour. Set, a caller presenting a token this key verifies is served without paying; everyone else still gets the 402. A file that is missing or is not an Ed25519 public key is a startup error, not a per-request one — and so is setting this to an empty string, which would otherwise ask for a token path while naming no key to build one from. See [Serving without payment](#serving-without-payment). |
 | `OBOLUS_TOKEN_KEYS` | unset | **The multi-key form, for rotation.** A JSON array of `{"kid": "...", "file": "..."}` objects; `kid` is optional. Supersedes `OBOLUS_TOKEN_PUBKEY_FILE`, and setting **both is a startup error** — the superseded one would sit inert, and an inert *verifying* key says nothing until a token signed with it is refused. A token naming a `kid` is checked against that key first, but a `kid` that matches nothing (or is absent) does not reject the token: it is checked against the rest of the set. At most 8 keys, no `kid` repeated, no key armed twice, every named file readable — each a startup error naming the offending entry. Set-but-empty (or whitespace-only) is its own startup error rather than the both-set one, since an array that arrived empty configures nothing. See [Rotating the signing key](#rotating-the-signing-key). |
 | `OBOLUS_TOKEN_ISSUER` | **required with the keys** | The exact `iss` every honoured token must carry. Not optional and has no default: a signing key usually belongs to an identity provider rather than to one service, so with nothing to check `iss` against, every token that key has ever minted — for any audience — would buy inference here. Setting the key without this, or setting it empty, is a startup error — as is setting **this** without the key, which would otherwise be a silent no-op that 402s every caller while looking configured. |
@@ -133,6 +134,8 @@ the log says plainly; a variable that arrived carrying nothing is a different th
 `${VAR}` in a compose file, an `EnvironmentFile` line ending in `=`, an empty ConfigMap key — and an
 empty `payTo` would advertise a challenge that sends money nowhere. The same check runs on
 `OBOLUS_ACCEPTS` entries; both forms go through one per-option validator, so they cannot disagree.
+`OBOLUS_EXTRA` set but empty is refused the same way, and on an `eip155:` network leaving it unset is
+refused too — there is no placeholder token domain to fall back on.
 
 `OBOLUS_ACCEPTS` **set but empty** is a startup error too, and it is the one that matters most,
 because this is the variable whose *set-ness* chooses which of the two configuration forms runs. An
@@ -324,8 +327,12 @@ to a JSON array with one object per chain:
 `amount` is the price in the token's atomic units, as a decimal string. It is x402 v2's name for
 what v1 called `maxAmountRequired`, and an entry still using the v1 key is refused by name rather
 than read. `extra` is scheme-specific; Obolus advertises it exactly as given, and a payment must carry
-every key it names, with the same value. x402's `exact` scheme on an EVM chain requires the
-token's EIP-712 domain `name` and `version` there, as in the first entry — clients sign under it.
+every key it names, with the same value. On an EVM chain, x402's `exact` scheme transfers by
+EIP-3009 unless `extra` names another `assetTransferMethod`, and EIP-3009 requires the token's
+EIP-712 domain `name` and `version` there, as in the first entry — clients sign under it, and a
+reference client refuses to sign without them. Obolus requires both, as non-empty strings, on every
+`eip155:` entry, and refuses to start without them. Whether the values are *right* for the token
+contract is not something Obolus can check; a wrong domain boots and fails at the facilitator.
 
 `network` must be the **CAIP-2** `namespace:reference` id (Base Sepolia and Solana Devnet above), not
 an x402 short name like `base-sepolia`. The arming guard compares byte-exactly against a CAIP-2
@@ -340,7 +347,7 @@ Obolus settles against the option it **actually paid**. The gateway-wide fields 
 `OBOLUS_DESCRIPTION`, `OBOLUS_MAX_TIMEOUT_SECS`, and the `exact` scheme — are shared across every
 entry, so an entry names only what a chain changes. Leaving `OBOLUS_ACCEPTS` unset is exactly the old
 single-chain behaviour: one option built from `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` /
-`OBOLUS_PRICE`.
+`OBOLUS_PRICE` / `OBOLUS_EXTRA`.
 
 Two rules the startup checks enforce:
 
@@ -356,10 +363,11 @@ Two rules the startup checks enforce:
 `OBOLUS_ACCEPTS` is validated at startup: a set-but-empty value, a malformed or empty array, an unknown/missing field, an
 empty `network` / `asset` / `payTo` (network is the match key, so an empty one can never match a real
 payment and would 402 forever; an empty asset or pay-to would advertise an option that sends money
-nowhere), a missing `amount` or one that is not a plain integer, the v1 key `maxAmountRequired`, or
-an `extra` that is not a JSON object aborts the launch rather than
-advertising an unpayable or wrong challenge. Setting `OBOLUS_ACCEPTS` **together with** any of the
-single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` vars is likewise a
+nowhere), a missing `amount` or one that is not a plain integer, the v1 key `maxAmountRequired`,
+an `extra` that is not a JSON object, or an `eip155:` entry whose `extra` lacks the token's `name` or
+`version` aborts the launch rather than advertising an unpayable or wrong challenge. Setting
+`OBOLUS_ACCEPTS` **together with** any of the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` /
+`OBOLUS_PAY_TO` / `OBOLUS_PRICE` / `OBOLUS_EXTRA` vars is likewise a
 startup error, naming the ignored vars — a gateway that silently advertises a different network than
 its operator configured is exactly the surprise to fail loudly on. It stays
 **testnet-by-construction** the same way the single-chain vars do — Obolus has no signing path, so it
@@ -470,3 +478,8 @@ facilitator still rejects. The load-bearing checks are deliberately outside our 
 the published EIP-3009 / EIP-712 known-answer vector, and a real testnet settle against a
 third-party facilitator. Nothing in this crate may become the thing that decides whether the
 signer is correct.
+
+`obolus-devseller` has the same blind spot in a sharper form. It verifies a payment under the
+EIP-712 domain its own challenge advertised, so a client that follows the challenge always agrees
+with it. A domain that is wrong for the real token contract — the wrong `name` or `version` in
+`extra` — therefore passes the devseller and fails only at a real settle.
