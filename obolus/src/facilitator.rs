@@ -23,7 +23,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 
-use crate::x402::{PaymentPayload, PaymentRequirements, SettlementReceipt};
+use crate::x402::{PaymentPayload, PaymentRequirements, SettlementReceipt, X402_VERSION};
 
 /// Why a facilitator did not complete a payment.
 ///
@@ -52,7 +52,7 @@ pub trait Facilitator: Send + Sync + 'static {
         requirements: &PaymentRequirements,
     ) -> impl Future<Output = Result<(), FacilitatorError>> + Send;
 
-    /// Collect the payment, returning the receipt we hand back in `X-PAYMENT-RESPONSE`.
+    /// Collect the payment, returning the receipt we hand back in `PAYMENT-RESPONSE`.
     fn settle(
         &self,
         payment: &PaymentPayload,
@@ -223,9 +223,11 @@ impl Facilitator for FakeFacilitator {
         match &self.outcome {
             FakeOutcome::Accept => Ok(SettlementReceipt {
                 success: true,
-                transaction: Some(self.transaction.clone()),
-                network: payment.network.clone(),
+                error_reason: None,
+                transaction: self.transaction.clone(),
+                network: payment.accepted().network.clone(),
                 payer: None,
+                amount: None,
             }),
             FakeOutcome::AcceptThenFailSettlement(reason) => {
                 Err(FacilitatorError::Unavailable(reason.clone()))
@@ -235,9 +237,11 @@ impl Facilitator for FakeFacilitator {
             }
             FakeOutcome::AcceptThenUnsuccessfulReceipt => Ok(SettlementReceipt {
                 success: false,
-                transaction: None,
-                network: payment.network.clone(),
+                error_reason: None,
+                transaction: String::new(),
+                network: payment.accepted().network.clone(),
                 payer: None,
+                amount: None,
             }),
             FakeOutcome::Reject(reason) => Err(FacilitatorError::Rejected(reason.clone())),
             FakeOutcome::Unavailable(reason) => Err(FacilitatorError::Unavailable(reason.clone())),
@@ -283,10 +287,12 @@ pub enum DelegatedFacilitatorError {
     NotAnHttpBase(String),
 }
 
-/// The body both `/verify` and `/settle` take; this wrapper only adds the top-level `x402Version`.
+/// The body both `/verify` and `/settle` take. `paymentPayload` is the client's payment as received
+/// (see [`PaymentPayload`]), so the facilitator judges what the client sent; `paymentRequirements` is
+/// the option it was matched to.
 ///
-/// The legacy facilitator *type* omits `x402Version` at this level, but every reference
-/// implementation puts it on the wire — so we send it, trusting the wire over the stale type.
+/// The top-level `x402Version` is the version obolus speaks, which is the only version a payment
+/// that reached this point can name.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct FacilitatorRequest<'a> {
@@ -324,7 +330,13 @@ struct SettleResponse {
     transaction: Option<String>,
     #[serde(default)]
     network: Option<String>,
+    #[serde(default)]
+    amount: Option<String>,
 }
+
+/// The `/settle` `errorReason` for a settlement that was broadcast but not confirmed: x402 v2 §9
+/// makes it non-terminal, since the transaction may still land.
+const SETTLEMENT_PENDING: &str = "settlement_pending";
 
 /// A [`Facilitator`] that delegates `verify` and `settle` to a third-party x402 facilitator over
 /// HTTP.
@@ -405,7 +417,7 @@ impl DelegatedFacilitator {
         requirements: &PaymentRequirements,
     ) -> Result<(StatusCode, Bytes), FacilitatorError> {
         let envelope = FacilitatorRequest {
-            x402_version: payment.x402_version,
+            x402_version: X402_VERSION,
             payment_payload: payment,
             payment_requirements: requirements,
         };
@@ -520,14 +532,31 @@ impl Facilitator for DelegatedFacilitator {
         })?;
         match parsed.success {
             // `success` is the sole authority — build the receipt ourselves rather than deserialize
-            // the domain type, normalizing "" to absent and filling the network from the payment
-            // when the facilitator omits it.
+            // the domain type, filling the network from the payment when the facilitator omits it.
+            // `transaction` stays a string, empty when none was named, as the receipt format
+            // requires.
             Some(true) => Ok(SettlementReceipt {
                 success: true,
-                transaction: non_empty(parsed.transaction),
-                network: non_empty(parsed.network).unwrap_or_else(|| payment.network.clone()),
+                error_reason: None,
+                transaction: parsed.transaction.unwrap_or_default(),
+                network: non_empty(parsed.network)
+                    .unwrap_or_else(|| payment.accepted().network.clone()),
                 payer: non_empty(parsed.payer),
+                amount: non_empty(parsed.amount),
             }),
+            // Broadcast but unconfirmed: the payer may yet be charged. By now the upstream has
+            // already run, so a 402 here would invite a second payment for one answer; this is a
+            // 502 instead, and the answer is withheld. The hash goes to the log (via the gateway),
+            // which is all the reconciliation there is today — #75. It is the facilitator's own
+            // string, so it is logged with `{:?}`, never interpreted.
+            Some(false) if parsed.error_reason.as_deref() == Some(SETTLEMENT_PENDING) => {
+                Err(FacilitatorError::Unavailable(format!(
+                    "facilitator /settle reported {SETTLEMENT_PENDING}: transaction {:?} on network \
+                     {:?} was broadcast but not confirmed, and may still settle",
+                    parsed.transaction.unwrap_or_default(),
+                    non_empty(parsed.network).unwrap_or_else(|| payment.accepted().network.clone()),
+                )))
+            }
             // A definite non-settlement: a pre-broadcast refusal (`transaction: ""`) or an on-chain
             // revert (a real hash, but reverted — no funds moved). Either way the payer was not
             // charged, so it is the client's 402 to retry, carrying the facilitator's own reason
@@ -584,47 +613,62 @@ mod delegated_tests {
     use serde_json::{json, Value};
     use tokio::net::TcpListener;
 
-    use crate::x402::{SCHEME_EXACT, X402_VERSION};
+    use crate::x402::{decode_payment, SCHEME_EXACT};
 
     // Obviously-synthetic fixtures — never real identifiers.
     const FIXTURE_NETWORK: &str = "test-network-not-a-real-caip2";
     const FIXTURE_PAY_TO: &str = "0xTEST-PAY-TO-ADDRESS-NOT-REAL";
     const FIXTURE_ASSET: &str = "0xTEST-ASSET-ADDRESS-NOT-REAL";
 
-    fn payment() -> PaymentPayload {
-        PaymentPayload {
-            x402_version: X402_VERSION,
-            scheme: SCHEME_EXACT.to_string(),
-            network: FIXTURE_NETWORK.to_string(),
-            payload: json!({ "authorization": "opaque-to-phase-a" }),
-        }
-    }
-
     fn requirements() -> PaymentRequirements {
         PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: FIXTURE_NETWORK.to_string(),
-            max_amount_required: "1000".to_string(),
-            resource: "http://127.0.0.1:8402/v1/chat/completions".to_string(),
-            description: "One inference request".to_string(),
-            mime_type: "application/json".to_string(),
+            amount: "1000".to_string(),
+            asset: FIXTURE_ASSET.to_string(),
             pay_to: FIXTURE_PAY_TO.to_string(),
             max_timeout_seconds: 60,
-            asset: FIXTURE_ASSET.to_string(),
             extra: None,
         }
     }
 
-    // Byte-exact response fixtures, field names and example values copied verbatim from the x402 v1
+    /// A payment as a client sent it, including fields obolus does not model — a `resource`, an
+    /// `extensions` entry and an `extra` key of the client's own — so that forwarding it "as
+    /// received" is visible in what the facilitator is handed.
+    fn sent() -> Value {
+        json!({
+            "x402Version": 2,
+            "resource": { "url": "http://127.0.0.1:8402/v1/chat/completions" },
+            "accepted": {
+                "scheme": SCHEME_EXACT,
+                "network": FIXTURE_NETWORK,
+                "amount": "1000",
+                "asset": FIXTURE_ASSET,
+                "payTo": FIXTURE_PAY_TO,
+                "maxTimeoutSeconds": 60,
+                "extra": { "clientChose": "this" },
+            },
+            "payload": { "authorization": "opaque-to-phase-a" },
+            "extensions": { "some-extension": { "info": { "k": "v" } } },
+        })
+    }
+
+    fn payment() -> PaymentPayload {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(sent().to_string());
+        decode_payment(&encoded).expect("the fixture is a well-formed payment")
+    }
+
+    // Byte-exact response fixtures, field names and example values copied verbatim from the x402 v2
     // spec §7.1/§7.2 (whitespace normalized). They are an out-of-distribution oracle for our wire
     // types: rename a field and these stop mapping. Threaded through the real HTTP path below as the
     // mock's canned bodies rather than parsed in isolation.
-    // https://github.com/coinbase/x402/blob/main/specs/x402-specification-v1.md
+    // https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md
     const SPEC_VERIFY_SUCCESS: &str =
         r#"{"isValid":true,"payer":"0x857b06519E91e3A54538791bDbb0E22373e36b66"}"#;
     const SPEC_VERIFY_ERROR: &str = r#"{"isValid":false,"invalidReason":"insufficient_funds","payer":"0x857b06519E91e3A54538791bDbb0E22373e36b66"}"#;
-    const SPEC_SETTLE_SUCCESS: &str = r#"{"success":true,"payer":"0x857b06519E91e3A54538791bDbb0E22373e36b66","transaction":"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef","network":"base-sepolia"}"#;
-    const SPEC_SETTLE_ERROR: &str = r#"{"success":false,"errorReason":"insufficient_funds","payer":"0x857b06519E91e3A54538791bDbb0E22373e36b66","transaction":"","network":"base-sepolia"}"#;
+    const SPEC_SETTLE_SUCCESS: &str = r#"{"success":true,"payer":"0x857b06519E91e3A54538791bDbb0E22373e36b66","transaction":"0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef","network":"eip155:84532"}"#;
+    const SPEC_SETTLE_ERROR: &str = r#"{"success":false,"errorReason":"insufficient_funds","payer":"0x857b06519E91e3A54538791bDbb0E22373e36b66","transaction":"","network":"eip155:84532"}"#;
 
     /// One canned facilitator response: a status, a body, and an optional delay so a test can make
     /// the endpoint hang past the client's timeout.
@@ -740,18 +784,25 @@ mod delegated_tests {
         assert_eq!(facilitator.verify(&payment(), &requirements()).await, Ok(()));
 
         // The request the facilitator received is the {x402Version, paymentPayload,
-        // paymentRequirements} envelope, camelCased end to end.
+        // paymentRequirements} envelope: the payment exactly as the client sent it, unmodelled
+        // fields and all, beside the option it was matched to.
         let log = captured.lock().unwrap();
         assert_eq!(log.len(), 1);
         let (endpoint, body) = &log[0];
         assert_eq!(*endpoint, "verify");
-        assert_eq!(body["x402Version"], json!(X402_VERSION));
-        assert_eq!(body["paymentPayload"]["scheme"], json!("exact"));
-        assert_eq!(body["paymentPayload"]["network"], json!(FIXTURE_NETWORK));
-        assert_eq!(body["paymentPayload"]["payload"]["authorization"], json!("opaque-to-phase-a"));
-        assert_eq!(body["paymentRequirements"]["payTo"], json!(FIXTURE_PAY_TO));
-        assert_eq!(body["paymentRequirements"]["maxAmountRequired"], json!("1000"));
-        assert_eq!(body["paymentRequirements"]["maxTimeoutSeconds"], json!(60));
+        assert_eq!(body["x402Version"], json!(2));
+        assert_eq!(body["paymentPayload"], sent(), "forwarded as received");
+        assert_eq!(body["paymentRequirements"], serde_json::to_value(requirements()).unwrap());
+        assert_eq!(body["paymentRequirements"]["amount"], json!("1000"));
+    }
+
+    #[tokio::test]
+    async fn settle_forwards_the_payment_as_received_too() {
+        let (base, captured) = serve(unused(), Canned::ok(SPEC_SETTLE_SUCCESS)).await;
+        DelegatedFacilitator::new(base).unwrap().settle(&payment(), &requirements()).await.unwrap();
+        let log = captured.lock().unwrap();
+        assert_eq!(log[0].0, "settle");
+        assert_eq!(log[0].1["paymentPayload"], sent());
     }
 
     #[tokio::test]
@@ -807,11 +858,12 @@ mod delegated_tests {
             receipt,
             SettlementReceipt {
                 success: true,
-                transaction: Some(
-                    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string()
-                ),
-                network: "base-sepolia".to_string(),
+                error_reason: None,
+                transaction: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                    .to_string(),
+                network: "eip155:84532".to_string(),
                 payer: Some("0x857b06519E91e3A54538791bDbb0E22373e36b66".to_string()),
+                amount: None,
             }
         );
         assert_eq!(captured.lock().unwrap().len(), 1, "settle was called exactly once");
@@ -819,7 +871,7 @@ mod delegated_tests {
 
     #[tokio::test]
     async fn settle_normalizes_empty_payer_and_fills_missing_network_from_the_payment() {
-        let body = r#"{"success":true,"transaction":"0xabc","payer":"","network":""}"#;
+        let body = r#"{"success":true,"transaction":"0xabc","payer":"","network":"","amount":"1000"}"#;
         let (base, _c) = serve(unused(), Canned::ok(body)).await;
         let receipt = DelegatedFacilitator::new(base)
             .unwrap()
@@ -828,7 +880,37 @@ mod delegated_tests {
             .unwrap();
         assert_eq!(receipt.payer, None, "an empty payer is absent, not \"\"");
         assert_eq!(receipt.network, FIXTURE_NETWORK, "empty network falls back to the payment's");
-        assert_eq!(receipt.transaction.as_deref(), Some("0xabc"));
+        assert_eq!(receipt.transaction, "0xabc");
+        assert_eq!(receipt.amount.as_deref(), Some("1000"), "a settled amount is carried through");
+    }
+
+    #[tokio::test]
+    async fn a_success_naming_no_transaction_carries_the_empty_string() {
+        // The receipt format requires `transaction`; the empty string is its "none".
+        let (base, _c) = serve(unused(), Canned::ok(r#"{"success":true}"#)).await;
+        let receipt = DelegatedFacilitator::new(base)
+            .unwrap()
+            .settle(&payment(), &requirements())
+            .await
+            .unwrap();
+        assert_eq!(receipt.transaction, "");
+    }
+
+    #[tokio::test]
+    async fn a_pending_settlement_is_unavailable_never_a_rechallenge() {
+        // Broadcast, not confirmed, may still land. The upstream has already run by the time settle
+        // is called, so a Rejected here — a 402 — would ask the client to pay a second time for one
+        // answer. It must be Unavailable, and the hash has to reach the log so it can be reconciled.
+        let body = r#"{"success":false,"errorReason":"settlement_pending","transaction":"0xfeedbeef","network":"eip155:84532"}"#;
+        let (base, _c) = serve(unused(), Canned::ok(body)).await;
+        let err = DelegatedFacilitator::new(base)
+            .unwrap()
+            .settle(&payment(), &requirements())
+            .await
+            .unwrap_err();
+        let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
+        assert!(detail.contains("0xfeedbeef"), "the broadcast hash must be logged: {detail}");
+        assert!(detail.contains("settlement_pending"), "{detail}");
     }
 
     #[tokio::test]
@@ -847,7 +929,7 @@ mod delegated_tests {
         // The dangerous shape: success:false but a real, non-empty transaction hash (an on-chain
         // revert). `success` is the sole authority, so this must be a rejection — a client keying on
         // the transaction's presence would wrongly believe it settled.
-        let body = r#"{"success":false,"errorReason":"invalid_transaction_state","transaction":"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef","network":"base-sepolia"}"#;
+        let body = r#"{"success":false,"errorReason":"invalid_transaction_state","transaction":"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef","network":"eip155:84532"}"#;
         let (base, _c) = serve(unused(), Canned::ok(body)).await;
         let err = DelegatedFacilitator::new(base)
             .unwrap()
@@ -878,7 +960,7 @@ mod delegated_tests {
         // Pins the CURRENT behavior and its comment: `duplicate_settlement` is not special-cased in
         // Phase A — its real handling (serve the cached receipt) is the A3 idempotency cache, and
         // the fail-open-vs-terminal policy is Christian's call (#17).
-        let body = r#"{"success":false,"errorReason":"duplicate_settlement","transaction":"","network":"base-sepolia"}"#;
+        let body = r#"{"success":false,"errorReason":"duplicate_settlement","transaction":"","network":"eip155:84532"}"#;
         let (base, _c) = serve(unused(), Canned::ok(body)).await;
         let err = DelegatedFacilitator::new(base)
             .unwrap()
@@ -892,7 +974,7 @@ mod delegated_tests {
     async fn settle_without_a_verdict_is_unavailable() {
         // A body that parses but carries no `success` field: we cannot tell whether funds moved, so
         // it is our problem (502), never a 402 the client retries as a fresh payment.
-        let (base, _c) = serve(unused(), Canned::ok(r#"{"network":"base-sepolia"}"#)).await;
+        let (base, _c) = serve(unused(), Canned::ok(r#"{"network":"eip155:84532"}"#)).await;
         let err = DelegatedFacilitator::new(base)
             .unwrap()
             .settle(&payment(), &requirements())
@@ -942,7 +1024,7 @@ mod delegated_tests {
         // `success:true` with a transaction hash. A status-blind client builds a receipt and the
         // gateway serves a paid answer for a settlement that never authoritatively happened. A 5xx is
         // not a verdict, so this must be Unavailable, never a receipt.
-        let body = r#"{"success":true,"transaction":"0xabc","network":"base-sepolia"}"#;
+        let body = r#"{"success":true,"transaction":"0xabc","network":"eip155:84532"}"#;
         let (base, _c) =
             serve(unused(), Canned::status(StatusCode::INTERNAL_SERVER_ERROR, body)).await;
         let err = DelegatedFacilitator::new(base)
@@ -1062,7 +1144,7 @@ mod delegated_tests {
         // settle_rejects_on_success_false_with_the_facilitators_reason).
         let huge = "x".repeat(200);
         let body = format!(
-            r#"{{"success":false,"errorReason":"{huge}","transaction":"","network":"base-sepolia"}}"#
+            r#"{{"success":false,"errorReason":"{huge}","transaction":"","network":"eip155:84532"}}"#
         );
         let (base, _c) = serve(unused(), Canned::ok(&body)).await;
         let err = DelegatedFacilitator::new(base)

@@ -256,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // One Obolus can advertise several chains at once. `OBOLUS_ACCEPTS`, when set, is a
-    // JSON array of `{network, asset, payTo, maxAmountRequired}` — the client picks one from the 402
+    // JSON array of `{network, asset, payTo, amount, extra?}` — the client picks one from the 402
     // and pays it. Unset, we build the single option from OBOLUS_NETWORK / OBOLUS_ASSET /
     // OBOLUS_PAY_TO / OBOLUS_PRICE. The `(scheme, network)` uniqueness of the resulting set is
     // enforced by `Gateway::new` below, not here.
@@ -286,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
                      silencing everything. Unset it to configure a single chain with \
                      OBOLUS_NETWORK / OBOLUS_ASSET / OBOLUS_PAY_TO / OBOLUS_PRICE instead, or give \
                      it a JSON array of \
-                     {{\"network\",\"asset\",\"payTo\",\"maxAmountRequired\"}} objects."
+                     {{\"network\",\"asset\",\"payTo\",\"amount\"}} objects."
                 );
             }
             // OBOLUS_ACCEPTS supersedes the single-chain vars, which then sit inert. An operator who
@@ -318,6 +318,7 @@ async fn main() -> anyhow::Result<()> {
                 env_or("OBOLUS_ASSET", PLACEHOLDER_ASSET),
                 env_or("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO),
                 &env_or("OBOLUS_PRICE", "1000"),
+                None,
                 &shared,
             )
             .map_err(single_chain_defect)?]
@@ -409,9 +410,8 @@ async fn main() -> anyhow::Result<()> {
     let diagnosis = armed_requirements.diagnosis().to_string();
 
     // The second check on the advertised option set, beside the first because they read the same
-    // value: `new` rejects an empty set, and two options sharing (scheme, network) — a pair no
-    // payment envelope can tell apart, so the second entry is unreachable and a payment matching it
-    // could be settled against the wrong asset.
+    // value: `new` rejects an empty set, and two options sharing (scheme, network) — see
+    // `GatewayError::DuplicateOption`.
     //
     // Here rather than at the wiring site below, for the reason the guard above is here: a
     // configuration this process is about to refuse must not first be advertised. Past this point
@@ -424,8 +424,9 @@ async fn main() -> anyhow::Result<()> {
     // advertised" a property of the constructor rather than of this file's ordering. The witness
     // holds its own copy of the option set; `requirements` stays for the banner below, and neither
     // is mutated after the guard ran, so they cannot drift.
-    let gateway = Gateway::new(facilitator, backends.clone(), armed_requirements)
-        .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
+    let gateway =
+        Gateway::new(facilitator, backends.clone(), shared.resource_info(), armed_requirements)
+            .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
     // Install the selected rate, wrapped in the promotional discount if one is configured. The
     // arming guard's witness was consumed by `new` above, so no determiner — base or wrapped — can
     // alter which networks are advertised; it prices the amount and nothing else.
@@ -529,7 +530,7 @@ async fn main() -> anyhow::Result<()> {
             // Static: the armed amount IS the price, so it stays on the option line.
             PricingChoice::Static => eprintln!(
                 "obolus:   - network {} / asset {} / pay-to {} / {} atomic units",
-                r.network, r.asset, r.pay_to, r.max_amount_required
+                r.network, r.asset, r.pay_to, r.amount
             ),
             // Cost-plus: the armed amount is inert (the rate above determines it), so print the
             // option without it rather than a number no client would pay.

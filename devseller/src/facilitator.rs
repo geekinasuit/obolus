@@ -66,7 +66,7 @@ impl DevFacilitator {
         payment: &PaymentPayload,
         requirements: &PaymentRequirements,
     ) -> Result<(), VerifyError> {
-        let payload = parse_exact_payload(&payment.payload)?;
+        let payload = parse_exact_payload(payment.payload())?;
         // Terms before signature, deliberately. Both are rejections either way, but a client
         // paying the wrong price gets told the price rather than "your signature does not
         // recover" — which is what a domain mismatch also says, and the two are not confusable
@@ -79,9 +79,11 @@ impl DevFacilitator {
     fn receipt(&self, network: &str, payer: String, success: bool) -> SettlementReceipt {
         SettlementReceipt {
             success,
-            transaction: Some(SYNTHETIC_TRANSACTION.to_string()),
+            error_reason: None,
+            transaction: SYNTHETIC_TRANSACTION.to_string(),
             network: network.to_string(),
             payer: Some(payer),
+            amount: None,
         }
     }
 
@@ -97,7 +99,7 @@ impl DevFacilitator {
         if self.verify != VerifyMode::Verify {
             return UNKNOWN_PAYER.to_string();
         }
-        parse_exact_payload(&payment.payload)
+        parse_exact_payload(payment.payload())
             .map(|payload| crate::verify::render_address(&payload.authorization.from))
             .unwrap_or_else(|_| UNKNOWN_PAYER.to_string())
     }
@@ -134,15 +136,17 @@ impl Facilitator for DevFacilitator {
             SettleMode::Unsuccessful => {
                 Ok(self.receipt(&requirements.network, self.payer_of(payment), false))
             }
-            // `None`, not an empty string: both optional fields are `skip_serializing_if`, so they
-            // are absent from the encoded receipt entirely rather than present and blank. A client
-            // that reads `transaction` without checking finds a missing key — a settlement
-            // reported as successful that the payer has no way to look up.
+            // As empty as the receipt format allows: `transaction` is required, so it is present and
+            // blank — the format's own "nothing was broadcast" — while `success` says it settled.
+            // A settlement reported as successful that the payer has no way to look up, and a
+            // client that trusts `success` without reading the rest never notices.
             SettleMode::EmptyReceipt => Ok(SettlementReceipt {
                 success: true,
-                transaction: None,
+                error_reason: None,
+                transaction: String::new(),
                 network: String::new(),
                 payer: None,
+                amount: None,
             }),
             SettleMode::Unavailable(reason) => Err(FacilitatorError::Unavailable(reason.clone())),
             SettleMode::Rejected(reason) => Err(FacilitatorError::Rejected(reason.clone())),
@@ -183,25 +187,27 @@ mod tests {
         serde_json::from_str(KAT).expect("the fixture is valid JSON")
     }
 
+    /// A payment for [`requirements`] carrying `payload` — the option it accepted is the one
+    /// advertised, so only the payload is under test.
+    fn paying(payload: serde_json::Value) -> PaymentPayload {
+        let payload = payload.as_object().expect("a payload is an object").clone();
+        PaymentPayload::new(None, requirements(), payload)
+    }
+
     fn payment() -> PaymentPayload {
         let doc = fixture();
         let a = &doc["authorization"];
-        PaymentPayload {
-            x402_version: 1,
-            scheme: "exact".to_string(),
-            network: "eip155:84532".to_string(),
-            payload: json!({
-                "signature": doc["signature"],
-                "authorization": {
-                    "from": a["from"],
-                    "to": a["to"],
-                    "value": a["value"],
-                    "validAfter": a["valid_after"],
-                    "validBefore": a["valid_before"],
-                    "nonce": a["nonce"],
-                }
-            }),
-        }
+        paying(json!({
+            "signature": doc["signature"],
+            "authorization": {
+                "from": a["from"],
+                "to": a["to"],
+                "value": a["value"],
+                "validAfter": a["valid_after"],
+                "validBefore": a["valid_before"],
+                "nonce": a["nonce"],
+            }
+        }))
     }
 
     /// Requirements that the published payment actually satisfies: the fixture's own payee, its
@@ -211,13 +217,10 @@ mod tests {
         PaymentRequirements {
             scheme: "exact".to_string(),
             network: "eip155:84532".to_string(),
-            max_amount_required: "10000".to_string(),
-            resource: "http://127.0.0.1:8404/v1/chat/completions".to_string(),
-            description: "One inference request".to_string(),
-            mime_type: "application/json".to_string(),
+            amount: "10000".to_string(),
+            asset: doc["domain"]["verifying_contract"].as_str().unwrap().to_string(),
             pay_to: doc["authorization"]["to"].as_str().unwrap().to_string(),
             max_timeout_seconds: 60,
-            asset: doc["domain"]["verifying_contract"].as_str().unwrap().to_string(),
             extra: None,
         }
     }
@@ -255,10 +258,19 @@ mod tests {
 
         // Underpaying: the authorization is for 10000, the resource now asks 10001.
         let mut too_expensive = requirements();
-        too_expensive.max_amount_required = "10001".to_string();
+        too_expensive.amount = "10001".to_string();
         assert!(matches!(
             facilitator.judge(&payment, &too_expensive),
-            Err(VerifyError::Underpaid { got: 10000, want: 10001 })
+            Err(VerifyError::AmountMismatch { got: 10000, want: 10001 })
+        ));
+
+        // Overpaying is refused too: `exact` means exactly, and the reference facilitator refuses
+        // it, so accepting it here would pass a client that the real thing rejects.
+        let mut cheaper = requirements();
+        cheaper.amount = "9999".to_string();
+        assert!(matches!(
+            facilitator.judge(&payment, &cheaper),
+            Err(VerifyError::AmountMismatch { got: 10000, want: 9999 })
         ));
 
         // A different network in the advertisement than the payment names.
@@ -288,13 +300,7 @@ mod tests {
             json!({"signature": "0xdeadbeef", "authorization": {}}),
             json!({"signature": "not-hex", "authorization": {"from": "0x00"}}),
         ] {
-            let payment = PaymentPayload {
-                x402_version: 1,
-                scheme: "exact".to_string(),
-                network: "eip155:84532".to_string(),
-                payload,
-            };
-            assert!(facilitator.judge(&payment, &requirements()).is_err());
+            assert!(facilitator.judge(&paying(payload), &requirements()).is_err());
         }
     }
 
@@ -346,12 +352,7 @@ mod tests {
         // the upstream. Fed a payload that `verify` mode rejects outright.
         let facilitator =
             DevFacilitator::new(VerifyMode::Accept, SettleMode::Succeed, TokenDomain::default());
-        let garbage = PaymentPayload {
-            x402_version: 1,
-            scheme: "exact".to_string(),
-            network: "eip155:84532".to_string(),
-            payload: json!({"authorization": "not even an object"}),
-        };
+        let garbage = paying(json!({"authorization": "not even an object"}));
 
         assert!(Facilitator::verify(&facilitator, &garbage, &requirements()).await.is_ok());
     }
@@ -420,10 +421,9 @@ mod tests {
         .with_clock(|| WITHIN_WINDOW);
         let receipt =
             Facilitator::settle(&empty, &payment, &requirements).await.expect("empty-receipt is Ok");
-        // Reported successful with no transaction at all — and because the field is
-        // `skip_serializing_if`, absent from the encoded receipt rather than blank.
+        // Reported successful with no transaction to look up: blank, the format's "none".
         assert!(receipt.success);
-        assert_eq!(receipt.transaction, None);
+        assert_eq!(receipt.transaction, "");
         assert_eq!(receipt.payer, None);
     }
 

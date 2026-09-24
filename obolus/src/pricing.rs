@@ -1,6 +1,6 @@
 //! Deciding what a request costs.
 //!
-//! Before this module the price of a request was fixed at boot: whatever `maxAmountRequired` each
+//! Before this module the price of a request was fixed at boot: whatever `amount` each
 //! armed payment option carried, forever, for every request. Running as a business needs the price
 //! *determined* per call and pluggable — the vision names cost-in/margin-out, flat, promotional,
 //! and free rates.
@@ -41,7 +41,7 @@ pub struct PriceContext<'a> {
     /// price on — `id`, `kind`, `models`, `precedence`, and the declared `cost` the cost-plus rate
     /// marks up.
     pub backend: &'a Backend,
-    /// The advertised option being priced. Its `maxAmountRequired` is the current quote; every other
+    /// The advertised option being priced. Its `amount` is the current quote; every other
     /// field is copied through unchanged and must not influence anything but the amount.
     pub requirement: &'a PaymentRequirements,
 }
@@ -76,7 +76,7 @@ impl PriceDeterminer for StaticPrice {
         // building `PaymentRequirements` directly — and fails *closed*: an unparseable amount
         // quotes the maximum, which no client can pay, rather than zero, which would give the work
         // away.
-        ctx.requirement.max_amount_required.parse().unwrap_or(u128::MAX)
+        ctx.requirement.amount.parse().unwrap_or(u128::MAX)
     }
 }
 
@@ -256,13 +256,10 @@ mod tests {
         PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: "test-net".to_string(),
-            max_amount_required: amount.to_string(),
-            resource: "http://localhost/v1/chat/completions".to_string(),
-            description: String::new(),
-            mime_type: String::new(),
+            amount: amount.to_string(),
+            asset: "0xTEST-ASSET".to_string(),
             pay_to: "0xTEST-PAY-TO".to_string(),
             max_timeout_seconds: 60,
-            asset: "0xTEST-ASSET".to_string(),
             extra: None,
         }
     }

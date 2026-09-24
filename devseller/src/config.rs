@@ -33,7 +33,7 @@ pub enum VerifyMode {
 ///
 /// The gateway serves the upstream response on `success: true` and nothing else, so these variants
 /// split two ways and the split is the point. [`Succeed`] and [`EmptyReceipt`] hand the client its
-/// answer plus an `X-PAYMENT-RESPONSE` receipt, and ask whether it reads any of that receipt beyond
+/// answer plus a `PAYMENT-RESPONSE` receipt, and ask whether it reads any of that receipt beyond
 /// the one field. The rest withhold the work and answer 402 or 502, which is the harder case: the
 /// client has signed an authorization and sent it, a nonce is spent as far as it knows, and it now
 /// has to decide whether to retry, whether to re-sign, and which of those two statuses means it may.

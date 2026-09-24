@@ -810,13 +810,10 @@ mod tests {
         PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: network.to_string(),
-            max_amount_required: "1000".to_string(),
-            resource: "http://127.0.0.1:8403/v1/chat/completions".to_string(),
-            description: "One inference request".to_string(),
-            mime_type: "application/json".to_string(),
+            amount: "1000".to_string(),
+            asset: "0xTEST-ASSET-ADDRESS-NOT-REAL".to_string(),
             pay_to: "0xTEST-PAY-TO-ADDRESS-NOT-REAL".to_string(),
             max_timeout_seconds: 60,
-            asset: "0xTEST-ASSET-ADDRESS-NOT-REAL".to_string(),
             extra: None,
         }
     }

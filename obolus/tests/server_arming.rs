@@ -178,41 +178,40 @@ const ADVERTISEMENT_LINE: &str = "payment option(s)";
 /// one is a hazard, not a convenience.
 const ACCEPTS_ONE_TESTNET: &str = r#"[
     {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
-/// Two entries sharing one network — the misconfiguration `Gateway::new` refuses, because a payment
-/// envelope carries only `(scheme, network)` and the pair cannot be told apart when a payment
-/// arrives.
+/// Two entries sharing one network — the misconfiguration `Gateway::new` refuses: obolus advertises
+/// at most one option per `(scheme, network)` until #76 decides whether more are wanted.
 ///
 /// The two assets differ deliberately. Entries identical in every field would also be refused, but
-/// by a check that could be comparing whole entries; the claim is that the pair is indistinguishable
-/// on the envelope *despite* naming different assets.
+/// by a check that could be comparing whole entries; the claim is that the pair is refused on
+/// `(scheme, network)` alone, *despite* naming different assets.
 const ACCEPTS_DUPLICATE_NETWORK: &str = r#"[
     {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"},
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"eip155:84532","asset":"0xSECOND-TEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
 /// A perfectly good Base Sepolia entry *plus* one naming the built-in placeholder. The only way an
 /// operator reaches `UNCONFIGURED NETWORK`'s third enumerated state.
 const ACCEPTS_TESTNET_PLUS_PLACEHOLDER: &str = r#"[
     {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"},
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"test-network-not-a-real-caip2","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
 /// Base mainnet hidden between two genuine testnets — the configuration the ticket's Definition of
 /// Done names, and one only `OBOLUS_ACCEPTS` can express.
 const ACCEPTS_MAINNET_HIDDEN_AMONG_TESTNETS: &str = r#"[
     {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"},
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"},
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
 /// A genuine Base mainnet entry — exactly what `OBOLUS_ALLOW_MAINNET` exists for — *plus*
@@ -232,9 +231,9 @@ const ACCEPTS_MAINNET_HIDDEN_AMONG_TESTNETS: &str = r#"[
 /// assumption it would have had to falsify.
 const ACCEPTS_MAINNET_PLUS_DEAD_SHORT_NAME: &str = r#"[
     {"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"},
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"base-sepolia","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
 /// Two x402 short names and nothing else — so every unproven value is diagnosable and the residue
@@ -246,9 +245,9 @@ const ACCEPTS_MAINNET_PLUS_DEAD_SHORT_NAME: &str = r#"[
 /// branch while misrepresenting how anyone reaches it.
 const ACCEPTS_TWO_SHORT_NAMES: &str = r#"[
     {"network":"base-sepolia","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"},
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"polygon-amoy","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
 /// A genuine mainnet *and* Obolus's own placeholder in one array.
@@ -259,9 +258,9 @@ const ACCEPTS_TWO_SHORT_NAMES: &str = r#"[
 /// value that needs reporting is invisible to the predicate that chose the branch.
 const ACCEPTS_MAINNET_PLUS_PLACEHOLDER: &str = r#"[
     {"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"},
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"test-network-not-a-real-caip2","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","maxAmountRequired":"1000"}
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
 /// The bearer-token path's startup line (#33). Asserted present by the positive case below and

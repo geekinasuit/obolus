@@ -4,7 +4,7 @@
 //!
 //! `verify` → start upstream → `settle` → stream the body.
 //!
-//! Two constraints pull against each other. `X-PAYMENT-RESPONSE` is a *header*, so settlement
+//! Two constraints pull against each other. `PAYMENT-RESPONSE` is a *header*, so settlement
 //! has to finish before the first byte of the body goes out — we cannot stream an answer and
 //! then charge for it. But settling before we know the upstream will answer at all would
 //! charge for work that never happened, and Obolus has no refund path.
@@ -37,12 +37,16 @@
 //! *and* an `error` explaining the previous attempt. Anything that is our fault or the
 //! facilitator's gets a 502. A payment that was never actually evaluated must never come back
 //! looking like a rejected one.
+//!
+//! Every 402 carries its challenge twice: base64 in the `PAYMENT-REQUIRED` header, which is the one
+//! an x402 v2 client reads, and as the JSON body, for a person with curl. Both are the same object,
+//! and both are marked `Cache-Control: no-store`, since a challenge quotes a price for one request.
 
 use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -56,7 +60,9 @@ use crate::pricing::{PriceContext, PriceDeterminer, StaticPrice};
 use crate::telemetry::{AccessPath, NoTelemetry, Offer, Outcome, Recorder, Telemetry, Trace};
 use crate::upstream::{Upstream, UpstreamResponse};
 use crate::arming::ArmedRequirements;
-use crate::x402::{self, PaymentPayload, PaymentRequired, PaymentRequirements, SettlementReceipt};
+use crate::x402::{
+    self, PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo, SettlementReceipt,
+};
 
 /// Why a [`Gateway`] could not be built from a set of payment options.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -66,15 +72,17 @@ pub enum GatewayError {
     #[error("a gateway must accept at least one payment option, but none were configured")]
     NoPaymentOptions,
 
-    /// Two options share a `(scheme, network)`. The `X-PAYMENT` envelope exposes only
-    /// `(scheme, network)` — the asset lives *inside* the opaque payload Phase A never parses — so
-    /// two options on the same pair cannot be told apart when a payment arrives: the second would be
-    /// unreachable, and, worse, we could hand the facilitator the wrong asset to settle against.
-    /// Multi-chain therefore means *distinct networks*, not several assets on one network.
+    /// Two options share a `(scheme, network)`.
+    ///
+    /// A payment names the whole option it accepted, and is matched on all of it
+    /// ([`PaymentRequirements::is_accepted_by`]), so two options on one network — two assets, say —
+    /// could be told apart when a payment arrives. What is not yet settled is whether offering them
+    /// is wanted, and what else keys on the network alone; until that is decided (#76), multi-chain
+    /// means *distinct networks*, and a configuration that says otherwise is refused rather than
+    /// served on an assumption.
     #[error(
         "duplicate payment option: two entries share (scheme, network) = ({scheme}, {network}); \
-         a payment envelope carries only (scheme, network), so they cannot be distinguished at \
-         settle time — advertise at most one entry per exact (scheme, network). Network strings are \
+         obolus advertises at most one option per exact (scheme, network). Network strings are \
          compared verbatim, not case- or whitespace-normalized (a CAIP-2 reference such as Solana's \
          base58 genesis hash is case-sensitive), so canonicalize your ids before configuring them"
     )]
@@ -93,6 +101,8 @@ pub enum GatewayError {
 pub struct Gateway<F: Facilitator> {
     facilitator: F,
     backends: Arc<Backends>,
+    /// What every challenge says is being paid for.
+    resource: ResourceInfo,
     /// Non-empty and unique by `(scheme, network)` — enforced by [`Gateway::new`].
     requirements: Vec<PaymentRequirements>,
     /// Decides each request's price. Defaults to [`StaticPrice`] (today's fixed per-option amounts);
@@ -105,13 +115,15 @@ pub struct Gateway<F: Facilitator> {
 }
 
 impl<F: Facilitator> Gateway<F> {
-    /// Build a gateway advertising `requirements`. Fails if the list is empty, or if two entries
-    /// share a `(scheme, network)` — see [`GatewayError`].
+    /// Build a gateway advertising `requirements` for `resource`. Fails if the list is empty, or if
+    /// two entries share a `(scheme, network)` — see [`GatewayError`].
+    ///
+    /// `resource` has no default: it is the address a payer is told they are paying for, and only
+    /// the caller knows where this gateway can be reached.
     ///
     /// The uniqueness invariant is enforced *here*, at the type that later hands one of these
-    /// requirements to `settle`, rather than only at the config boundary — so a wrong-asset
-    /// settlement is impossible by construction, including for a future caller that builds a
-    /// `Gateway` directly.
+    /// requirements to `settle`, rather than only at the config boundary — so it holds for a future
+    /// caller that builds a `Gateway` directly too.
     ///
     /// The arming invariant is enforced by the *parameter type*: an [`ArmedRequirements`] can only
     /// be obtained from [`arming::check_arming`](crate::arming::check_arming), so every option set
@@ -125,6 +137,7 @@ impl<F: Facilitator> Gateway<F> {
     pub fn new(
         facilitator: F,
         backends: Arc<Backends>,
+        resource: ResourceInfo,
         requirements: ArmedRequirements,
     ) -> Result<Self, GatewayError> {
         let requirements = requirements.into_requirements();
@@ -144,6 +157,7 @@ impl<F: Facilitator> Gateway<F> {
         Ok(Self {
             facilitator,
             backends,
+            resource,
             requirements,
             price: Arc::new(StaticPrice),
             telemetry: Arc::new(NoTelemetry),
@@ -174,7 +188,7 @@ impl<F: Facilitator> Gateway<F> {
     /// This request's advertised options, each repriced for the routed backend.
     ///
     /// The option set is exactly `requirements` — same `(scheme, network)`, asset, and pay-to — and
-    /// only `maxAmountRequired` is replaced, with the determiner's quote for that one option. So the
+    /// only `amount` is replaced, with the determiner's quote for that one option. So the
     /// arming guard still governs which networks are advertised (a determiner prices an option, it
     /// cannot add one), and the amount the 402 quotes is the same amount settlement later charges.
     ///
@@ -185,36 +199,65 @@ impl<F: Facilitator> Gateway<F> {
             .iter()
             .map(|requirement| {
                 let amount = self.price.quote(PriceContext { model, backend, requirement });
-                PaymentRequirements { max_amount_required: amount.to_string(), ..requirement.clone() }
+                PaymentRequirements { amount: amount.to_string(), ..requirement.clone() }
             })
             .collect()
     }
 
 }
 
-/// The advertised option whose `(scheme, network)` this payment matches, if any.
+/// The advertised option this payment is for, if any: the one its `accepted` matches in full —
+/// scheme, network, amount, asset, pay-to and timeout, and our `extra` keys (see
+/// [`PaymentRequirements::is_accepted_by`]).
 ///
-/// `offered` is this request's priced option set (see [`Gateway::priced`]). Unique by construction —
-/// repricing replaces only the amount, and `Gateway::new` made the `(scheme, network)` pairs unique —
-/// so the first match is the only match. Matching on `(scheme, network)` and nothing more is not a
-/// shortcut: it is the most the opaque envelope lets us see (the asset is inside the payload we do not
-/// parse), which is exactly why `new` forbids two options from sharing the pair.
+/// `offered` is this request's priced option set (see [`Gateway::priced`]), so a payment for a price
+/// no longer quoted matches nothing here; [`repriced_for`] tells that case apart. `Gateway::new`
+/// made the `(scheme, network)` pairs unique, so at most one option can match.
 fn accepted_for<'a>(
     offered: &'a [PaymentRequirements],
     payment: &PaymentPayload,
 ) -> Option<&'a PaymentRequirements> {
-    offered.iter().find(|r| r.scheme == payment.scheme && r.network == payment.network)
+    offered.iter().find(|r| r.is_accepted_by(payment))
+}
+
+/// The offered option this payment would have matched at the amount it carries — so the only thing
+/// wrong with it is the price. Worth telling apart from a payment for an option we never offered:
+/// that client picked wrong, this one was quoted a price the gateway has since changed, and the
+/// remedy is to pay the new one.
+fn repriced_for<'a>(
+    offered: &'a [PaymentRequirements],
+    payment: &PaymentPayload,
+) -> Option<&'a PaymentRequirements> {
+    let paid = &payment.accepted().amount;
+    offered.iter().find(|r| {
+        PaymentRequirements { amount: paid.clone(), ..(*r).clone() }.is_accepted_by(payment)
+    })
 }
 
 /// A 402 carrying *every* option offered for this request, optionally with why the last attempt did
 /// not qualify. `offered` is the priced option set (see [`Gateway::priced`]), so the amounts it
 /// quotes are the determined prices, not the raw armed ones.
-fn challenge(offered: &[PaymentRequirements], error: Option<String>) -> Response {
-    let mut challenge = PaymentRequired::offering_all(offered.to_vec());
+///
+/// The challenge goes in the `PAYMENT-REQUIRED` header — the only place an x402 v2 client reads it —
+/// and, as the same object, in the JSON body.
+fn challenge(resource: &ResourceInfo, offered: &[PaymentRequirements], error: Option<String>) -> Response {
+    let mut challenge = PaymentRequired::offering_all(resource.clone(), offered.to_vec());
     if let Some(error) = error {
         challenge = challenge.with_error(error);
     }
-    (StatusCode::PAYMENT_REQUIRED, Json(challenge)).into_response()
+    let encoded = x402::encode_payment_required(&challenge);
+    let mut response = (StatusCode::PAYMENT_REQUIRED, Json(challenge)).into_response();
+    let headers = response.headers_mut();
+    // Base64 is always a valid header value, so this cannot fail. Were it ever to, the body alone
+    // would still be a 402 a person can read — but no v2 client could pay it, so it is not ignored.
+    match HeaderValue::from_str(&encoded) {
+        Ok(value) => {
+            headers.insert(x402::HEADER_PAYMENT_REQUIRED, value);
+        }
+        Err(err) => eprintln!("obolus: could not attach {}: {err}", x402::HEADER_PAYMENT_REQUIRED),
+    }
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Our fault or the facilitator's — never dressed up as the client's.
@@ -296,37 +339,49 @@ async fn paid_completion<F: Facilitator>(
     trace: &mut Trace,
 ) -> (Response, Outcome) {
     trace.offers = priced.iter().map(Offer::from).collect();
+    let resource = &gateway.resource;
 
-    let Some(raw) = headers.get(x402::HEADER_PAYMENT) else {
-        return (challenge(&priced, None), Outcome::PaymentRequired);
+    let Some(raw) = headers.get(x402::HEADER_PAYMENT_SIGNATURE) else {
+        return (challenge(resource, &priced, None), Outcome::PaymentRequired);
     };
     let Ok(raw) = raw.to_str() else {
-        let error = format!("{} must be ASCII base64", x402::HEADER_PAYMENT);
-        return (challenge(&priced, Some(error)), Outcome::PaymentMalformed);
+        let error = format!("{} must be ASCII base64", x402::HEADER_PAYMENT_SIGNATURE);
+        return (challenge(resource, &priced, Some(error)), Outcome::PaymentMalformed);
     };
 
     let payment = match x402::decode_payment(raw) {
         Ok(payment) => payment,
-        Err(err) => return (challenge(&priced, Some(err.to_string())), Outcome::PaymentMalformed),
+        Err(err) => {
+            return (challenge(resource, &priced, Some(err.to_string())), Outcome::PaymentMalformed)
+        }
     };
 
     // Our own policy check, not the facilitator's: which advertised option did the client pay? None
-    // → they picked an offer we did not make, so re-challenge with everything we DO accept. This is
-    // the only place the paid option is chosen, and the *matched* `requirements` — not "the"
+    // → they paid for an offer we are not making, so re-challenge with everything we DO accept. This
+    // is the only place the paid option is chosen, and the *matched* `requirements` — not "the"
     // requirements — is what we verify and settle against.
     let Some(requirements) = accepted_for(&priced, &payment) else {
-        let error = format!(
-            "payment offers {}/{}, which is not one of the payment options this resource accepts",
-            payment.scheme, payment.network,
-        );
-        return (challenge(&priced, Some(error)), Outcome::OptionUnmatched);
+        let accepted = payment.accepted();
+        let error = match repriced_for(&priced, &payment) {
+            Some(current) => format!(
+                "payment is for {} atomic units, but this resource now costs {} on {}; pay the \
+                 amount this challenge quotes",
+                accepted.amount, current.amount, current.network,
+            ),
+            None => format!(
+                "payment accepts an option ({} on {}) that does not match any payment option this \
+                 resource offers; accept one of the options in this challenge exactly as given",
+                accepted.scheme, accepted.network,
+            ),
+        };
+        return (challenge(resource, &priced, Some(error)), Outcome::OptionUnmatched);
     };
     trace.paid = Some(Offer::from(requirements));
 
     match gateway.facilitator.verify(&payment, requirements).await {
         Ok(()) => {}
         Err(FacilitatorError::Rejected(reason)) => {
-            return (challenge(&priced, Some(reason)), Outcome::VerifyRejected)
+            return (challenge(resource, &priced, Some(reason)), Outcome::VerifyRejected)
         }
         Err(err @ FacilitatorError::Unavailable(_)) => {
             return (upstream_failure(err.to_string()), Outcome::VerifyUnavailable)
@@ -356,19 +411,20 @@ async fn paid_completion<F: Facilitator>(
         // response on the strength of `Ok(_)` alone would give the work away for free.
         Ok(_) => {
             let error = "settlement did not complete".to_string();
-            return (challenge(&priced, Some(error)), Outcome::SettleRejected);
+            return (challenge(resource, &priced, Some(error)), Outcome::SettleRejected);
         }
         // The same split as verify. Returning 502 for a payment the facilitator actually
         // evaluated and refused would be both a lie and the more dangerous lie: 502 reads as
         // transient, so clients retry it harder than they retry a 402.
         Err(FacilitatorError::Rejected(reason)) => {
-            return (challenge(&priced, Some(reason)), Outcome::SettleRejected)
+            return (challenge(resource, &priced, Some(reason)), Outcome::SettleRejected)
         }
         Err(err @ FacilitatorError::Unavailable(_)) => {
             return (upstream_failure(err.to_string()), Outcome::SettleUnavailable)
         }
     };
-    trace.transaction = receipt.transaction.clone();
+    // The receipt's "no transaction" is the empty string; telemetry's is absence.
+    trace.transaction = Some(receipt.transaction.clone()).filter(|t| !t.is_empty());
 
     (proxy_response(response, Some(&receipt)), Outcome::Settled)
 }
@@ -530,6 +586,7 @@ mod tests {
     use crate::upstream::{FakeUpstream, UpstreamCalls};
     use crate::arming::{check_arming, is_provably_testnet};
     use crate::x402::{PaymentPayload, SettlementReceipt, SCHEME_EXACT, X402_VERSION};
+    use serde_json::json;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt as _;
@@ -555,24 +612,31 @@ mod tests {
         PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: FIXTURE_NETWORK.to_string(),
-            max_amount_required: "1000".to_string(),
-            resource: "http://localhost:8402/v1/chat/completions".to_string(),
-            description: "One inference request".to_string(),
-            mime_type: "application/json".to_string(),
+            amount: "1000".to_string(),
+            asset: FIXTURE_ASSET.to_string(),
             pay_to: FIXTURE_PAY_TO.to_string(),
             max_timeout_seconds: 60,
-            asset: FIXTURE_ASSET.to_string(),
             extra: None,
         }
     }
 
-    fn payment() -> PaymentPayload {
-        PaymentPayload {
-            x402_version: X402_VERSION,
-            scheme: SCHEME_EXACT.to_string(),
-            network: FIXTURE_NETWORK.to_string(),
-            payload: serde_json::json!({ "authorization": "opaque-to-phase-a" }),
+    fn resource() -> ResourceInfo {
+        ResourceInfo {
+            url: "http://localhost:8402/v1/chat/completions".to_string(),
+            description: Some("One inference request".to_string()),
+            mime_type: Some("application/json".to_string()),
         }
+    }
+
+    /// A payment accepting `accepted`, with a payload Phase A never opens.
+    fn paying(accepted: PaymentRequirements) -> PaymentPayload {
+        let payload = json!({ "authorization": "opaque-to-phase-a" });
+        PaymentPayload::new(None, accepted, payload.as_object().unwrap().clone())
+    }
+
+    /// A payment for the advertised option, exactly as offered.
+    fn payment() -> PaymentPayload {
+        paying(requirements())
     }
 
     /// Pass `reqs` through the arming guard, arming by name every network it cannot prove testnet.
@@ -600,7 +664,7 @@ mod tests {
     fn app_with(facilitator: FakeFacilitator, upstream: FakeUpstream) -> (Router, FakeCalls) {
         let calls = facilitator.calls();
         let gateway =
-            Gateway::new(facilitator, one_backend(upstream), armed(vec![requirements()])).unwrap();
+            Gateway::new(facilitator, one_backend(upstream), resource(), armed(vec![requirements()])).unwrap();
         (router(Access::new(gateway, None)), calls)
     }
 
@@ -613,7 +677,7 @@ mod tests {
         price: Arc<dyn PriceDeterminer>,
     ) -> (Router, FakeCalls) {
         let calls = facilitator.calls();
-        let gateway = Gateway::new(facilitator, one_backend(upstream), armed(vec![requirements()]))
+        let gateway = Gateway::new(facilitator, one_backend(upstream), resource(), armed(vec![requirements()]))
             .unwrap()
             .with_price_determiner(price);
         (router(Access::new(gateway, None)), calls)
@@ -621,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_challenge_quotes_the_determined_price_not_the_armed_amount() {
-        // The armed option carries maxAmountRequired = "1000"; a flat determiner of 777 must
+        // The armed option carries amount = "1000"; a flat determiner of 777 must
         // override it. This is the whole point of the seam: the 402 quotes the *determined* price.
         let (app, _) = app_priced_with(
             FakeFacilitator::accepting(),
@@ -631,7 +695,7 @@ mod tests {
         let (status, _, body) = send(app, completion_request(None)).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["accepts"][0]["maxAmountRequired"], serde_json::json!("777"));
+        assert_eq!(json["accepts"][0]["amount"], serde_json::json!("777"));
         // The determiner prices only the amount — network and pay-to are still the armed option's,
         // because a determiner cannot touch which network is advertised.
         assert_eq!(json["accepts"][0]["network"], serde_json::json!(FIXTURE_NETWORK));
@@ -650,6 +714,7 @@ mod tests {
         let gateway = Gateway::new(
             FakeFacilitator::accepting(),
             Arc::new(Backends::from_parts(vec![backend])),
+            resource(),
             armed(vec![requirements()]),
         )
         .unwrap()
@@ -658,7 +723,7 @@ mod tests {
         let (status, _, body) = send(app, completion_request(None)).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["accepts"][0]["maxAmountRequired"], serde_json::json!("1250"));
+        assert_eq!(json["accepts"][0]["amount"], serde_json::json!("1250"));
     }
 
     #[tokio::test]
@@ -678,7 +743,7 @@ mod tests {
         let (status, _, body) = send(app, completion_request(None)).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(json["accepts"][0]["maxAmountRequired"], serde_json::json!("750"));
+        assert_eq!(json["accepts"][0]["amount"], serde_json::json!("750"));
         // The discount prices only the amount — the armed network and pay-to are untouched, as for
         // every determiner.
         assert_eq!(json["accepts"][0]["network"], serde_json::json!(FIXTURE_NETWORK));
@@ -694,12 +759,13 @@ mod tests {
             FakeUpstream::streaming(),
             Arc::new(FlatPrice::new(777)),
         );
+        let quoted = paying(PaymentRequirements { amount: "777".to_string(), ..requirements() });
         let (status, _, _) =
-            send(app, completion_request(Some(&x402::encode_payment(&payment())))).await;
+            send(app, completion_request(Some(&x402::encode_payment(&quoted)))).await;
         assert_eq!(status, StatusCode::OK);
         let settled = calls.settled_requirements();
         assert_eq!(settled.len(), 1, "exactly one settlement");
-        assert_eq!(settled[0].max_amount_required, "777", "at the determined price");
+        assert_eq!(settled[0].amount, "777", "at the determined price");
     }
 
     fn app(facilitator: FakeFacilitator, upstream: FakeUpstream) -> Router {
@@ -718,7 +784,7 @@ mod tests {
         let calls = facilitator.calls();
         let forwards = upstream.calls();
         let gateway =
-            Gateway::new(facilitator, one_backend(upstream), armed(vec![requirements()])).unwrap();
+            Gateway::new(facilitator, one_backend(upstream), resource(), armed(vec![requirements()])).unwrap();
         let token = TokenPath::new(Arc::new(verifier));
         (router(Access::new(gateway, Some(token))), calls, forwards)
     }
@@ -726,7 +792,7 @@ mod tests {
     fn completion_request(payment_header: Option<&str>) -> Request<Body> {
         let mut builder = Request::builder().method("POST").uri("/v1/chat/completions");
         if let Some(header) = payment_header {
-            builder = builder.header(x402::HEADER_PAYMENT, header);
+            builder = builder.header(x402::HEADER_PAYMENT_SIGNATURE, header);
         }
         builder.body(Body::from(r#"{"model":"test","messages":[]}"#)).unwrap()
     }
@@ -777,6 +843,26 @@ mod tests {
         json["error"].as_str().map(str::to_string)
     }
 
+    /// The 402's two copies of its challenge must be one object: the `PAYMENT-REQUIRED` header
+    /// (what a v2 client reads) decodes to exactly the JSON body (what a person reads), and the
+    /// response is marked uncacheable. Returns the decoded challenge.
+    fn assert_challenge_headers(headers: &HeaderMap, body: &str) -> PaymentRequired {
+        let raw = headers
+            .get(x402::HEADER_PAYMENT_REQUIRED)
+            .expect("every 402 carries PAYMENT-REQUIRED")
+            .to_str()
+            .unwrap();
+        let from_header = x402::decode_payment_required(raw).expect("a v2 challenge");
+        let from_body: PaymentRequired = serde_json::from_str(body).unwrap();
+        assert_eq!(from_header, from_body, "header and body must carry the same challenge");
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+            "a challenge quotes a price for one request and must not be cached"
+        );
+        from_header
+    }
+
     #[tokio::test]
     async fn health_needs_no_payment() {
         let request = Request::builder().uri("/health").body(Body::empty()).unwrap();
@@ -788,15 +874,32 @@ mod tests {
 
     #[tokio::test]
     async fn no_payment_gets_a_challenge_describing_what_we_accept() {
-        let (status, _, body) =
+        let (status, headers, body) =
             send(app(FakeFacilitator::accepting(), FakeUpstream::streaming()), completion_request(None))
                 .await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["x402Version"], serde_json::json!(X402_VERSION));
+        assert_eq!(json["resource"], serde_json::to_value(resource()).unwrap());
         assert_eq!(json["accepts"][0]["payTo"], serde_json::json!(FIXTURE_PAY_TO));
-        assert_eq!(json["accepts"][0]["maxAmountRequired"], serde_json::json!("1000"));
+        assert_eq!(json["accepts"][0]["amount"], serde_json::json!("1000"));
         assert!(json.get("error").is_none(), "a first request has nothing to apologise for");
+        let challenge = assert_challenge_headers(&headers, &body);
+        assert_eq!(challenge.accepts, vec![requirements()]);
+    }
+
+    #[tokio::test]
+    async fn a_rechallenge_carries_the_header_too() {
+        // The header is not only for the first 402: a client whose payment was refused reads the
+        // next challenge — and the reason — from the same place.
+        let (status, headers, body) = send(
+            app(FakeFacilitator::rejecting("insufficient_funds"), FakeUpstream::streaming()),
+            completion_request(Some(&x402::encode_payment(&payment()))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let challenge = assert_challenge_headers(&headers, &body);
+        assert_eq!(challenge.error.as_deref(), Some("insufficient_funds"));
     }
 
     #[tokio::test]
@@ -812,15 +915,54 @@ mod tests {
 
     #[tokio::test]
     async fn payment_for_an_offer_we_did_not_make_is_refused() {
-        let mut wrong = payment();
-        wrong.network = "some-other-network".to_string();
-        let (status, _, body) = send(
-            app(FakeFacilitator::accepting(), FakeUpstream::streaming()),
-            completion_request(Some(&x402::encode_payment(&wrong))),
-        )
-        .await;
+        let wrong = paying(PaymentRequirements {
+            network: "some-other-network".to_string(),
+            ..requirements()
+        });
+        let (app, calls) = app_with(FakeFacilitator::accepting(), FakeUpstream::streaming());
+        let (status, headers, body) =
+            send(app, completion_request(Some(&x402::encode_payment(&wrong)))).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert!(challenge_error(&body).unwrap().contains("some-other-network"));
+        assert_challenge_headers(&headers, &body);
+        assert_eq!(calls.verifies(), 0, "a payment for no offered option is never verified");
+    }
+
+    #[tokio::test]
+    async fn a_payment_differing_from_the_offer_in_any_field_is_refused() {
+        // The whole option is matched, not its (scheme, network): a payment that echoes our network
+        // but names another asset or recipient is not for anything we offered. Under v1's
+        // (scheme, network) matching every one of these would have reached the facilitator.
+        for (field, accepted) in [
+            ("asset", PaymentRequirements { asset: "0xOTHER-ASSET".to_string(), ..requirements() }),
+            ("payTo", PaymentRequirements { pay_to: "0xOTHER-PAYEE".to_string(), ..requirements() }),
+            ("maxTimeoutSeconds", PaymentRequirements { max_timeout_seconds: 61, ..requirements() }),
+        ] {
+            let (app, calls) = app_with(FakeFacilitator::accepting(), FakeUpstream::streaming());
+            let (status, _, body) =
+                send(app, completion_request(Some(&x402::encode_payment(&paying(accepted))))).await;
+            assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{field}");
+            assert!(
+                challenge_error(&body).unwrap().contains("does not match any payment option"),
+                "{field}: {body}"
+            );
+            assert_eq!(calls.verifies(), 0, "{field}: never verified");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_payment_at_a_price_no_longer_quoted_is_told_the_price_changed() {
+        // Everything matches but the amount — the client paid a price the gateway has since moved
+        // off. It is re-challenged, told so, and nothing is verified or charged.
+        let stale = paying(PaymentRequirements { amount: "900".to_string(), ..requirements() });
+        let (app, calls) = app_with(FakeFacilitator::accepting(), FakeUpstream::streaming());
+        let (status, headers, body) =
+            send(app, completion_request(Some(&x402::encode_payment(&stale)))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let error = challenge_error(&body).unwrap();
+        assert!(error.contains("900") && error.contains("now costs 1000"), "{error}");
+        assert_eq!(assert_challenge_headers(&headers, &body).accepts[0].amount, "1000");
+        assert_eq!(calls.verifies(), 0);
     }
 
     #[tokio::test]
@@ -862,9 +1004,11 @@ mod tests {
             receipt,
             SettlementReceipt {
                 success: true,
-                transaction: Some("0xTEST-TX-HASH-NOT-A-REAL-TRANSACTION".to_string()),
+                error_reason: None,
+                transaction: "0xTEST-TX-HASH-NOT-A-REAL-TRANSACTION".to_string(),
                 network: FIXTURE_NETWORK.to_string(),
                 payer: None,
+                amount: None,
             }
         );
     }
@@ -1010,24 +1154,16 @@ mod tests {
         PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: FIXTURE_NETWORK_B.to_string(),
-            max_amount_required: "2000".to_string(),
-            resource: "http://localhost:8402/v1/chat/completions".to_string(),
-            description: "One inference request".to_string(),
-            mime_type: "application/json".to_string(),
+            amount: "2000".to_string(),
+            asset: FIXTURE_ASSET_B.to_string(),
             pay_to: FIXTURE_PAY_TO_B.to_string(),
             max_timeout_seconds: 60,
-            asset: FIXTURE_ASSET_B.to_string(),
             extra: None,
         }
     }
 
     fn payment_b() -> PaymentPayload {
-        PaymentPayload {
-            x402_version: X402_VERSION,
-            scheme: SCHEME_EXACT.to_string(),
-            network: FIXTURE_NETWORK_B.to_string(),
-            payload: serde_json::json!({ "authorization": "opaque-to-phase-a" }),
-        }
+        paying(requirements_b())
     }
 
     /// A gateway advertising option A (`requirements()`) THEN option B (`requirements_b()`).
@@ -1041,6 +1177,7 @@ mod tests {
                 Gateway::new(
                     facilitator,
                     one_backend(upstream),
+                    resource(),
                     armed(vec![requirements(), requirements_b()]),
                 )
                 .unwrap(),
@@ -1081,7 +1218,7 @@ mod tests {
         assert_eq!(settled[0].network, FIXTURE_NETWORK_B);
         assert_eq!(settled[0].asset, FIXTURE_ASSET_B, "settled the PAID option's asset, not [0]'s");
         assert_eq!(settled[0].pay_to, FIXTURE_PAY_TO_B, "and its pay-to");
-        assert_eq!(settled[0].max_amount_required, "2000", "and its price");
+        assert_eq!(settled[0].amount, "2000", "and its price");
         // And verify saw the same matched option.
         assert_eq!(calls.verified_requirements().last().unwrap().asset, FIXTURE_ASSET_B);
     }
@@ -1107,8 +1244,10 @@ mod tests {
         // A network we do not advertise is re-challenged and — discriminating — refused BEFORE any
         // facilitator call. An implementation that fell back to settling some option anyway would
         // show verifies() > 0 here.
-        let mut wrong = payment();
-        wrong.network = "test-network-c-unlisted".to_string();
+        let wrong = paying(PaymentRequirements {
+            network: "test-network-c-unlisted".to_string(),
+            ..requirements()
+        });
         let (app, calls) =
             multichain_app_with(FakeFacilitator::accepting(), FakeUpstream::streaming());
         let (status, _, body) =
@@ -1152,14 +1291,14 @@ mod tests {
             Gateway::new(
                 calls_holder,
                 one_backend(FakeUpstream::streaming()),
-                armed(vec![requirements_b(), short_name]),
+                resource(),
+                armed(vec![requirements_b(), short_name.clone()]),
             )
             .unwrap(),
             None,
         ));
 
-        let mut pay_short_name = payment();
-        pay_short_name.network = FIXTURE_SHORT_NAME.to_string();
+        let pay_short_name = paying(short_name);
         let (status, _, _) =
             send(app, completion_request(Some(&x402::encode_payment(&pay_short_name)))).await;
 
@@ -1186,6 +1325,7 @@ mod tests {
         let err = Gateway::new(
             FakeFacilitator::accepting(),
             one_backend(FakeUpstream::streaming()),
+            resource(),
             armed(vec![]),
         )
         .err()
@@ -1195,8 +1335,8 @@ mod tests {
 
     #[test]
     fn new_rejects_two_options_sharing_scheme_and_network() {
-        // Same (scheme, network), different asset: indistinguishable from the opaque envelope, so
-        // one would be unreachable and we could settle the wrong asset. The guard must bite at
+        // Same (scheme, network), different asset. A v2 payment could tell these apart, but offering
+        // both is refused until #76 decides whether it is wanted. The guard must bite at
         // construction — this asserts it does rather than assuming it. (`.err()` not `.unwrap_err()`
         // for the same reason as above: `Gateway` is not `Debug`, its error is.)
         let mut dup = requirements();
@@ -1204,6 +1344,7 @@ mod tests {
         let err = Gateway::new(
             FakeFacilitator::accepting(),
             one_backend(FakeUpstream::streaming()),
+            resource(),
             armed(vec![requirements(), dup]),
         )
         .err()
@@ -1298,6 +1439,7 @@ mod tests {
             let gateway = Gateway::new(
                 FakeFacilitator::accepting(),
                 one_backend(upstream),
+                resource(),
                 armed(vec![requirements()]),
             )
             .unwrap();
@@ -1397,7 +1539,8 @@ mod tests {
             Backend::for_test("a", vec!["llama3"], None, Arc::new(a)),
             Backend::for_test("b", vec!["mistral"], None, Arc::new(b)),
         ]));
-        let gateway = Gateway::new(facilitator, backends, armed(vec![requirements()])).unwrap();
+        let gateway =
+            Gateway::new(facilitator, backends, resource(), armed(vec![requirements()])).unwrap();
         (router(Access::new(gateway, None)), calls, a_calls, b_calls)
     }
 
@@ -1407,7 +1550,7 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
-            .header(x402::HEADER_PAYMENT, x402::encode_payment(&payment()))
+            .header(x402::HEADER_PAYMENT_SIGNATURE, x402::encode_payment(&payment()))
             .body(Body::from(body))
             .unwrap()
     }
@@ -1446,7 +1589,7 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
-            .header(x402::HEADER_PAYMENT, x402::encode_payment(&payment()))
+            .header(x402::HEADER_PAYMENT_SIGNATURE, x402::encode_payment(&payment()))
             .body(Body::from(r#"{"messages":[]}"#))
             .unwrap();
         let (status, _headers, _body) = send(app, request).await;
@@ -1475,6 +1618,7 @@ mod tests {
         let gateway = Gateway::new(
             facilitator,
             Arc::new(Backends::from_parts(vec![backend])),
+            resource(),
             armed(vec![requirements()]),
         )
         .unwrap()
@@ -1532,12 +1676,15 @@ mod tests {
         let gateway = Gateway::new(
             FakeFacilitator::accepting(),
             one_backend(FakeUpstream::streaming()),
+            resource(),
             armed(vec![requirements()]),
         )
         .unwrap()
         .with_price_determiner(Arc::new(FlatPrice::new(777)))
         .with_telemetry(Arc::new(sink.clone()));
-        send(router(Access::new(gateway, None)), paid_request()).await;
+        let quoted = paying(PaymentRequirements { amount: "777".to_string(), ..requirements() });
+        let request = completion_request(Some(&x402::encode_payment(&quoted)));
+        send(router(Access::new(gateway, None)), request).await;
         let event = sink.only();
         assert_eq!(event.offers[0].amount, "777");
         assert_eq!(event.revenue.as_deref(), Some("777"), "revenue is what settlement charged");
@@ -1566,7 +1713,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_payment_for_an_unoffered_option_is_recorded_as_unmatched() {
-        let elsewhere = PaymentPayload { network: "some-other-network".to_string(), ..payment() };
+        let elsewhere = paying(PaymentRequirements {
+            network: "some-other-network".to_string(),
+            ..requirements()
+        });
         let request = completion_request(Some(&x402::encode_payment(&elsewhere)));
         let event = recorded(FakeFacilitator::accepting(), FakeUpstream::streaming(), request).await;
         assert_eq!(event.outcome, Outcome::OptionUnmatched);
@@ -1661,8 +1811,13 @@ mod tests {
             None,
             Arc::new(FakeUpstream::streaming()),
         )]));
-        let gateway = Gateway::new(FakeFacilitator::accepting(), backends, armed(vec![requirements()]))
-            .unwrap()
+        let gateway = Gateway::new(
+            FakeFacilitator::accepting(),
+            backends,
+            resource(),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
             .with_telemetry(Arc::new(sink.clone()));
         send(router(Access::new(gateway, None)), paid_request_for_model("gpt-4")).await;
         let event = sink.only();
@@ -1755,6 +1910,7 @@ mod tests {
         let gateway = Gateway::new(
             Hanging { hang_verify },
             Arc::new(Backends::from_parts(vec![backend])),
+            resource(),
             armed(vec![requirements()]),
         )
         .unwrap()
@@ -1805,7 +1961,7 @@ mod tests {
         let request = format!(
             "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
              {}: {}\r\ncontent-length: {}\r\n\r\n{body}",
-            x402::HEADER_PAYMENT,
+            x402::HEADER_PAYMENT_SIGNATURE,
             x402::encode_payment(&payment()),
             body.len(),
         );
@@ -1845,6 +2001,7 @@ mod tests {
         let gateway = Gateway::new(
             FakeFacilitator::accepting(),
             one_backend(FakeUpstream::streaming()),
+            resource(),
             armed(vec![requirements()]),
         )
         .unwrap()

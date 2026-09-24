@@ -5,20 +5,21 @@
 //! `OBOLUS_ACCEPTS` form — a JSON array of per-chain entries — into [`PaymentRequirements`],
 //! folding in the gateway-wide fields and validating each amount.
 //!
-//! What it deliberately does **not** do is check `(scheme, network)` uniqueness. That invariant
-//! belongs to [`Gateway::new`](crate::gateway::Gateway::new), the type that later hands one of these
-//! requirements to `settle`: enforcing it there makes a wrong-asset settlement impossible by
-//! construction, not merely improbable if a config path remembers to de-duplicate.
+//! What it deliberately does **not** do is check `(scheme, network)` uniqueness. That rule belongs
+//! to [`Gateway::new`](crate::gateway::Gateway::new), so it holds for every way of building a
+//! gateway rather than only for the config paths that remember to de-duplicate.
 
+use serde::de::IgnoredAny;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use crate::backends::Backends;
-use crate::x402::{validate_atomic_amount, PaymentRequirements, SCHEME_EXACT};
+use crate::x402::{validate_atomic_amount, PaymentRequirements, ResourceInfo, SCHEME_EXACT};
 
-/// One per-chain entry in `OBOLUS_ACCEPTS`: network / asset / pay-to / price. The gateway-wide
-/// fields come from [`SharedOffer`].
+/// One per-chain entry in `OBOLUS_ACCEPTS`: network / asset / pay-to / price, and optionally the
+/// scheme's `extra`. The gateway-wide fields come from [`SharedOffer`].
 ///
-/// `deny_unknown_fields` on purpose: a typo (`payto`, `amount`) must fail loudly at startup rather
+/// `deny_unknown_fields` on purpose: a typo (`payto`, `amout`) must fail loudly at startup rather
 /// than be silently dropped, leaving a challenge with a defaulted-away field that no client can pay
 /// or that sends money nowhere.
 #[derive(Debug, Deserialize)]
@@ -27,16 +28,38 @@ struct AcceptEntry {
     network: String,
     asset: String,
     pay_to: String,
-    max_amount_required: String,
+    amount: Option<String>,
+    /// Passed through to the advertised option untouched. An object by type, because that is the
+    /// only shape x402 gives it; for EVM `exact` it carries the token's EIP-712 `name` and `version`.
+    #[serde(default)]
+    extra: Option<Map<String, Value>>,
+    /// The key x402 v1 used for `amount`. Accepted by the parser only so it can be refused by name:
+    /// under `deny_unknown_fields` alone its error would list the fields expected without saying
+    /// which one it became.
+    #[serde(default)]
+    max_amount_required: Option<IgnoredAny>,
 }
 
-/// The gateway-wide fields folded onto every advertised option — the parts that do not vary by
-/// chain.
+/// The gateway-wide fields — the parts that do not vary by chain. The resource and its description
+/// are stated once per challenge ([`SharedOffer::resource_info`]); the timeout is folded onto every
+/// advertised option.
 #[derive(Debug, Clone)]
 pub struct SharedOffer {
     pub resource: String,
     pub description: String,
     pub max_timeout_seconds: u64,
+}
+
+impl SharedOffer {
+    /// What every challenge says is being paid for. The response is JSON, whichever backend serves
+    /// it.
+    pub fn resource_info(&self) -> ResourceInfo {
+        ResourceInfo {
+            url: self.resource.clone(),
+            description: Some(self.description.clone()),
+            mime_type: Some("application/json".to_string()),
+        }
+    }
 }
 
 /// Why an `OBOLUS_ACCEPTS` value could not be turned into payment options.
@@ -45,9 +68,24 @@ pub enum ConfigError {
     /// Not a JSON array of the expected shape — bad JSON, wrong type, or an unknown/missing field.
     #[error(
         "OBOLUS_ACCEPTS must be a JSON array of \
-         {{\"network\",\"asset\",\"payTo\",\"maxAmountRequired\"}} objects: {0}"
+         {{\"network\",\"asset\",\"payTo\",\"amount\"}} objects, each with an optional \"extra\" \
+         object: {0}"
     )]
     Malformed(String),
+
+    /// An entry names its price `maxAmountRequired`, x402 v1's key. Refused rather than read, so
+    /// that a configuration written for the old wire is corrected once, at startup, where the
+    /// message can say what the key is now.
+    #[error(
+        "OBOLUS_ACCEPTS entry for network {network:?} prices itself with \"maxAmountRequired\", \
+         which is x402 v1's name for it; obolus speaks x402 v2, where the key is \"amount\". \
+         Rename the key — the value keeps its meaning (atomic units, as a decimal string)"
+    )]
+    V1AmountKey { network: String },
+
+    /// An entry has no `amount` at all.
+    #[error("OBOLUS_ACCEPTS entry for network {network:?} has no \"amount\"")]
+    MissingAmount { network: String },
 
     /// A syntactically valid but empty array. A gateway that advertises nothing can never be paid.
     #[error(
@@ -57,9 +95,9 @@ pub enum ConfigError {
     )]
     Empty,
 
-    /// An entry's `maxAmountRequired` is not a non-negative integer in atomic units. Names the
-    /// offending network so an operator can find the bad entry.
-    #[error("OBOLUS_ACCEPTS entry for network {network:?}: maxAmountRequired {detail}")]
+    /// An entry's `amount` is not a non-negative integer in atomic units. Names the offending
+    /// network so an operator can find the bad entry.
+    #[error("OBOLUS_ACCEPTS entry for network {network:?}: amount {detail}")]
     BadAmount { network: String, detail: String },
 
     /// An entry's `network` is empty. It is the match key, so the gateway starts cleanly and 402s
@@ -156,7 +194,8 @@ pub fn validated_option(
     network: String,
     asset: String,
     pay_to: String,
-    max_amount_required: &str,
+    amount: &str,
+    extra: Option<Map<String, Value>>,
     shared: &SharedOffer,
 ) -> Result<PaymentRequirements, EntryDefect> {
     if network.trim().is_empty() {
@@ -168,18 +207,15 @@ pub fn validated_option(
     if pay_to.trim().is_empty() {
         return Err(EntryDefect::EmptyField { field: EntryField::PayTo });
     }
-    let amount = validate_atomic_amount(max_amount_required).map_err(EntryDefect::BadAmount)?;
+    let amount = validate_atomic_amount(amount).map_err(EntryDefect::BadAmount)?;
     Ok(PaymentRequirements {
         scheme: SCHEME_EXACT.to_string(),
         network,
-        max_amount_required: amount,
-        resource: shared.resource.clone(),
-        description: shared.description.clone(),
-        mime_type: "application/json".to_string(),
+        amount,
+        asset,
         pay_to,
         max_timeout_seconds: shared.max_timeout_seconds,
-        asset,
-        extra: None,
+        extra: extra.map(Value::Object),
     })
 }
 
@@ -201,14 +237,14 @@ pub fn parse_accepts(
             // Kept for the error message only: `validated_option` consumes the field, and naming
             // the offending entry is what lets an operator find it in a multi-entry array.
             let named = entry.network.clone();
-            validated_option(
-                entry.network,
-                entry.asset,
-                entry.pay_to,
-                &entry.max_amount_required,
-                shared,
-            )
-            .map_err(|defect| ConfigError::in_accepts_entry(named, defect))
+            if entry.max_amount_required.is_some() {
+                return Err(ConfigError::V1AmountKey { network: named });
+            }
+            let Some(amount) = entry.amount else {
+                return Err(ConfigError::MissingAmount { network: named });
+            };
+            validated_option(entry.network, entry.asset, entry.pay_to, &amount, entry.extra, shared)
+                .map_err(|defect| ConfigError::in_accepts_entry(named, defect))
         })
         .collect()
 }
@@ -700,8 +736,8 @@ mod tests {
     #[test]
     fn parses_a_multi_chain_array_folding_in_the_shared_fields() {
         let raw = r#"[
-            {"network":"test-net-a","asset":"0xAAA","payTo":"0xPAYA","maxAmountRequired":"1000"},
-            {"network":"test-net-b","asset":"0xBBB","payTo":"0xPAYB","maxAmountRequired":"2000"}
+            {"network":"test-net-a","asset":"0xAAA","payTo":"0xPAYA","amount":"1000"},
+            {"network":"test-net-b","asset":"0xBBB","payTo":"0xPAYB","amount":"2000"}
         ]"#;
         let options = parse_accepts(raw, &shared()).unwrap();
         assert_eq!(options.len(), 2);
@@ -709,18 +745,70 @@ mod tests {
         assert_eq!(options[0].network, "test-net-a");
         assert_eq!(options[0].asset, "0xAAA");
         assert_eq!(options[0].pay_to, "0xPAYA");
-        assert_eq!(options[0].max_amount_required, "1000");
+        assert_eq!(options[0].amount, "1000");
         assert_eq!(options[1].network, "test-net-b");
-        assert_eq!(options[1].max_amount_required, "2000");
+        assert_eq!(options[1].amount, "2000");
 
-        // The shared, non-per-chain fields are folded onto every option.
+        // The shared per-option field is folded onto every option, and nothing else is invented.
         for o in &options {
             assert_eq!(o.scheme, SCHEME_EXACT);
-            assert_eq!(o.resource, shared().resource);
-            assert_eq!(o.description, "One inference request");
-            assert_eq!(o.mime_type, "application/json");
             assert_eq!(o.max_timeout_seconds, 60);
+            assert_eq!(o.extra, None, "no extra unless the entry gives one");
         }
+    }
+
+    #[test]
+    fn the_resource_is_stated_once_from_the_shared_fields() {
+        let resource = shared().resource_info();
+        assert_eq!(resource.url, shared().resource);
+        assert_eq!(resource.description.as_deref(), Some("One inference request"));
+        assert_eq!(resource.mime_type.as_deref(), Some("application/json"));
+    }
+
+    #[test]
+    fn an_entry_extra_is_advertised_as_given() {
+        let raw = r#"[{"network":"test-net-a","asset":"0xAAA","payTo":"0xPAYA","amount":"1000",
+                       "extra":{"name":"USDC","version":"2","nested":{"k":[1,2]}}}]"#;
+        let options = parse_accepts(raw, &shared()).unwrap();
+        assert_eq!(
+            options[0].extra,
+            Some(serde_json::json!({ "name": "USDC", "version": "2", "nested": { "k": [1, 2] } }))
+        );
+    }
+
+    #[test]
+    fn an_extra_that_is_not_an_object_is_rejected() {
+        // `null` is not in the list: it reads as an absent `extra`, which is what it says.
+        for extra in [r#""USDC""#, "[1]", "7", "true"] {
+            let raw = format!(
+                r#"[{{"network":"n","asset":"a","payTo":"p","amount":"1","extra":{extra}}}]"#
+            );
+            let err = parse_accepts(&raw, &shared()).unwrap_err();
+            assert!(matches!(err, ConfigError::Malformed(_)), "extra {extra}: got {err:?}");
+        }
+    }
+
+    #[test]
+    fn the_v1_amount_key_is_refused_naming_its_replacement() {
+        // A configuration written for x402 v1. Refused, not read: the message has to say what the
+        // key is called now, which serde's unknown-field error would not.
+        for raw in [
+            r#"[{"network":"test-net-a","asset":"a","payTo":"p","maxAmountRequired":"1000"}]"#,
+            r#"[{"network":"test-net-a","asset":"a","payTo":"p","amount":"1","maxAmountRequired":"1"}]"#,
+        ] {
+            let err = parse_accepts(raw, &shared()).unwrap_err();
+            assert_eq!(err, ConfigError::V1AmountKey { network: "test-net-a".to_string() }, "{raw}");
+            let message = err.to_string();
+            assert!(message.contains("\"amount\""), "must name the new key: {message}");
+            assert!(message.contains("test-net-a"), "must name the entry: {message}");
+        }
+    }
+
+    #[test]
+    fn an_entry_without_an_amount_is_rejected_naming_it() {
+        let raw = r#"[{"network":"test-net-a","asset":"a","payTo":"p"}]"#;
+        let err = parse_accepts(raw, &shared()).unwrap_err();
+        assert_eq!(err, ConfigError::MissingAmount { network: "test-net-a".to_string() });
     }
 
     #[test]
@@ -733,7 +821,7 @@ mod tests {
         // Reusing validate_atomic_amount means a float / sign / separator is caught here, at config
         // time, and the error points at WHICH entry so an operator can find it in a long array.
         let raw =
-            r#"[{"network":"test-net-a","asset":"0xAAA","payTo":"0xPAYA","maxAmountRequired":"1.5"}]"#;
+            r#"[{"network":"test-net-a","asset":"0xAAA","payTo":"0xPAYA","amount":"1.5"}]"#;
         let err = parse_accepts(raw, &shared()).unwrap_err();
         assert!(matches!(err, ConfigError::BadAmount { .. }), "got {err:?}");
         assert!(err.to_string().contains("test-net-a"), "must name the entry, got: {err}");
@@ -743,14 +831,14 @@ mod tests {
     fn an_unknown_field_is_rejected_not_silently_dropped() {
         // deny_unknown_fields: a typo'd key ("payto") must fail, not vanish — otherwise the entry
         // would build a challenge with an empty/defaulted pay-to and quietly send money nowhere.
-        let raw = r#"[{"network":"n","asset":"a","payto":"0xTYPO","maxAmountRequired":"1"}]"#;
+        let raw = r#"[{"network":"n","asset":"a","payto":"0xTYPO","amount":"1"}]"#;
         let err = parse_accepts(raw, &shared()).unwrap_err();
         assert!(matches!(err, ConfigError::Malformed(_)), "got {err:?}");
     }
 
     #[test]
     fn a_missing_field_is_rejected() {
-        let raw = r#"[{"network":"n","asset":"a","maxAmountRequired":"1"}]"#; // no payTo
+        let raw = r#"[{"network":"n","asset":"a","amount":"1"}]"#; // no payTo
         let err = parse_accepts(raw, &shared()).unwrap_err();
         assert!(matches!(err, ConfigError::Malformed(_)), "got {err:?}");
     }
@@ -766,8 +854,8 @@ mod tests {
         // network is the match key: an empty one yields a gateway that starts fine and 402s every
         // request forever. Whitespace-only is the same trap, so it is rejected too.
         for bad in [
-            r#"[{"network":"","asset":"0xAAA","payTo":"0xPAYA","maxAmountRequired":"1000"}]"#,
-            r#"[{"network":"   ","asset":"0xAAA","payTo":"0xPAYA","maxAmountRequired":"1000"}]"#,
+            r#"[{"network":"","asset":"0xAAA","payTo":"0xPAYA","amount":"1000"}]"#,
+            r#"[{"network":"   ","asset":"0xAAA","payTo":"0xPAYA","amount":"1000"}]"#,
         ] {
             let err = parse_accepts(bad, &shared()).unwrap_err();
             assert!(matches!(err, ConfigError::EmptyNetwork), "got {err:?} for {bad}");
@@ -779,7 +867,7 @@ mod tests {
         // Both are required, so a *missing* one is already Malformed; this is the present-but-""
         // case — an option that would advertise sending money nowhere. Caught at startup, named.
         let empty_asset =
-            r#"[{"network":"test-net-a","asset":"","payTo":"0xPAYA","maxAmountRequired":"1000"}]"#;
+            r#"[{"network":"test-net-a","asset":"","payTo":"0xPAYA","amount":"1000"}]"#;
         let err = parse_accepts(empty_asset, &shared()).unwrap_err();
         assert!(
             matches!(&err, ConfigError::EmptyField { field: EntryField::Asset, network } if network == "test-net-a"),
@@ -791,7 +879,7 @@ mod tests {
         assert!(err.to_string().contains("asset must not be empty"), "got {err}");
 
         let empty_pay_to =
-            r#"[{"network":"test-net-a","asset":"0xAAA","payTo":"  ","maxAmountRequired":"1000"}]"#;
+            r#"[{"network":"test-net-a","asset":"0xAAA","payTo":"  ","amount":"1000"}]"#;
         let err = parse_accepts(empty_pay_to, &shared()).unwrap_err();
         assert!(
             matches!(&err, ConfigError::EmptyField { field: EntryField::PayTo, .. }),

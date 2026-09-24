@@ -25,13 +25,13 @@ construction, because there is no signing path to misuse.
 
 | | |
 |---|---|
-| **Shipped (A0–A2)** | 402 challenge, `X-PAYMENT` / `X-PAYMENT-RESPONSE` codec, the `Facilitator` and `Upstream` seams, the fakes, the wired gateway |
+| **Shipped (A0–A2)** | 402 challenge, the x402 header codec — x402 v2 only since [#71](https://github.com/geekinasuit/obolus/issues/71): `PAYMENT-REQUIRED` / `PAYMENT-SIGNATURE` / `PAYMENT-RESPONSE`, with v1 support deferred to [#73](https://github.com/geekinasuit/obolus/issues/73) — the `Facilitator` and `Upstream` seams, the fakes, the wired gateway |
 | **Shipped (A3 rewire)** | The real HTTP clients wired into the `obolus` binary: `DelegatedFacilitator` (delegates `/verify` + `/settle` to a facilitator you point it at) and `OllamaUpstream` (proxies a real Ollama). The fakes are now `#[cfg(test)]`-only, so no shipped binary can select "accept every payment + real model". Live-path hardening addressed: upstream head deadline ([#31](https://github.com/geekinasuit/obolus/issues/31) item 1), settle deadline derived from `maxTimeoutSeconds` (item 4), pooled-retry double-settle disabled (item 6) |
 | **Next (A3 e2e + fast-follows)** | The post-merge **cron** that settles a real testnet payment against a third-party facilitator (touches the network, so cron-only, never per-PR). Plus the remaining [#31](https://github.com/geekinasuit/obolus/issues/31) fast-follows: output/generation caps (item 2), settle-failure body drain/abort (item 3), and — both answerable only on the first live round-trip — the 4xx-verdict contract confirmation (item 5) and whether the upstream head deadline can outlast the advertised payment window (item 7) |
 | **Later (Phase B)** | A self-settling facilitator that verifies and submits on-chain itself — additive behind the same seam, gated separately |
 
-The payment payload is **opaque** to Phase A: we decode the envelope (version / scheme /
-network) and forward the inner authorization untouched. That boundary is what lets this ship
+The payment payload is **opaque** to Phase A: we decode the envelope (the version, and the
+option the client says it `accepted`) and forward the inner authorization untouched. That boundary is what lets this ship
 without crypto, and A1's types are built to preserve it.
 
 ## Layout
@@ -109,7 +109,7 @@ Configuration is by environment variable:
 | `OBOLUS_ASSET` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_DESCRIPTION` | `One inference request` | Free text shown in the challenge. |
 | `OBOLUS_ALLOW_MAINNET` | unset | **Arming value.** Unset, Obolus refuses to start if **any** advertised `network` is not on its pinned testnet allowlist — a mainnet id, a typo, or a testnet x402 added after this build. To advertise one anyway, set this to **exactly the network id(s) to arm**, comma-separated (`eip155:8453`, or `eip155:8453,eip155:1`); the startup log then carries a `*** MAINNET ARMED ***` banner naming every armed network. The value must name every advertised unproven network and nothing else: an id the gateway does not advertise, or one already on the allowlist, is a startup refusal, and so is the retired boolean form `1`. Comparison is byte-exact, so a typo in the value fails closed. See [Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network). |
-| `OBOLUS_ACCEPTS` | unset | **Multi-chain override.** A JSON array of `{"network","asset","payTo","maxAmountRequired"}` objects — one per chain — advertised together in a single 402; the client picks one to pay. When set it **supersedes** the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` vars — and setting both at once is a **startup error** (the single-chain values would be inert, so the server refuses rather than advertise a config you did not intend). At most one entry per `(scheme, network)`; see [Advertising more than one chain](#advertising-more-than-one-chain). |
+| `OBOLUS_ACCEPTS` | unset | **Multi-chain override.** A JSON array of `{"network","asset","payTo","amount"}` objects (plus an optional `extra` object, advertised as given) — one per chain — advertised together in a single 402; the client picks one to pay. When set it **supersedes** the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` vars — and setting both at once is a **startup error** (the single-chain values would be inert, so the server refuses rather than advertise a config you did not intend). At most one entry per `(scheme, network)`; see [Advertising more than one chain](#advertising-more-than-one-chain). |
 | `OBOLUS_TOKEN_PUBKEY_FILE` | unset | **Turns the bearer-token path on.** Path to an Ed25519 **public** key in PEM (`openssl pkey -pubout`). Unset, there is no token path at all and every caller pays — the previous behaviour. Set, a caller presenting a token this key verifies is served without paying; everyone else still gets the 402. A file that is missing or is not an Ed25519 public key is a startup error, not a per-request one — and so is setting this to an empty string, which would otherwise ask for a token path while naming no key to build one from. See [Serving without payment](#serving-without-payment). |
 | `OBOLUS_TOKEN_KEYS` | unset | **The multi-key form, for rotation.** A JSON array of `{"kid": "...", "file": "..."}` objects; `kid` is optional. Supersedes `OBOLUS_TOKEN_PUBKEY_FILE`, and setting **both is a startup error** — the superseded one would sit inert, and an inert *verifying* key says nothing until a token signed with it is refused. A token naming a `kid` is checked against that key first, but a `kid` that matches nothing (or is absent) does not reject the token: it is checked against the rest of the set. At most 8 keys, no `kid` repeated, no key armed twice, every named file readable — each a startup error naming the offending entry. Set-but-empty (or whitespace-only) is its own startup error rather than the both-set one, since an array that arrived empty configures nothing. See [Rotating the signing key](#rotating-the-signing-key). |
 | `OBOLUS_TOKEN_ISSUER` | **required with the keys** | The exact `iss` every honoured token must carry. Not optional and has no default: a signing key usually belongs to an identity provider rather than to one service, so with nothing to check `iss` against, every token that key has ever minted — for any audience — would buy inference here. Setting the key without this, or setting it empty, is a startup error — as is setting **this** without the key, which would otherwise be a silent no-op that 402s every caller while looking configured. |
@@ -315,10 +315,17 @@ to a JSON array with one object per chain:
 
 ```json
 [
-  {"network": "eip155:84532", "asset": "0x…usdc", "payTo": "0x…you", "maxAmountRequired": "1000"},
-  {"network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "asset": "…usdc-mint", "payTo": "…you", "maxAmountRequired": "1000"}
+  {"network": "eip155:84532", "asset": "0x…usdc", "payTo": "0x…you", "amount": "1000",
+   "extra": {"name": "USDC", "version": "2"}},
+  {"network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "asset": "…usdc-mint", "payTo": "…you", "amount": "1000"}
 ]
 ```
+
+`amount` is the price in the token's atomic units, as a decimal string. It is x402 v2's name for
+what v1 called `maxAmountRequired`, and an entry still using the v1 key is refused by name rather
+than read. `extra` is scheme-specific; Obolus advertises it exactly as given, and a payment must carry
+every key it names, with the same value. x402's `exact` scheme on an EVM chain requires the
+token's EIP-712 domain `name` and `version` there, as in the first entry — clients sign under it.
 
 `network` must be the **CAIP-2** `namespace:reference` id (Base Sepolia and Solana Devnet above), not
 an x402 short name like `base-sepolia`. The arming guard compares byte-exactly against a CAIP-2
@@ -337,11 +344,10 @@ single-chain behaviour: one option built from `OBOLUS_NETWORK` / `OBOLUS_ASSET` 
 
 Two rules the startup checks enforce:
 
-- **At most one entry per `(scheme, network)`.** A payment envelope exposes only its
-  `(scheme, network)` — the asset lives *inside* the opaque authorization Obolus never parses — so
-  two entries on the same network could not be told apart, and Obolus would not know which asset to
-  settle against. Multi-chain therefore means *distinct networks*, not several tokens on one network.
-  A duplicate aborts startup.
+- **At most one entry per `(scheme, network)`.** A v2 payment names the whole option it accepted,
+  so two entries on one network could now be told apart; whether offering several tokens on one
+  network is wanted is still open ([#76](https://github.com/geekinasuit/obolus/issues/76)). Until
+  it is decided, multi-chain means *distinct networks*, and a duplicate aborts startup.
 - **One facilitator serves every advertised chain.** `OBOLUS_FACILITATOR_URL` is singular, so
   whatever facilitator you point at must handle all the networks you advertise (the x402.org testnet
   facilitator covers Base-Sepolia and Solana devnet). A per-network facilitator map is a later
@@ -350,7 +356,8 @@ Two rules the startup checks enforce:
 `OBOLUS_ACCEPTS` is validated at startup: a set-but-empty value, a malformed or empty array, an unknown/missing field, an
 empty `network` / `asset` / `payTo` (network is the match key, so an empty one can never match a real
 payment and would 402 forever; an empty asset or pay-to would advertise an option that sends money
-nowhere), or a `maxAmountRequired` that is not a plain integer aborts the launch rather than
+nowhere), a missing `amount` or one that is not a plain integer, the v1 key `maxAmountRequired`, or
+an `extra` that is not a JSON object aborts the launch rather than
 advertising an unpayable or wrong challenge. Setting `OBOLUS_ACCEPTS` **together with** any of the
 single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` / `OBOLUS_PAY_TO` / `OBOLUS_PRICE` vars is likewise a
 startup error, naming the ignored vars — a gateway that silently advertises a different network than
