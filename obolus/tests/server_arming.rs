@@ -64,6 +64,7 @@ const OBOLUS_VARS: &[&str] = &[
     "OBOLUS_PRICE",
     "OBOLUS_PAY_TO",
     "OBOLUS_ASSET",
+    "OBOLUS_EXTRA",
     "OBOLUS_PRICING",
     "OBOLUS_UPSTREAM_COST",
     "OBOLUS_MARGIN_BPS",
@@ -173,11 +174,17 @@ const ALL_CLEAR_CLAIM: &str = "every advertised network is on the pinned testnet
 /// else; the ARMED banner counts `network(s) NOT`.
 const ADVERTISEMENT_LINE: &str = "payment option(s)";
 
+/// The token domain an EVM option must advertise — synthetic, like every value here. Passed as
+/// `OBOLUS_EXTRA` by each single-chain run on an `eip155:` network, and carried by each EVM
+/// `OBOLUS_ACCEPTS` entry below, so those runs reach the refusal they are about rather than the one
+/// for a missing domain.
+const EVM_EXTRA: &str = r#"{"name":"TEST-TOKEN-NOT-REAL","version":"1"}"#;
+
 /// `OBOLUS_ACCEPTS` fixtures. Obviously-synthetic asset and pay-to values, never real or
 /// partially-real addresses — these are payment-path fixtures and a plausible-looking address in
 /// one is a hazard, not a convenience.
 const ACCEPTS_ONE_TESTNET: &str = r#"[
-    {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
+    {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
@@ -188,16 +195,16 @@ const ACCEPTS_ONE_TESTNET: &str = r#"[
 /// by a check that could be comparing whole entries; the claim is that the pair is refused on
 /// `(scheme, network)` alone, *despite* naming different assets.
 const ACCEPTS_DUPLICATE_NETWORK: &str = r#"[
-    {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
+    {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
-    {"network":"eip155:84532","asset":"0xSECOND-TEST-ASSET-ADDRESS-NOT-REAL",
+    {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:84532","asset":"0xSECOND-TEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
 ]"#;
 
 /// A perfectly good Base Sepolia entry *plus* one naming the built-in placeholder. The only way an
 /// operator reaches `UNCONFIGURED NETWORK`'s third enumerated state.
 const ACCEPTS_TESTNET_PLUS_PLACEHOLDER: &str = r#"[
-    {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
+    {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"test-network-not-a-real-caip2","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
@@ -206,9 +213,9 @@ const ACCEPTS_TESTNET_PLUS_PLACEHOLDER: &str = r#"[
 /// Base mainnet hidden between two genuine testnets — the configuration the ticket's Definition of
 /// Done names, and one only `OBOLUS_ACCEPTS` can express.
 const ACCEPTS_MAINNET_HIDDEN_AMONG_TESTNETS: &str = r#"[
-    {"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
+    {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:84532","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
-    {"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
+    {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
@@ -230,7 +237,7 @@ const ACCEPTS_MAINNET_HIDDEN_AMONG_TESTNETS: &str = r#"[
 /// tell which" disclaimer happens to be true. The armed suite was in-distribution with the very
 /// assumption it would have had to falsify.
 const ACCEPTS_MAINNET_PLUS_DEAD_SHORT_NAME: &str = r#"[
-    {"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
+    {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"base-sepolia","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
@@ -257,7 +264,7 @@ const ACCEPTS_TWO_SHORT_NAMES: &str = r#"[
 /// becomes "unproven". That is exactly why the placeholder report went missing on this branch — the
 /// value that needs reporting is invisible to the predicate that chose the branch.
 const ACCEPTS_MAINNET_PLUS_PLACEHOLDER: &str = r#"[
-    {"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
+    {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"test-network-not-a-real-caip2","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
@@ -507,6 +514,7 @@ fn a_non_utf8_arming_value_refuses() {
     let value = std::ffi::OsStr::from_bytes(b"eip155:8453\xff");
     let run = run_os(&[], &[
         ("OBOLUS_NETWORK", std::ffi::OsStr::new(TESTNET)),
+        ("OBOLUS_EXTRA", std::ffi::OsStr::new(EVM_EXTRA)),
         ("OBOLUS_ALLOW_MAINNET", value),
     ]);
 
@@ -517,7 +525,7 @@ fn a_non_utf8_arming_value_refuses() {
 
 #[test]
 fn an_unarmed_mainnet_network_refuses_to_start() {
-    let run = run(&[("OBOLUS_NETWORK", MAINNET)]);
+    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_EXTRA", EVM_EXTRA)]);
 
     run.must_say("not on Obolus's pinned testnet allowlist");
     run.must_have_refused_during_startup();
@@ -530,7 +538,7 @@ fn a_refusal_never_advertises_anything_first() {
     // see this. (Below `Gateway::new` it cannot move: the constructor takes the guard's witness.)
     // What distinguishes the two is whether a gateway that is about to abort first told the
     // operator it was advertising payment options.
-    let run = run(&[("OBOLUS_NETWORK", MAINNET)]);
+    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_EXTRA", EVM_EXTRA)]);
 
     // Positive first, deliberately. The three absences below are the actual claim, but absences
     // alone are satisfied by a run that printed nothing at all — this pins that the refusal really
@@ -765,7 +773,7 @@ fn a_boolean_arming_value_arms_nothing_and_refuses() {
     // Arming names its target. `true` names no network this gateway advertises, so it arms
     // nothing — and a value that arms nothing is refused, not ignored: an operator who set it
     // believes they armed something.
-    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_ALLOW_MAINNET", "true")]);
+    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_EXTRA", EVM_EXTRA), ("OBOLUS_ALLOW_MAINNET", "true")]);
 
     run.must_say(CANNOT_ARM);
     run.must_say("\"true\"");
@@ -778,7 +786,7 @@ fn the_retired_boolean_form_is_refused_and_redirected() {
     // `=1` was the documented form and is the one an operator with old notes will reach for. It
     // must not arm — a process-wide yes is exactly what #28 retired — and it must not merely fall
     // into the generic "cannot arm" refusal either: the operator needs to be told the form changed.
-    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_ALLOW_MAINNET", "1")]);
+    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_EXTRA", EVM_EXTRA), ("OBOLUS_ALLOW_MAINNET", "1")]);
 
     run.must_say(RETIRED_FORM);
     run.must_have_refused_during_startup();
@@ -813,7 +821,7 @@ fn arming_an_unadvertised_network_refuses() {
     // under it. The gateway advertises one mainnet and the value names it plus one it does not
     // advertise; the extra entry is a refusal, not a no-op.
     let run = run(&[
-        ("OBOLUS_NETWORK", MAINNET),
+        ("OBOLUS_NETWORK", MAINNET), ("OBOLUS_EXTRA", EVM_EXTRA),
         ("OBOLUS_ALLOW_MAINNET", &format!("{MAINNET},eip155:1")),
     ]);
 
@@ -825,7 +833,7 @@ fn arming_an_unadvertised_network_refuses() {
 
 #[test]
 fn an_armed_mainnet_network_boots_and_says_so_loudly() {
-    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_ALLOW_MAINNET", MAINNET)]);
+    let run = run(&[("OBOLUS_NETWORK", MAINNET), ("OBOLUS_EXTRA", EVM_EXTRA), ("OBOLUS_ALLOW_MAINNET", MAINNET)]);
 
     run.must_have_got_past_startup();
     run.must_say("*** MAINNET ARMED ***");
@@ -945,7 +953,7 @@ fn an_unconfigured_boot_is_not_reported_as_testnet_by_construction() {
 
 #[test]
 fn a_configured_testnet_reports_the_testnet_posture() {
-    let run = run(&[("OBOLUS_NETWORK", TESTNET)]);
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA)]);
 
     run.must_have_got_past_startup();
     run.must_say("testnet-by-construction");
@@ -996,7 +1004,7 @@ fn accepts_alongside_the_single_chain_vars_refuses_to_start() {
     // { bail! }` that consumes it was not tested anywhere. It is a refusal with its own message on
     // the payment-configuration path, and it is what makes the parenthetical in UNCONFIGURED
     // NETWORK ("that combination refuses to start") true.
-    let run = run(&[("OBOLUS_ACCEPTS", ACCEPTS_ONE_TESTNET), ("OBOLUS_NETWORK", TESTNET)]);
+    let run = run(&[("OBOLUS_ACCEPTS", ACCEPTS_ONE_TESTNET), ("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA)]);
 
     run.must_say("supersedes the single-chain payment variables");
     run.must_say("OBOLUS_NETWORK"); // names which variable is being ignored
@@ -1044,7 +1052,7 @@ fn an_empty_asset_variable_refuses_to_start() {
     // The negative assertion below is the other half: with a `{ .. }` catch-all in
     // `single_chain_defect`, the empty-asset defect would be reported against OBOLUS_PAY_TO, sending
     // the operator to clear a variable that was fine.
-    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_ASSET", "")]);
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA), ("OBOLUS_ASSET", "")]);
 
     run.must_say("OBOLUS_ASSET is set but empty");
     run.must_not_say("OBOLUS_PAY_TO is set but empty"); // the catch-all's wording, on the wrong var
@@ -1075,7 +1083,7 @@ fn an_empty_accepts_alongside_single_chain_vars_reports_the_true_premise() {
     // The non-empty pairing is `accepts_alongside_the_single_chain_vars_refuses_to_start` above,
     // which still reaches the supersession bail — that is what keeps this ordering claim readable as
     // a choice between two live branches rather than as the only branch left.
-    let run = run(&[("OBOLUS_ACCEPTS", ""), ("OBOLUS_NETWORK", TESTNET)]);
+    let run = run(&[("OBOLUS_ACCEPTS", ""), ("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA)]);
 
     run.must_say("OBOLUS_ACCEPTS is set but empty");
     // The supersession bail's own distinguishing clause, not the phrase both messages share
@@ -1115,9 +1123,70 @@ fn an_empty_pay_to_variable_refuses_to_start() {
     // The asymmetry that convergence closed, stated as its own test because it is the one with
     // money attached: `parse_accepts` has always rejected an empty `payTo`, while the single-chain
     // branch advertised the challenge — an option that sends money nowhere — and started cleanly.
-    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_PAY_TO", "")]);
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA), ("OBOLUS_PAY_TO", "")]);
 
     run.must_say("OBOLUS_PAY_TO is set but empty");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn an_evm_network_without_the_token_domain_refuses_and_names_the_variable() {
+    // Without `extra.name` and `extra.version` a conforming client cannot build the EIP-712 domain
+    // and refuses to sign, so the challenge would be one nobody can pay. The operator needs the
+    // variable that carries it, not the JSON key inside it.
+    let run = run(&[("OBOLUS_NETWORK", TESTNET)]);
+
+    run.must_say("OBOLUS_EXTRA must carry the token domain");
+    run.must_say("extra.name");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn a_token_domain_missing_its_version_refuses_naming_the_key() {
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", r#"{"name":"TEST-TOKEN-NOT-REAL"}"#)]);
+
+    run.must_say("OBOLUS_EXTRA must carry the token domain");
+    run.must_say("extra.version");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn an_empty_extra_variable_refuses_to_start() {
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", "")]);
+
+    run.must_say("OBOLUS_EXTRA is set but empty");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn an_extra_that_is_not_a_json_object_refuses_to_start() {
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", r#"["USDC","2"]"#)]);
+
+    run.must_say("OBOLUS_EXTRA");
+    run.must_say("JSON object");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn accepts_alongside_only_the_single_chain_extra_refuses_and_names_it() {
+    // OBOLUS_EXTRA is a single-chain variable like the other four: set beside an array it would be
+    // silently ignored, while each array entry carries its own `extra`.
+    let run = run(&[("OBOLUS_ACCEPTS", ACCEPTS_ONE_TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA)]);
+
+    run.must_say("supersedes the single-chain payment variables");
+    run.must_say("OBOLUS_EXTRA");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn an_accepts_evm_entry_without_the_token_domain_refuses() {
+    let run = run(&[(
+        "OBOLUS_ACCEPTS",
+        r#"[{"network":"eip155:84532","asset":"0x0000000000000000000000000000000000000001","payTo":"0x0000000000000000000000000000000000000002","amount":"1000"}]"#,
+    )]);
+
+    run.must_say("OBOLUS_ACCEPTS entry for network \"eip155:84532\"");
+    run.must_say("extra.name");
     run.must_have_refused_during_startup();
 }
 
@@ -1128,7 +1197,7 @@ fn arming_a_network_that_is_already_testnet_refuses() {
     // allowlist is nothing to arm — so this is a configuration error, refused by name, rather than
     // an inert flag an operator has to notice in the log. What must not happen on either side of
     // that change: the banner crying mainnet on an all-testnet gateway.
-    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_ALLOW_MAINNET", TESTNET)]);
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA), ("OBOLUS_ALLOW_MAINNET", TESTNET)]);
 
     run.must_say(CANNOT_ARM);
     run.must_say(&format!("\"{TESTNET}\""));
@@ -1354,7 +1423,7 @@ fn an_instance_with_no_token_configuration_announces_no_token_path() {
     // token path at all and every caller pays. Worth pinning because it is the negative half of the
     // shared `TOKEN_ENABLED` needle — without it, a banner that printed unconditionally would still
     // satisfy every positive assertion above.
-    let run = run(&[("OBOLUS_NETWORK", TESTNET)]);
+    let run = run(&[("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA)]);
 
     run.must_have_got_past_startup();
     run.must_not_say(TOKEN_ENABLED);

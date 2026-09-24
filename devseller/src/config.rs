@@ -91,7 +91,10 @@ pub const REJECT_REASON_VAR: &str = "OBOLUS_DEV_REJECT_REASON";
 pub const SETTLE_VAR: &str = "OBOLUS_DEV_SETTLE";
 pub const SETTLE_REASON_VAR: &str = "OBOLUS_DEV_SETTLE_REASON";
 pub const SETTLE_DELAY_VAR: &str = "OBOLUS_DEV_SETTLE_DELAY_SECS";
+/// Retired: the token domain is read from each option's advertised `extra`. Kept only so `main`
+/// can refuse a configuration that still sets them.
 pub const TOKEN_NAME_VAR: &str = "OBOLUS_DEV_TOKEN_NAME";
+/// Retired, as [`TOKEN_NAME_VAR`].
 pub const TOKEN_VERSION_VAR: &str = "OBOLUS_DEV_TOKEN_VERSION";
 
 const VERIFY_CHOICES: &str = "verify (default), accept, reject";

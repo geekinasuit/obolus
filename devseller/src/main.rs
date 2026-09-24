@@ -47,14 +47,16 @@ use std::sync::Arc;
 
 use obolus::arming::{check_arming, PLACEHOLDER_NETWORK};
 use obolus::backends::{Backends, Kind};
-use obolus::config::{parse_accepts, superseded_single_chain_vars, validated_option, SharedOffer};
+use obolus::config::{
+    parse_accepts, parse_extra, superseded_single_chain_vars, validated_option, EntryDefect,
+    SharedOffer, EXTRA_VAR,
+};
 use obolus::gateway::{router, Access, Gateway};
 use obolus::upstream::{OllamaUpstream, Upstream};
 use obolus::x402::PaymentRequirements;
 
 use crate::config::{VerifyMode, TOKEN_NAME_VAR, TOKEN_VERSION_VAR};
 use crate::upstream::CannedUpstream;
-use crate::verify::TokenDomain;
 
 /// Deliberately neither 8402 (which x402 client tooling tends to bind) nor 8403 (`obolus`), so a
 /// development seller and a real gateway can run side by side without either moving.
@@ -98,7 +100,7 @@ WHERE IT LISTENS, AND WHAT IS BEHIND IT
     OBOLUS_DESCRIPTION            human description in the challenge
 
 WHAT IT CHARGES — two mutually exclusive doors, the same ones `obolus` offers
-    OBOLUS_ACCEPTS                JSON array of payment options; supersedes the four below, and
+    OBOLUS_ACCEPTS                JSON array of payment options; supersedes the five below, and
                                   refuses to start if any of them is also set
     OBOLUS_NETWORK                CAIP-2 network id, e.g. eip155:84532 (testnets only)
     OBOLUS_ASSET                  20-byte token contract address
@@ -106,6 +108,9 @@ WHAT IT CHARGES — two mutually exclusive doors, the same ones `obolus` offers
                                   built-in placeholder is not an address, so a client could not
                                   name it in an authorization, and startup refuses it.
     OBOLUS_PRICE                  price in atomic units (default 1000)
+    OBOLUS_EXTRA                  JSON object advertised as the option's extra. On an EVM network
+                                  it must carry the token's EIP-712 domain, e.g. for USDC on Base
+                                  Sepolia {\"name\":\"USDC\",\"version\":\"2\"}
 
 HOW IT SHOULD FAIL — the reason this binary exists. Two knobs, not one, because verification and
 settlement fail independently: `verify` passing and settlement THEN failing is the case that decides
@@ -119,11 +124,12 @@ nonce spent as far as the client knows.
     OBOLUS_DEV_SETTLE_REASON      reason text for `unavailable` and `rejected`
     OBOLUS_DEV_SETTLE_DELAY_SECS  seconds `timeout` blocks for (default 120)
 
-THE EIP-712 TOKEN DOMAIN that `verify` checks signatures under. A mismatch here rejects
-correctly-signed payments, so when an OBOLUS_ACCEPTS entry's \"extra\" names a domain too — which is
-what a client signs under — startup refuses unless the two agree.
-    OBOLUS_DEV_TOKEN_NAME         EIP-712 domain name (default USDC)
-    OBOLUS_DEV_TOKEN_VERSION      EIP-712 domain version (default 2)
+THE EIP-712 TOKEN DOMAIN that `verify` checks signatures under is the one each option advertises:
+extra.name and extra.version, the asset as verifyingContract, and the network's chain id. A client
+that signs under the challenge therefore always agrees with it — so this seller CANNOT tell you
+whether that name and version are right for the real token contract. A wrong one passes here and
+fails only when a real facilitator settles. OBOLUS_DEV_TOKEN_NAME / OBOLUS_DEV_TOKEN_VERSION no
+longer exist; setting either is a startup refusal pointing at extra.
 
 REFUSALS, none of which are overridable except the last
     Any network it cannot prove is a testnet, and the built-in placeholder network. `obolus` has
@@ -147,10 +153,6 @@ REFUSALS, none of which are overridable except the last
 /// states for its own variables to the rest of them: an empty value means something arrived carrying
 /// nothing — an unexpanded `${VAR}`, an `EnvironmentFile` line ending in `=` — and silently taking
 /// the default hides that the operator's chosen value never reached the process.
-///
-/// `OBOLUS_DEV_TOKEN_NAME` is the one that stings. An empty EIP-712 domain name is still a domain,
-/// so verification runs, rejects every correctly-signed payment, and gives the payer no way to see
-/// why from their side.
 fn env_or(key: &str, default: &str) -> anyhow::Result<String> {
     match std::env::var(key) {
         Err(_) => Ok(default.to_string()),
@@ -186,10 +188,19 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: SocketAddr = env_or("OBOLUS_ADDR", DEFAULT_ADDR)?.parse()?;
     let dev = config::from_env(|key| std::env::var(key).ok())?;
-    let token = TokenDomain {
-        name: env_or(TOKEN_NAME_VAR, &TokenDomain::default().name)?,
-        version: env_or(TOKEN_VERSION_VAR, &TokenDomain::default().version)?,
-    };
+    // The domain is read from each option's advertised `extra` now. A variable that used to set it
+    // and silently no longer does would verify under something other than what its operator wrote,
+    // so it is refused, set or set-but-empty alike.
+    for retired in [TOKEN_NAME_VAR, TOKEN_VERSION_VAR] {
+        if std::env::var_os(retired).is_some() {
+            anyhow::bail!(
+                "{retired} is no longer read: the EIP-712 token domain is taken from each payment \
+                 option's advertised extra (\"name\" and \"version\"), which is what a client signs \
+                 under. Unset it, and put the value in OBOLUS_EXTRA — or in the OBOLUS_ACCEPTS \
+                 entry's \"extra\" — e.g. {{\"name\":\"USDC\",\"version\":\"2\"}}."
+            );
+        }
+    }
 
     // Unset means the canned upstream — a development seller that needs a model running to test a
     // *payment* flow would be a worse tool than the one it replaces.
@@ -219,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(raw) if raw.trim().is_empty() => anyhow::bail!(
             "OBOLUS_ACCEPTS is set but empty: it reached this process carrying nothing. Unset it \
              to configure a single chain with OBOLUS_NETWORK / OBOLUS_ASSET / OBOLUS_PAY_TO / \
-             OBOLUS_PRICE instead."
+             OBOLUS_PRICE / OBOLUS_EXTRA instead."
         ),
         Ok(raw) => {
             let ignored = superseded_single_chain_vars(|k| std::env::var(k).is_ok());
@@ -238,10 +249,15 @@ async fn main() -> anyhow::Result<()> {
             env_or("OBOLUS_ASSET", PLACEHOLDER_ASSET)?,
             env_or("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO)?,
             &env_or("OBOLUS_PRICE", "1000")?,
-            None,
+            parse_extra(std::env::var(EXTRA_VAR).ok().as_deref())?,
             &shared,
         )
-        .map_err(|e| anyhow::anyhow!("payment configuration: {e}"))?],
+        .map_err(|e| match e {
+            EntryDefect::MissingTokenDomain { .. } => anyhow::anyhow!(
+                "OBOLUS_NETWORK names an EVM chain, so OBOLUS_EXTRA must carry the token domain: {e}"
+            ),
+            e => anyhow::anyhow!("payment configuration: {e}"),
+        })?],
     };
 
     // ---- guards, all of them before anything is advertised -----------------------------------
@@ -366,33 +382,14 @@ async fn main() -> anyhow::Result<()> {
     // client author as "my signing is broken" rather than "the seller is misconfigured".
     if dev.verify == VerifyMode::Verify {
         for r in &requirements {
-            verify::domain_for(r, &token).map_err(|e| {
+            verify::domain_for(r).map_err(|e| {
                 anyhow::anyhow!(
                     "{e}\nOBOLUS_DEV_VERIFY=verify checks signatures offline, so every advertised \
-                     option must carry an EVM chain id and a 20-byte asset address. Fix the \
-                     option, or set OBOLUS_DEV_VERIFY=accept to serve without inspecting payments."
+                     option must carry an EVM chain id, a 20-byte asset address, and the token's \
+                     EIP-712 name and version in its extra. Fix the option, or set \
+                     OBOLUS_DEV_VERIFY=accept to serve without inspecting payments."
                 )
             })?;
-            // A client signs under the domain the challenge shows it; this seller verifies under
-            // its own configured one. Where an option's `extra` names a domain field, the two have
-            // to agree, or every correctly-signed payment fails with a domain the client never saw.
-            for (key, configured, variable) in [
-                ("name", &token.name, TOKEN_NAME_VAR),
-                ("version", &token.version, TOKEN_VERSION_VAR),
-            ] {
-                let Some(advertised) = r.extra.as_ref().and_then(|extra| extra.get(key)) else {
-                    continue;
-                };
-                if advertised.as_str() != Some(configured.as_str()) {
-                    anyhow::bail!(
-                        "the option on network {} advertises extra.{key} = {advertised}, but this \
-                         seller verifies signatures under {key} {configured:?} (from {variable}). \
-                         A client signs under the advertised value, so every correctly-signed \
-                         payment would be rejected. Make them agree.",
-                        r.network
-                    );
-                }
-            }
         }
     }
 
@@ -433,15 +430,18 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("obolus-devseller: behaviour -> {dev}");
     eprintln!("obolus-devseller: upstream -> {}", upstream::describe(upstream_url.as_deref()));
     if dev.verify == VerifyMode::Verify {
-        // The domain this seller verifies under, taken from configuration rather than from the
-        // challenge. Printed unconditionally under `verify` because a wrong one rejects every
-        // correct signature, and the payer cannot see it from their side.
-        eprintln!(
-            "obolus-devseller: EIP-712 token domain -> name={:?} version={:?} (from \
-             {TOKEN_NAME_VAR} / {TOKEN_VERSION_VAR}; a mismatch with the domain a client signs \
-             under rejects correctly-signed payments)",
-            token.name, token.version
-        );
+        // The domain each option is verified under — the one it advertises. Printed, with what it
+        // cannot establish, because a wrong one passes here and fails only at a real settle.
+        for r in &requirements {
+            let domain = verify::domain_for(r).expect("checked in the guard block above");
+            eprintln!(
+                "obolus-devseller: EIP-712 token domain on {} -> name={:?} version={:?} (from the \
+                 advertised extra; a client signs under the same, so this seller cannot tell \
+                 whether it is right for the token contract — a wrong one fails only at a real \
+                 settle)",
+                r.network, domain.name, domain.version
+            );
+        }
     }
     if !loopback {
         eprintln!(
@@ -452,9 +452,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // The last configuration check, and the one that cannot sit in the guard block above: it
-    // consumes the upstream and the token domain, both of which the lines between there and here
-    // still have to report. `new` rejects an empty option set, and two options sharing
-    // (scheme, network) — see `obolus::gateway::GatewayError::DuplicateOption`.
+    // consumes the upstream, which the lines between there and here still have to report. `new`
+    // rejects an empty option set, and two options sharing (scheme, network) — see
+    // `obolus::gateway::GatewayError::DuplicateOption`.
     //
     // Above the banner rather than below it, for the reason that block states: a configuration this
     // process is about to refuse must never first be announced as one it is advertising.
@@ -473,7 +473,7 @@ async fn main() -> anyhow::Result<()> {
         upstream,
     ));
     let gateway = Gateway::new(
-        facilitator::DevFacilitator::new(dev.verify, dev.settle, token),
+        facilitator::DevFacilitator::new(dev.verify, dev.settle),
         backends,
         shared.resource_info(),
         armed_requirements,

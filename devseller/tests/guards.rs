@@ -52,6 +52,7 @@ const OBOLUS_VARS: &[&str] = &[
     "OBOLUS_PRICE",
     "OBOLUS_PAY_TO",
     "OBOLUS_ASSET",
+    "OBOLUS_EXTRA",
     "OBOLUS_ALLOW_MAINNET",
     "OBOLUS_DEV_VERIFY",
     "OBOLUS_DEV_REJECT_REASON",
@@ -90,6 +91,14 @@ const SYNTHETIC_ASSET: &str = "0x0000000000000000000000000000000000000000";
 /// Deliberately a different value from [`SYNTHETIC_ASSET`]: if the two matched, code that compared
 /// the wrong one of the pair would still pass every assertion here.
 const SYNTHETIC_PAY_TO: &str = "0x000000000000000000000000000000000000dead";
+
+/// The `extra` every EVM option here advertises: the token's EIP-712 domain, which an EVM `exact`
+/// option has to carry and which is what this binary verifies under.
+///
+/// Deliberately not USDC's real domain, for the same reason [`SYNTHETIC_ASSET`] is the burn address:
+/// nothing here should resemble a real deployment, and nothing here can tell whether a domain is
+/// right for a contract anyway — it verifies under whatever it advertised.
+const SYNTHETIC_EXTRA: &str = r#"{"name":"TEST-TOKEN-NOT-REAL","version":"1"}"#;
 
 /// A second syntactically valid asset, for the one fixture that needs two *distinct* assets on a
 /// single network. Same disclaimer as [`SYNTHETIC_ASSET`]: parseable, not plausible.
@@ -225,6 +234,7 @@ fn run_os(vars: &[(&str, &std::ffi::OsStr)]) -> Run {
         ("OBOLUS_NETWORK", std::ffi::OsStr::new(TESTNET)),
         ("OBOLUS_ASSET", std::ffi::OsStr::new(SYNTHETIC_ASSET)),
         ("OBOLUS_PAY_TO", std::ffi::OsStr::new(SYNTHETIC_PAY_TO)),
+        ("OBOLUS_EXTRA", std::ffi::OsStr::new(SYNTHETIC_EXTRA)),
     ];
     all.extend_from_slice(vars);
     exec_os(&all)
@@ -465,7 +475,7 @@ fn a_placeholder_hidden_among_good_networks_still_refuses() {
     let accepts = format!(
         r#"[
             {{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}},
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}},
             {{"network":"{PLACEHOLDER_NETWORK}","asset":"{SYNTHETIC_ASSET}",
              "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}}
         ]"#
@@ -482,9 +492,9 @@ fn a_mainnet_hidden_among_testnets_refuses_to_start() {
     let accepts = format!(
         r#"[
             {{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}},
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}},
             {{"network":"{MAINNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}}
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}}
         ]"#
     );
     let run = run_accepts(&accepts);
@@ -506,9 +516,9 @@ fn a_duplicate_option_refuses_before_advertising_anything() {
     let accepts = format!(
         r#"[
             {{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}},
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}},
             {{"network":"{TESTNET}","asset":"{SECOND_SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}}
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}}
         ]"#
     );
     let run = run_accepts(&accepts);
@@ -602,6 +612,7 @@ fn an_unpayable_recipient_refuses_to_start() {
         ("OBOLUS_NETWORK", TESTNET),
         ("OBOLUS_ASSET", SYNTHETIC_ASSET),
         ("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO),
+        ("OBOLUS_EXTRA", SYNTHETIC_EXTRA),
     ]);
 
     run.must_say("cannot use advertised payTo");
@@ -617,6 +628,7 @@ fn an_unpayable_recipient_refuses_even_when_nothing_verifies() {
         ("OBOLUS_NETWORK", TESTNET),
         ("OBOLUS_ASSET", SYNTHETIC_ASSET),
         ("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO),
+        ("OBOLUS_EXTRA", SYNTHETIC_EXTRA),
         ("OBOLUS_DEV_VERIFY", "accept"),
     ]);
 
@@ -636,6 +648,7 @@ fn the_unpayable_recipient_refusal_does_not_blame_the_asset() {
         ("OBOLUS_NETWORK", TESTNET),
         ("OBOLUS_ASSET", SYNTHETIC_ASSET),
         ("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO),
+        ("OBOLUS_EXTRA", SYNTHETIC_EXTRA),
     ]);
 
     // The positive first. Every other assertion here is a `must_not_say`, and a run that never
@@ -649,13 +662,11 @@ fn the_unpayable_recipient_refusal_does_not_blame_the_asset() {
 /// Set-but-empty is refused rather than silently taking the default — for the variables `main` reads
 /// directly, not only the ones `config.rs` parses.
 ///
-/// `OBOLUS_DEV_TOKEN_NAME` is the one worth pinning. An empty EIP-712 domain name is still a domain,
-/// so verification would run and reject every correctly-signed payment while the startup banner
-/// reported a token domain that looked configured — and the payer, who cannot see this side's
-/// domain at all, has nothing to go on.
+/// `OBOLUS_RESOURCE` is one `main` reads through its own helper rather than through `config.rs`,
+/// and an empty one would advertise a challenge whose resource names nothing.
 #[test]
 fn a_set_but_empty_variable_is_refused_rather_than_defaulted() {
-    let empty = run(&[("OBOLUS_DEV_TOKEN_NAME", "")]);
+    let empty = run(&[("OBOLUS_RESOURCE", "")]);
     empty.must_say("is set but empty");
     empty.must_have_refused_during_startup();
 
@@ -679,11 +690,11 @@ fn a_set_but_empty_variable_is_refused_rather_than_defaulted() {
 fn the_unpayable_recipient_remedy_matches_the_configuration_door() {
     let good = format!(
         r#"{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-            "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}}"#
+            "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}}"#
     );
     let bad = format!(
         r#"{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-            "payTo":"{PLACEHOLDER_PAY_TO}","amount":"1000"}}"#
+            "payTo":"{PLACEHOLDER_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}}"#
     );
     let via_array = run_accepts(&format!("[{good},{bad},{good}]"));
 
@@ -753,6 +764,7 @@ fn an_evm_option_is_still_checked_when_its_recipient_is_not_hex_shaped() {
         ("OBOLUS_NETWORK", TESTNET),
         ("OBOLUS_ASSET", UNVERIFIABLE_ASSET),
         ("OBOLUS_PAY_TO", "TEST-PAY-TO-WITH-NO-HEX-PREFIX"),
+        ("OBOLUS_EXTRA", SYNTHETIC_EXTRA),
         ("OBOLUS_DEV_VERIFY", "accept"),
     ]);
 
@@ -925,57 +937,70 @@ fn an_unknown_behaviour_mode_refuses_and_names_the_choices() {
     run.must_have_refused_during_startup();
 }
 
-/// The banner has to say which token domain it is verifying under, because this seller verifies
-/// under its configured domain rather than one read from the challenge, and a wrong one rejects
-/// every correctly-signed payment with a message about signature recovery.
+/// The banner says which token domain it is verifying under, and that it is the advertised one.
+///
+/// That is also the limit of what this seller can check: a client that follows the challenge signs
+/// under the same domain, so a domain that is wrong for the real token contract passes here and
+/// fails only at a real settle. The banner is where an operator can see the value and compare it.
 #[test]
-fn the_startup_banner_names_the_eip712_token_domain() {
-    let run = run(&[("OBOLUS_DEV_TOKEN_NAME", "USD Coin")]);
+fn the_startup_banner_names_the_advertised_eip712_token_domain() {
+    let run = run(&[("OBOLUS_EXTRA", r#"{"name":"USD Coin","version":"7"}"#)]);
 
     run.must_have_got_past_startup();
     run.must_say("EIP-712 token domain");
-    run.must_say("USD Coin");
+    run.must_say(r#"name="USD Coin" version="7""#);
+    run.must_say("from the advertised extra");
 }
 
-/// An option whose `extra` names a token domain this seller does not verify under refuses to start.
+/// An EVM network with no token domain to advertise refuses to start, in every verification mode.
 ///
-/// A client signs under the domain the challenge shows it; this binary verifies under the one it was
-/// configured with. If the two disagree, every correctly-signed payment is rejected with a recovery
-/// failure the client can do nothing about — so the disagreement is a startup fault, not a request
-/// one.
+/// Not only a verification concern: a conforming client cannot build the EIP-712 domain without
+/// `extra.name` and `extra.version`, so it refuses to sign, and a seller that advertised such an
+/// option would be one nobody can pay — which is why `accept`, verifying nothing, refuses it too.
 #[test]
-fn an_advertised_token_domain_that_disagrees_with_the_configured_one_refuses() {
+fn an_evm_network_without_a_token_domain_refuses_to_start() {
+    for mode in ["verify", "accept"] {
+        let run = exec(&[
+            ("OBOLUS_NETWORK", TESTNET),
+            ("OBOLUS_ASSET", SYNTHETIC_ASSET),
+            ("OBOLUS_PAY_TO", SYNTHETIC_PAY_TO),
+            ("OBOLUS_DEV_VERIFY", mode),
+        ]);
+
+        run.must_say("OBOLUS_EXTRA must carry the token domain");
+        run.must_say("extra.name");
+        run.must_have_refused_during_startup();
+    }
+
+    // The array door names the entry rather than a variable it does not use.
     let accepts = format!(
         r#"[{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000",
-             "extra":{{"name":"USD Coin","version":"2"}}}}]"#
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{{"name":"USDC"}}}}]"#
     );
     let run = run_accepts(&accepts);
 
-    run.must_say(r#"advertises extra.name = "USD Coin""#);
-    run.must_say("OBOLUS_DEV_TOKEN_NAME");
+    run.must_say(r#"OBOLUS_ACCEPTS entry for network "eip155:84532""#);
+    run.must_say("extra.version");
+    run.must_not_say("OBOLUS_EXTRA must carry the token domain");
     run.must_have_refused_during_startup();
+}
 
-    // The version is checked too, not only the name.
-    let accepts = format!(
-        r#"[{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000",
-             "extra":{{"name":"USDC","version":"1"}}}}]"#
-    );
-    let run = run_accepts(&accepts);
+/// The retired token-domain variables are refused rather than ignored.
+///
+/// Silently ignoring them would be the worse failure: an operator who set one believes the seller
+/// verifies under it, while it verifies under the advertised `extra` instead. Set-but-empty is
+/// refused as well — "set at all" is the test, since any value is one the operator meant something by.
+#[test]
+fn the_retired_token_domain_variables_are_refused_and_point_at_extra() {
+    for var in ["OBOLUS_DEV_TOKEN_NAME", "OBOLUS_DEV_TOKEN_VERSION"] {
+        for value in ["USDC", ""] {
+            let run = run(&[(var, value)]);
 
-    run.must_say(r#"advertises extra.version = "1""#);
-    run.must_say("OBOLUS_DEV_TOKEN_VERSION");
-    run.must_have_refused_during_startup();
-
-    // The discriminating half: an `extra` that agrees with the defaults gets through. Without it
-    // both refusals above hold on a binary that refuses any `extra` at all.
-    let accepts = format!(
-        r#"[{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000",
-             "extra":{{"name":"USDC","version":"2"}}}}]"#
-    );
-    run_accepts(&accepts).must_have_got_past_startup();
+            run.must_say(&format!("{var} is no longer read"));
+            run.must_say("OBOLUS_EXTRA");
+            run.must_have_refused_during_startup();
+        }
+    }
 }
 
 /// Under `accept` nothing is verified, so there is no domain to report — and printing one would

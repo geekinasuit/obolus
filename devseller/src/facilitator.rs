@@ -25,9 +25,7 @@ use obolus::facilitator::{Facilitator, FacilitatorError};
 use obolus::x402::{PaymentPayload, PaymentRequirements, SettlementReceipt};
 
 use crate::config::{SettleMode, VerifyMode};
-use crate::verify::{
-    check_terms, check_window, domain_for, parse_exact_payload, TokenDomain, VerifyError,
-};
+use crate::verify::{check_terms, check_window, domain_for, parse_exact_payload, VerifyError};
 
 /// The synthetic transaction id a successful settlement reports.
 ///
@@ -43,14 +41,13 @@ const UNKNOWN_PAYER: &str = "0xDEV-SELLER-PAYER-NOT-VERIFIED";
 pub struct DevFacilitator {
     verify: VerifyMode,
     settle: SettleMode,
-    token: TokenDomain,
     /// Injected so the window check is testable without waiting for wall-clock time to pass.
     now: fn() -> u64,
 }
 
 impl DevFacilitator {
-    pub fn new(verify: VerifyMode, settle: SettleMode, token: TokenDomain) -> Self {
-        Self { verify, settle, token, now: unix_now }
+    pub fn new(verify: VerifyMode, settle: SettleMode) -> Self {
+        Self { verify, settle, now: unix_now }
     }
 
     #[cfg(test)]
@@ -73,7 +70,7 @@ impl DevFacilitator {
         // when only one of them can be true at a time.
         check_terms(payment, &payload, requirements)?;
         check_window(&payload.authorization, (self.now)())?;
-        crate::verify::verify_signature(&payload, &domain_for(requirements, &self.token)?)
+        crate::verify::verify_signature(&payload, &domain_for(requirements)?)
     }
 
     fn receipt(&self, network: &str, payer: String, success: bool) -> SettlementReceipt {
@@ -211,8 +208,13 @@ mod tests {
     }
 
     /// Requirements that the published payment actually satisfies: the fixture's own payee, its
-    /// amount, and the token contract it was signed against.
+    /// amount, and the token contract and EIP-712 domain it was signed against.
     fn requirements() -> PaymentRequirements {
+        advertising_domain(fixture()["domain"]["name"].as_str().unwrap())
+    }
+
+    /// [`requirements`], advertising `name` as the token's EIP-712 domain name.
+    fn advertising_domain(name: &str) -> PaymentRequirements {
         let doc = fixture();
         PaymentRequirements {
             scheme: "exact".to_string(),
@@ -221,13 +223,12 @@ mod tests {
             asset: doc["domain"]["verifying_contract"].as_str().unwrap().to_string(),
             pay_to: doc["authorization"]["to"].as_str().unwrap().to_string(),
             max_timeout_seconds: 60,
-            extra: None,
+            extra: Some(json!({ "name": name, "version": doc["domain"]["version"] })),
         }
     }
 
     fn verifying() -> DevFacilitator {
-        DevFacilitator::new(VerifyMode::Verify, SettleMode::Succeed, TokenDomain::default())
-            .with_clock(|| WITHIN_WINDOW)
+        DevFacilitator::new(VerifyMode::Verify, SettleMode::Succeed).with_clock(|| WITHIN_WINDOW)
     }
 
     #[test]
@@ -311,7 +312,6 @@ mod tests {
         let facilitator = DevFacilitator::new(
             VerifyMode::Verify,
             SettleMode::Succeed,
-            TokenDomain::default(),
         )
         .with_clock(|| 1_800_000_000);
 
@@ -322,28 +322,54 @@ mod tests {
     }
 
     #[test]
-    fn a_misconfigured_token_domain_rejects_and_says_so() {
-        // The failure mode this binary is most likely to hand someone: `name` and `version` are
-        // configuration (#13), and a wrong one makes every correct signature fail to recover.
-        // The rejection has to be traceable to the domain or the client author debugs their signer
-        // for an afternoon.
-        let facilitator = DevFacilitator::new(
-            VerifyMode::Verify,
-            SettleMode::Succeed,
-            TokenDomain { name: "USD Coin".to_string(), version: "2".to_string() },
-        )
-        .with_clock(|| WITHIN_WINDOW);
-
-        let message = facilitator
-            .judge(&payment(), &requirements())
-            .expect_err("a wrong domain name must reject")
+    fn verification_uses_the_advertised_domain_and_says_which() {
+        // Offered "USD Coin"; the payment was signed under "USDC". The advertised domain is the one
+        // verified under, so this must not recover — and the rejection has to name the domain, or
+        // the client author debugs their signer for an afternoon.
+        let message = verifying()
+            .judge(&payment(), &advertising_domain("USD Coin"))
+            .expect_err("a signature under another domain name must reject")
             .to_string();
 
         assert!(message.contains("USD Coin"), "the rejection must name the domain: {message}");
-        assert!(
-            message.contains("OBOLUS_DEV_TOKEN_NAME"),
-            "the rejection must name the variable to fix: {message}"
-        );
+        assert!(message.contains("advertised"), "and say where it came from: {message}");
+    }
+
+    #[test]
+    fn the_domain_comes_from_the_offer_never_from_what_the_client_accepted() {
+        // The client's `accepted` option says "USD Coin"; the offer says "USDC", which is what the
+        // payment was signed under. Verifying under the client's value would let a payer choose the
+        // domain its own signature is checked against — so this must verify, under the offer's.
+        let signed = payment();
+        let payload = signed.payload().as_object().expect("an object payload").clone();
+        let claims_another_domain =
+            PaymentPayload::new(None, advertising_domain("USD Coin"), payload);
+        verifying()
+            .judge(&claims_another_domain, &requirements())
+            .expect("verified under the offered domain, whatever the client's accepted says");
+    }
+
+    #[test]
+    fn an_offer_without_a_token_domain_cannot_be_verified() {
+        let mut bare = requirements();
+        bare.extra = None;
+        assert!(matches!(
+            verifying().judge(&payment(), &bare),
+            Err(VerifyError::MissingTokenDomain { key: "name", .. })
+        ));
+    }
+
+    #[test]
+    fn a_non_evm_offer_is_refused_for_its_network_before_its_token_domain() {
+        // Asking a Solana option for a token name first would send the operator to add one, only
+        // to be told next that the option cannot be verified at all.
+        let mut solana = requirements();
+        solana.network = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string();
+        solana.extra = None;
+        assert!(matches!(
+            crate::verify::domain_for(&solana),
+            Err(VerifyError::UnusableNetwork { .. })
+        ));
     }
 
     #[tokio::test]
@@ -351,7 +377,7 @@ mod tests {
         // The whole point of the mode: a client that is not signing correctly yet still reaches
         // the upstream. Fed a payload that `verify` mode rejects outright.
         let facilitator =
-            DevFacilitator::new(VerifyMode::Accept, SettleMode::Succeed, TokenDomain::default());
+            DevFacilitator::new(VerifyMode::Accept, SettleMode::Succeed);
         let garbage = paying(json!({"authorization": "not even an object"}));
 
         assert!(Facilitator::verify(&facilitator, &garbage, &requirements()).await.is_ok());
@@ -364,7 +390,6 @@ mod tests {
         let facilitator = DevFacilitator::new(
             VerifyMode::Reject("insufficient funds".to_string()),
             SettleMode::Succeed,
-            TokenDomain::default(),
         );
 
         assert_eq!(
@@ -392,7 +417,6 @@ mod tests {
         let unsuccessful = DevFacilitator::new(
             VerifyMode::Verify,
             SettleMode::Unsuccessful,
-            TokenDomain::default(),
         )
         .with_clock(|| WITHIN_WINDOW);
         assert!(Facilitator::verify(&unsuccessful, &payment, &requirements).await.is_ok());
@@ -404,7 +428,6 @@ mod tests {
         let unavailable = DevFacilitator::new(
             VerifyMode::Verify,
             SettleMode::Unavailable("chain is down".to_string()),
-            TokenDomain::default(),
         )
         .with_clock(|| WITHIN_WINDOW);
         assert!(Facilitator::verify(&unavailable, &payment, &requirements).await.is_ok());
@@ -416,7 +439,6 @@ mod tests {
         let empty = DevFacilitator::new(
             VerifyMode::Verify,
             SettleMode::EmptyReceipt,
-            TokenDomain::default(),
         )
         .with_clock(|| WITHIN_WINDOW);
         let receipt =
@@ -466,7 +488,7 @@ mod tests {
             };
 
             let facilitator =
-                DevFacilitator::new(VerifyMode::Verify, mode.clone(), TokenDomain::default())
+                DevFacilitator::new(VerifyMode::Verify, mode.clone())
                     .with_clock(|| WITHIN_WINDOW);
             let outcome = Facilitator::settle(&facilitator, &payment, &requirements).await;
 
@@ -494,7 +516,7 @@ mod tests {
         let requirements = requirements();
 
         let accepting =
-            DevFacilitator::new(VerifyMode::Accept, SettleMode::Succeed, TokenDomain::default())
+            DevFacilitator::new(VerifyMode::Accept, SettleMode::Succeed)
                 .with_clock(|| WITHIN_WINDOW);
         let receipt = Facilitator::settle(&accepting, &payment, &requirements)
             .await

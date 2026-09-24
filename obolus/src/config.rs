@@ -91,7 +91,7 @@ pub enum ConfigError {
     #[error(
         "OBOLUS_ACCEPTS is an empty array: a gateway must advertise at least one payment option \
          (unset it to use the single-chain OBOLUS_NETWORK / OBOLUS_ASSET / OBOLUS_PAY_TO / \
-         OBOLUS_PRICE variables instead)"
+         OBOLUS_PRICE / OBOLUS_EXTRA variables instead)"
     )]
     Empty,
 
@@ -111,6 +111,11 @@ pub enum ConfigError {
     /// network so an operator can find it.
     #[error("OBOLUS_ACCEPTS entry for network {network:?}: {field} must not be empty")]
     EmptyField { network: String, field: EntryField },
+
+    /// An EVM `exact` entry does not carry the token's EIP-712 domain in its `extra`. See
+    /// [`EntryDefect::MissingTokenDomain`].
+    #[error("OBOLUS_ACCEPTS entry for network {network:?}: {defect}")]
+    MissingTokenDomain { network: String, defect: EntryDefect },
 }
 
 impl ConfigError {
@@ -122,6 +127,9 @@ impl ConfigError {
             EntryDefect::EmptyNetwork => ConfigError::EmptyNetwork,
             EntryDefect::EmptyField { field } => ConfigError::EmptyField { network, field },
             EntryDefect::BadAmount(detail) => ConfigError::BadAmount { network, detail },
+            defect @ EntryDefect::MissingTokenDomain { .. } => {
+                ConfigError::MissingTokenDomain { network, defect }
+            }
         }
     }
 }
@@ -177,7 +185,25 @@ pub enum EntryDefect {
     /// keep the wording they had.
     #[error("{0}")]
     BadAmount(String),
+
+    /// An `exact` option on an EVM network whose `extra` lacks the token's EIP-712 domain `name` or
+    /// `version`, or holds one that is not a non-empty string. x402's EVM `exact` scheme transfers
+    /// by EIP-3009 unless `extra` names another method, and EIP-3009 requires both: a client signs
+    /// its authorization under that domain, and without it no client can sign at all — the gateway
+    /// would start cleanly and nobody could ever pay it. Required here on every EVM option, whatever
+    /// method `extra` names.
+    #[error(
+        "an exact option on an EVM network must carry the token's EIP-712 domain in its extra, as \
+         non-empty strings \"name\" and \"version\" (for USDC on Base Sepolia: \
+         {{\"name\":\"USDC\",\"version\":\"2\"}}); extra.{key} is missing or not a non-empty string"
+    )]
+    MissingTokenDomain { key: &'static str },
 }
+
+/// The CAIP-2 namespace of EVM chains. Every option this gateway builds is `exact`, and on these
+/// networks `exact`'s default transfer method, EIP-3009, needs the token's EIP-712 domain in
+/// `extra`.
+const EVM_NAMESPACE: &str = "eip155:";
 
 /// Build one advertised payment option, applying the validation **both** configuration forms owe.
 ///
@@ -208,6 +234,18 @@ pub fn validated_option(
         return Err(EntryDefect::EmptyField { field: EntryField::PayTo });
     }
     let amount = validate_atomic_amount(amount).map_err(EntryDefect::BadAmount)?;
+    if network.starts_with(EVM_NAMESPACE) {
+        for key in ["name", "version"] {
+            let usable = extra
+                .as_ref()
+                .and_then(|extra| extra.get(key))
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            if !usable {
+                return Err(EntryDefect::MissingTokenDomain { key });
+            }
+        }
+    }
     Ok(PaymentRequirements {
         scheme: SCHEME_EXACT.to_string(),
         network,
@@ -252,8 +290,44 @@ pub fn parse_accepts(
 /// The single-chain payment variables that `OBOLUS_ACCEPTS` supersedes. When `OBOLUS_ACCEPTS` is set
 /// these are inert, so an operator who sets both has almost certainly configured a network they
 /// believe is live but is not — exactly the surprise a payment gateway must not ship silently.
-pub const SINGLE_CHAIN_VARS: [&str; 4] =
-    ["OBOLUS_NETWORK", "OBOLUS_ASSET", "OBOLUS_PAY_TO", "OBOLUS_PRICE"];
+pub const SINGLE_CHAIN_VARS: [&str; 5] =
+    ["OBOLUS_NETWORK", "OBOLUS_ASSET", "OBOLUS_PAY_TO", "OBOLUS_PRICE", EXTRA_VAR];
+
+/// The single-chain option's `extra`: a JSON object, advertised as given — the same thing an
+/// `OBOLUS_ACCEPTS` entry's `extra` key holds.
+pub const EXTRA_VAR: &str = "OBOLUS_EXTRA";
+
+/// Why an [`EXTRA_VAR`] value could not be used.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ExtraError {
+    /// Set, but to nothing — an unexpanded `${VAR}`, an `EnvironmentFile` line ending in `=`.
+    #[error(
+        "OBOLUS_EXTRA is set but empty. Unset it, or give it a JSON object such as \
+         {{\"name\":\"USDC\",\"version\":\"2\"}}"
+    )]
+    Empty,
+    /// Not a JSON object: bad JSON, or JSON of another type.
+    #[error(
+        "OBOLUS_EXTRA must be a JSON object, advertised as the option's extra (for USDC on Base \
+         Sepolia: {{\"name\":\"USDC\",\"version\":\"2\"}}): {0}"
+    )]
+    NotAnObject(String),
+}
+
+/// Parse [`EXTRA_VAR`], given its raw value if set. Unset is `None`; set is either an object or a
+/// refusal — never silently dropped, since an `extra` that went missing is a challenge no EVM client
+/// can sign.
+pub fn parse_extra(raw: Option<&str>) -> Result<Option<Map<String, Value>>, ExtraError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.trim().is_empty() {
+        return Err(ExtraError::Empty);
+    }
+    serde_json::from_str::<Map<String, Value>>(raw)
+        .map(Some)
+        .map_err(|e| ExtraError::NotAnObject(e.to_string()))
+}
 
 /// Which of the [`SINGLE_CHAIN_VARS`] are present, given a presence probe. Taking the probe as an
 /// argument keeps this testable without mutating process-global environment state; `main` passes
@@ -886,6 +960,83 @@ mod tests {
             "got {err:?}"
         );
         assert!(err.to_string().contains("payTo must not be empty"), "got {err}");
+    }
+
+    /// An EVM `exact` entry, built through `parse_accepts` with the given `extra` JSON (or none).
+    fn evm_entry(extra: Option<&str>) -> Result<Vec<PaymentRequirements>, ConfigError> {
+        let extra = extra.map(|e| format!(r#","extra":{e}"#)).unwrap_or_default();
+        let raw = format!(
+            r#"[{{"network":"eip155:84532","asset":"0xAAA","payTo":"0xPAYA","amount":"1000"{extra}}}]"#
+        );
+        parse_accepts(&raw, &shared())
+    }
+
+    #[test]
+    fn an_evm_option_carrying_the_token_domain_is_accepted() {
+        let options = evm_entry(Some(r#"{"name":"USDC","version":"2"}"#)).unwrap();
+        assert_eq!(options[0].extra, Some(serde_json::json!({ "name": "USDC", "version": "2" })));
+    }
+
+    #[test]
+    fn an_evm_option_without_the_token_domain_is_rejected_naming_the_key() {
+        for (extra, key) in [
+            (None, "name"),
+            (Some(r#"{}"#), "name"),
+            (Some(r#"{"version":"2"}"#), "name"),
+            (Some(r#"{"name":"USDC"}"#), "version"),
+            (Some(r#"{"name":"","version":"2"}"#), "name"),
+            (Some(r#"{"name":"USDC","version":"  "}"#), "version"),
+            (Some(r#"{"name":7,"version":"2"}"#), "name"),
+            (Some(r#"{"name":"USDC","version":2}"#), "version"),
+        ] {
+            let err = evm_entry(extra).unwrap_err();
+            assert_eq!(
+                err,
+                ConfigError::MissingTokenDomain {
+                    network: "eip155:84532".to_string(),
+                    defect: EntryDefect::MissingTokenDomain { key },
+                },
+                "extra {extra:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains(&format!("extra.{key}")), "{message}");
+            assert!(message.contains("eip155:84532"), "must name the entry: {message}");
+        }
+    }
+
+    #[test]
+    fn a_non_evm_option_needs_no_token_domain() {
+        // Solana's `exact` has no EIP-712 domain, and the placeholder network is no chain at all.
+        for network in ["solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "test-network-not-a-real-caip2"]
+        {
+            let raw = format!(
+                r#"[{{"network":"{network}","asset":"a","payTo":"p","amount":"1"}}]"#
+            );
+            assert!(parse_accepts(&raw, &shared()).is_ok(), "{network}");
+        }
+    }
+
+    #[test]
+    fn the_single_chain_extra_is_parsed_as_an_object() {
+        assert_eq!(parse_extra(None), Ok(None));
+        let parsed = parse_extra(Some(r#"{"name":"USDC","version":"2"}"#)).unwrap().unwrap();
+        assert_eq!(Value::Object(parsed), serde_json::json!({ "name": "USDC", "version": "2" }));
+    }
+
+    #[test]
+    fn a_single_chain_extra_that_is_empty_or_not_an_object_is_refused() {
+        assert_eq!(parse_extra(Some("")), Err(ExtraError::Empty));
+        assert_eq!(parse_extra(Some("  ")), Err(ExtraError::Empty));
+        for raw in [r#""USDC""#, "[1]", "7", "null", "{not json"] {
+            let err = parse_extra(Some(raw)).unwrap_err();
+            assert!(matches!(err, ExtraError::NotAnObject(_)), "{raw}: got {err:?}");
+            assert!(err.to_string().contains("OBOLUS_EXTRA"), "must name the variable: {err}");
+        }
+    }
+
+    #[test]
+    fn the_single_chain_extra_is_superseded_like_the_other_single_chain_vars() {
+        assert_eq!(superseded_single_chain_vars(|k| k == EXTRA_VAR), vec!["OBOLUS_EXTRA"]);
     }
 
     #[test]
