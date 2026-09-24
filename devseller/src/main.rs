@@ -1,7 +1,7 @@
 //! `obolus-devseller` — a counterparty to test an x402 client against.
 //!
 //! An x402 client is hard to develop against nothing. The protocol needs a seller that issues a
-//! real 402 challenge, reads a real `X-PAYMENT` header, judges the authorization inside it, and
+//! real 402 challenge, reads a real `PAYMENT-SIGNATURE` header, judges the authorization inside it, and
 //! then *fails on command* — because the paths a client gets wrong are the failure paths, and a
 //! real facilitator on a real testnet cannot be asked to reject the next payment, or to time out
 //! settlement on an authorization it has already accepted.
@@ -119,8 +119,9 @@ nonce spent as far as the client knows.
     OBOLUS_DEV_SETTLE_REASON      reason text for `unavailable` and `rejected`
     OBOLUS_DEV_SETTLE_DELAY_SECS  seconds `timeout` blocks for (default 120)
 
-THE EIP-712 TOKEN DOMAIN, which no x402 challenge carries, so both sides must agree out of band. A
-mismatch here rejects correctly-signed payments.
+THE EIP-712 TOKEN DOMAIN that `verify` checks signatures under. A mismatch here rejects
+correctly-signed payments, so when an OBOLUS_ACCEPTS entry's \"extra\" names a domain too — which is
+what a client signs under — startup refuses unless the two agree.
     OBOLUS_DEV_TOKEN_NAME         EIP-712 domain name (default USDC)
     OBOLUS_DEV_TOKEN_VERSION      EIP-712 domain version (default 2)
 
@@ -237,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
             env_or("OBOLUS_ASSET", PLACEHOLDER_ASSET)?,
             env_or("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO)?,
             &env_or("OBOLUS_PRICE", "1000")?,
+            None,
             &shared,
         )
         .map_err(|e| anyhow::anyhow!("payment configuration: {e}"))?],
@@ -371,6 +373,26 @@ async fn main() -> anyhow::Result<()> {
                      option, or set OBOLUS_DEV_VERIFY=accept to serve without inspecting payments."
                 )
             })?;
+            // A client signs under the domain the challenge shows it; this seller verifies under
+            // its own configured one. Where an option's `extra` names a domain field, the two have
+            // to agree, or every correctly-signed payment fails with a domain the client never saw.
+            for (key, configured, variable) in [
+                ("name", &token.name, TOKEN_NAME_VAR),
+                ("version", &token.version, TOKEN_VERSION_VAR),
+            ] {
+                let Some(advertised) = r.extra.as_ref().and_then(|extra| extra.get(key)) else {
+                    continue;
+                };
+                if advertised.as_str() != Some(configured.as_str()) {
+                    anyhow::bail!(
+                        "the option on network {} advertises extra.{key} = {advertised}, but this \
+                         seller verifies signatures under {key} {configured:?} (from {variable}). \
+                         A client signs under the advertised value, so every correctly-signed \
+                         payment would be rejected. Make them agree.",
+                        r.network
+                    );
+                }
+            }
         }
     }
 
@@ -411,13 +433,13 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("obolus-devseller: behaviour -> {dev}");
     eprintln!("obolus-devseller: upstream -> {}", upstream::describe(upstream_url.as_deref()));
     if dev.verify == VerifyMode::Verify {
-        // The two fields no x402 challenge carries (#13). Printed unconditionally under
-        // `verify` because a wrong one rejects every correct signature, and the payer cannot see
-        // it from their side.
+        // The domain this seller verifies under, taken from configuration rather than from the
+        // challenge. Printed unconditionally under `verify` because a wrong one rejects every
+        // correct signature, and the payer cannot see it from their side.
         eprintln!(
             "obolus-devseller: EIP-712 token domain -> name={:?} version={:?} (from \
-             {TOKEN_NAME_VAR} / {TOKEN_VERSION_VAR}; x402 does not carry these, so a mismatch \
-             here rejects correctly-signed payments)",
+             {TOKEN_NAME_VAR} / {TOKEN_VERSION_VAR}; a mismatch with the domain a client signs \
+             under rejects correctly-signed payments)",
             token.name, token.version
         );
     }
@@ -432,8 +454,7 @@ async fn main() -> anyhow::Result<()> {
     // The last configuration check, and the one that cannot sit in the guard block above: it
     // consumes the upstream and the token domain, both of which the lines between there and here
     // still have to report. `new` rejects an empty option set, and two options sharing
-    // (scheme, network) — a pair no payment envelope can tell apart, so the second entry is
-    // unreachable and a payment matching it could be settled against the wrong asset.
+    // (scheme, network) — see `obolus::gateway::GatewayError::DuplicateOption`.
     //
     // Above the banner rather than below it, for the reason that block states: a configuration this
     // process is about to refuse must never first be announced as one it is advertising.
@@ -454,6 +475,7 @@ async fn main() -> anyhow::Result<()> {
     let gateway = Gateway::new(
         facilitator::DevFacilitator::new(dev.verify, dev.settle, token),
         backends,
+        shared.resource_info(),
         armed_requirements,
     )
     .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
@@ -462,7 +484,7 @@ async fn main() -> anyhow::Result<()> {
     for r in &requirements {
         eprintln!(
             "obolus-devseller:   - network {} / asset {} / pay-to {} / {} atomic units",
-            r.network, r.asset, r.pay_to, r.max_amount_required
+            r.network, r.asset, r.pay_to, r.amount
         );
     }
 

@@ -1,9 +1,5 @@
 //! x402 **v2** wire types and the `PAYMENT-REQUIRED` / `PAYMENT-SIGNATURE` / `PAYMENT-RESPONSE`
-//! header codec.
-//!
-//! Added beside the v1 codec in the parent module rather than in place of it: nothing consumes this
-//! module yet. Moving the gateway, the facilitator client and devseller onto it — and deleting v1 —
-//! is one change of its own (#72), because those three share these types and must switch together.
+//! header codec — the only version obolus speaks. The parent module re-exports all of it.
 //!
 //! # What v2 changes, and why obolus needs it
 //!
@@ -33,7 +29,7 @@
 //! implementation `@x402/core` 2.27.0.
 
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use super::CodecError;
 
@@ -183,6 +179,9 @@ impl PaymentRequired {
 ///
 /// "As decoded" is JSON-exact, not byte-exact: key order and whitespace are not kept, and nothing
 /// downstream of a JSON parser can tell the difference.
+///
+/// Forwarding everything includes a client's `extensions`, although obolus advertises none; they
+/// reach the facilitator unexamined until refusing unadvertised ones lands (#72).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaymentPayload {
     accepted: PaymentRequirements,
@@ -190,10 +189,15 @@ pub struct PaymentPayload {
 }
 
 impl PaymentPayload {
-    /// A payment built on the client side — for tests, devseller and other clients; the gateway only
-    /// ever decodes one. `payload` is the scheme's data (for EVM `exact`, `signature` and
-    /// `authorization`).
-    pub fn new(resource: Option<ResourceInfo>, accepted: PaymentRequirements, payload: Value) -> Self {
+    /// A payment built on the client side — for tests and other clients; the gateway only ever
+    /// decodes one. `payload` is the scheme's data (for EVM `exact`, `signature` and
+    /// `authorization`): an object by type, because [`decode_payment`] refuses anything else, and a
+    /// payment that could be built but not received would test nothing real.
+    pub fn new(
+        resource: Option<ResourceInfo>,
+        accepted: PaymentRequirements,
+        payload: Map<String, Value>,
+    ) -> Self {
         let mut received = serde_json::json!({
             "x402Version": X402_VERSION,
             "accepted": accepted,
@@ -457,12 +461,20 @@ mod tests {
         assert_eq!(failure.transaction, "");
     }
 
+    /// A real x402 v1 payment envelope, produced outside this codebase (`base64 -i` on
+    /// `{"x402Version":1,"scheme":"exact","network":"test-network-not-a-real-caip2","payload":{"authorization":"opaque-to-phase-a"}}`)
+    /// when obolus still spoke v1 — so it is v1's shape as a v1 codec wrote it, not our guess at it.
+    const V1_PAYMENT_B64: &str = "eyJ4NDAyVmVyc2lvbiI6MSwic2NoZW1lIjoiZXhhY3QiLCJuZXR3b3JrIjoidGVzdC1uZXR3b3JrLW5vdC1hLXJlYWwtY2FpcDIiLCJwYXlsb2FkIjp7ImF1dGhvcml6YXRpb24iOiJvcGFxdWUtdG8tcGhhc2UtYSJ9fQ==";
+
     #[test]
     fn a_v1_payment_is_refused_as_version_1() {
-        // The real v1 envelope from the parent module's golden vector: a v1 client must hear which
-        // version it spoke, not that its envelope is malformed.
-        let err = decode_payment(crate::x402::tests::GOLDEN_B64).unwrap_err();
+        // A v1 envelope is refused by its version, not as malformed. This is the codec only: a v1
+        // client sends `X-PAYMENT`, which the gateway does not read at all, so over HTTP it is
+        // simply re-challenged (#73).
+        let err = decode_payment(V1_PAYMENT_B64).unwrap_err();
         assert_eq!(err, CodecError::UnsupportedVersion { found: 1, expected: 2 });
+        let bytes = super::super::decode_base64(V1_PAYMENT_B64).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap()["x402Version"], json!(1));
     }
 
     fn encoded(value: Value) -> String {
@@ -623,8 +635,8 @@ mod tests {
             description: None,
             mime_type: None,
         };
-        let payment =
-            PaymentPayload::new(Some(resource), option.clone(), json!({ "signature": "0x00" }));
+        let payload = json!({ "signature": "0x00" }).as_object().unwrap().clone();
+        let payment = PaymentPayload::new(Some(resource), option.clone(), payload);
         assert_eq!(payment.as_received()["x402Version"], json!(2));
         assert_eq!(payment.as_received()["resource"]["url"], json!("https://api.example.com/premium-data"));
         let decoded = decode_payment(&encode_payment(&payment)).unwrap();

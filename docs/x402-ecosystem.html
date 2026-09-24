@@ -180,6 +180,7 @@
   .foot{margin-top:clamp(2.6rem,6vw,4rem); border-top:1px solid var(--line); padding-top:1.4rem; font-size:.85rem; color:var(--ink-faint)}
   .foot h3{font-size:.72rem; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-faint); margin-bottom:.6rem}
   .foot ul{margin:0 0 1rem; padding-left:1.1rem; display:grid; gap:.3rem}
+  .stale{border-left:3px solid var(--ink-soft); padding-left:.9rem; max-width:70ch; color:var(--ink-soft); margin:0 0 1.1em}
   .foot .note{font-style:italic; color:var(--ink-faint); border-left:2px solid var(--line); padding-left:.9rem; max-width:70ch}
   .v-ok{color:var(--settle-strong); font-weight:650; font-family:var(--font-display); font-size:.72rem}
   .v-soft{color:var(--disc-strong); font-weight:650; font-family:var(--font-display); font-size:.72rem}
@@ -210,6 +211,7 @@
       <span>Discovery facts from <b>docs.cdp.coinbase.com/x402</b></span><i class="dot"></i>
       <span>Obolus project documentation</span>
     </div>
+    <p class="stale"><b>This page describes x402 v1.</b> Obolus now speaks x402 v2 only (<a href="https://github.com/geekinasuit/obolus/issues/71">#71</a>): the headers are <code>PAYMENT-REQUIRED</code>, <code>PAYMENT-SIGNATURE</code> and <code>PAYMENT-RESPONSE</code>, the price field is <code>amount</code>, and a payment names the whole option it accepted. Where this page and the <a href="https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md">v2 specification</a> disagree, the specification wins. Updating this page is tracked in <a href="https://github.com/geekinasuit/obolus/issues/72">#72</a>.</p>
     <div class="legend">
       <span><i class="l-rail"></i> the rail — protocol surface, challenge and payload</span>
       <span><i class="l-settle"></i> settlement — facilitator, chain, funds</span>

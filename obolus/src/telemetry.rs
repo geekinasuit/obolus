@@ -108,7 +108,9 @@ pub enum Outcome {
     PaymentRequired,
     /// A payment header was present but not a decodable x402 payment.
     PaymentMalformed,
-    /// The payment named a `(scheme, network)` this gateway does not offer.
+    /// The option the payment accepted is not one this gateway offers as given — a different
+    /// scheme, network, asset, pay-to, timeout or `extra`, or a price the gateway no longer quotes.
+    /// The client was re-challenged; the line does not say which field differed.
     OptionUnmatched,
     /// The facilitator evaluated the payment and refused it.
     VerifyRejected,
@@ -143,7 +145,7 @@ pub struct Offer {
     pub scheme: String,
     pub network: String,
     pub asset: String,
-    /// Atomic units, as a decimal string — the same shape as `maxAmountRequired`.
+    /// Atomic units, as a decimal string — the same shape as the option's `amount`.
     pub amount: String,
 }
 
@@ -153,7 +155,7 @@ impl From<&PaymentRequirements> for Offer {
             scheme: requirement.scheme.clone(),
             network: requirement.network.clone(),
             asset: requirement.asset.clone(),
-            amount: requirement.max_amount_required.clone(),
+            amount: requirement.amount.clone(),
         }
     }
 }

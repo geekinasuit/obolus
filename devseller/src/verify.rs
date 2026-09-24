@@ -22,17 +22,19 @@
 //! token contract's EIP-712 domain: `name`, `version`, `chainId`, `verifyingContract`. Two of the
 //! four are already in the payment requirements — `verifyingContract` *is* the advertised asset,
 //! and `chainId` is the CAIP-2 network's reference. The other two are properties of the token
-//! contract that nothing in an x402 challenge carries, and the specification does not say where to
-//! get them (#13). So they are configuration here, and every rejection renders the domain it
-//! used: a misconfigured `name` produces a signature that does not recover, and "bad signature"
-//! with no domain printed is precisely the dead end this crate exists to help someone out of.
+//! contract. x402 v2's EVM `exact` scheme carries them in the option's `extra`, but this seller
+//! does not read them from there yet (#72): they are configuration here, and startup refuses an
+//! advertised `extra` that names different ones, since a client signs under what it is shown. Every
+//! rejection renders the domain it used: a misconfigured `name` produces a signature that does not
+//! recover, and "bad signature" with no domain printed is precisely the dead end this crate exists
+//! to help someone out of.
 
 use eip3009::{decode_hex_array, Authorization, Eip712Domain};
 use obolus::x402::{PaymentPayload, PaymentRequirements};
 use serde_json::Value;
 
-/// The `name` and `version` halves of the token contract's EIP-712 domain — the two fields no
-/// x402 challenge carries and this gateway therefore has to be told.
+/// The `name` and `version` halves of the token contract's EIP-712 domain — the two fields this
+/// seller is told by configuration rather than reading them from the advertised `extra`.
 ///
 /// Defaults to the Base Sepolia USDC values, which is what the specification's own example was
 /// signed under, so a client following the spec's worked example verifies out of the box.
@@ -119,8 +121,15 @@ pub enum VerifyError {
     #[error("authorization pays {got}; this resource is advertised as payable to {want}")]
     WrongPayee { got: String, want: String },
 
-    #[error("authorization is for {got} atomic units; this resource costs {want}")]
-    Underpaid { got: u128, want: u128 },
+    /// The authorization moves a different amount than the price — more as well as less. The
+    /// `exact` scheme means exactly: the reference facilitator (`@x402/evm`) refuses any
+    /// `authorization.value` other than `amount`, so a seller that took an overpayment would pass a
+    /// client that a real facilitator rejects.
+    #[error(
+        "authorization is for {got} atomic units; this resource costs exactly {want}, and the \
+         exact scheme requires authorization.value to equal the amount"
+    )]
+    AmountMismatch { got: u128, want: u128 },
 
     /// Renders the domain, deliberately. Without it this says only "bad signature", and the
     /// likeliest cause is a `name`/`version` mismatch the payer cannot see from the outside.
@@ -128,8 +137,8 @@ pub enum VerifyError {
         "signature does not recover to the authorizing party.\n  authorization.from: {expected}\n  \
          recovered:          {recovered}\n  verified under EIP-712 domain: {domain}\n  If the \
          payer signed correctly, the domain above is wrong — name and version are properties of \
-         the token contract that no x402 challenge carries. Set OBOLUS_DEV_TOKEN_NAME \
-         and OBOLUS_DEV_TOKEN_VERSION to match the contract the payer signed against."
+         the token contract, and this seller takes them from OBOLUS_DEV_TOKEN_NAME and \
+         OBOLUS_DEV_TOKEN_VERSION. Set those to match the contract the payer signed against."
     )]
     NotRecovered { expected: String, recovered: String, domain: String },
 
@@ -252,7 +261,13 @@ pub fn verify_signature(
     Ok(())
 }
 
-/// Is this payment for what was advertised — same scheme, same network, our address, enough money?
+/// Is this payment for what was advertised — same scheme, same network, our address, the exact
+/// price?
+///
+/// The scheme and network are read from the option the client says it `accepted`. The gateway has
+/// already matched that option against what it offered before calling a facilitator, so these two
+/// comparisons repeat a check rather than make one — kept because this is a facilitator, and a
+/// facilitator judges what it is handed rather than trusting its caller did.
 ///
 /// The **asset** is checked by [`verify_signature`], not here: the asset address is the EIP-712
 /// `verifyingContract`, so a payment authorizing a different token is signed under a different
@@ -263,15 +278,16 @@ pub fn check_terms(
     payload: &ExactPayload,
     requirements: &PaymentRequirements,
 ) -> Result<(), VerifyError> {
-    if payment.scheme != requirements.scheme {
+    let accepted = payment.accepted();
+    if accepted.scheme != requirements.scheme {
         return Err(VerifyError::SchemeMismatch {
-            got: payment.scheme.clone(),
+            got: accepted.scheme.clone(),
             want: requirements.scheme.clone(),
         });
     }
-    if payment.network != requirements.network {
+    if accepted.network != requirements.network {
         return Err(VerifyError::NetworkMismatch {
-            got: payment.network.clone(),
+            got: accepted.network.clone(),
             want: requirements.network.clone(),
         });
     }
@@ -284,15 +300,14 @@ pub fn check_terms(
         });
     }
 
-    // `>=`, not `==`: `maxAmountRequired` is the price this resource asks, and a payer who
-    // authorized more than that has still paid for it. Underpayment is the direction that costs
-    // the seller, and it is the direction this rejects.
-    let price: u128 = requirements.max_amount_required.parse().map_err(|_| VerifyError::BadUint {
-        field: "maxAmountRequired",
-        value: requirements.max_amount_required.clone(),
+    // `!=`, not `<`: see `VerifyError::AmountMismatch` — `exact` means exactly, and an overpayment
+    // accepted here is one a real facilitator refuses.
+    let price: u128 = requirements.amount.parse().map_err(|_| VerifyError::BadUint {
+        field: "amount",
+        value: requirements.amount.clone(),
     })?;
-    if payload.authorization.value < price {
-        return Err(VerifyError::Underpaid { got: payload.authorization.value, want: price });
+    if payload.authorization.value != price {
+        return Err(VerifyError::AmountMismatch { got: payload.authorization.value, want: price });
     }
     Ok(())
 }
@@ -401,7 +416,7 @@ mod kat_tests {
     }
 
     /// The fixture stores the authorization in its own snake_case shape. Re-emit it as the
-    /// camelCase wire payload a client puts in the `X-PAYMENT` header, which is what this module
+    /// camelCase wire payload a client puts in the `PAYMENT-SIGNATURE` header, which is what this module
     /// parses — anything else would test a decoder nobody uses.
     fn wire_payload(doc: &Value) -> Value {
         let a = &doc["authorization"];

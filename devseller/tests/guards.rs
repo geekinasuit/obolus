@@ -96,8 +96,8 @@ const SYNTHETIC_PAY_TO: &str = "0x000000000000000000000000000000000000dead";
 ///
 /// Distinct from both of its neighbours on purpose. A duplicate-option fixture whose two entries
 /// matched in every field would also be refused, but by a check that could be comparing whole
-/// entries rather than `(scheme, network)` — and the whole point of that refusal is that the pair is
-/// indistinguishable on the envelope *despite* naming different assets.
+/// entries rather than `(scheme, network)` — and the whole point of that refusal is that it keys on
+/// `(scheme, network)` alone, *despite* the pair naming different assets.
 const SECOND_SYNTHETIC_ASSET: &str = "0x000000000000000000000000000000000000beef";
 
 /// The built-in `payTo`, which `obolus` boots on and this binary refuses. Not an address at all, so
@@ -465,9 +465,9 @@ fn a_placeholder_hidden_among_good_networks_still_refuses() {
     let accepts = format!(
         r#"[
             {{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}},
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}},
             {{"network":"{PLACEHOLDER_NETWORK}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}}
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}}
         ]"#
     );
     let run = run_accepts(&accepts);
@@ -482,9 +482,9 @@ fn a_mainnet_hidden_among_testnets_refuses_to_start() {
     let accepts = format!(
         r#"[
             {{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}},
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}},
             {{"network":"{MAINNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}}
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}}
         ]"#
     );
     let run = run_accepts(&accepts);
@@ -493,9 +493,8 @@ fn a_mainnet_hidden_among_testnets_refuses_to_start() {
     run.must_have_refused_during_startup();
 }
 
-/// Two entries on one network, which `Gateway::new` refuses: a payment envelope carries only
-/// `(scheme, network)`, so the second entry is unreachable and a payment matching the pair could be
-/// settled against the wrong asset.
+/// Two entries on one network, which `Gateway::new` refuses: obolus advertises at most one option
+/// per `(scheme, network)` until #76 decides whether more are wanted.
 ///
 /// This is the fixture that can see where the constructor sits. Every other refusal in this file is
 /// reached from the guard block, which is above the banner either way — so all of them hold with
@@ -507,9 +506,9 @@ fn a_duplicate_option_refuses_before_advertising_anything() {
     let accepts = format!(
         r#"[
             {{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}},
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}},
             {{"network":"{TESTNET}","asset":"{SECOND_SYNTHETIC_ASSET}",
-             "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}}
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}}
         ]"#
     );
     let run = run_accepts(&accepts);
@@ -680,11 +679,11 @@ fn a_set_but_empty_variable_is_refused_rather_than_defaulted() {
 fn the_unpayable_recipient_remedy_matches_the_configuration_door() {
     let good = format!(
         r#"{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-            "payTo":"{SYNTHETIC_PAY_TO}","maxAmountRequired":"1000"}}"#
+            "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000"}}"#
     );
     let bad = format!(
         r#"{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
-            "payTo":"{PLACEHOLDER_PAY_TO}","maxAmountRequired":"1000"}}"#
+            "payTo":"{PLACEHOLDER_PAY_TO}","amount":"1000"}}"#
     );
     let via_array = run_accepts(&format!("[{good},{bad},{good}]"));
 
@@ -926,9 +925,9 @@ fn an_unknown_behaviour_mode_refuses_and_names_the_choices() {
     run.must_have_refused_during_startup();
 }
 
-/// The banner has to say which token domain it is verifying under, because x402 does not carry
-/// `name`/`version` (#13) and a wrong one rejects every correctly-signed payment with a
-/// message about signature recovery. The payer cannot see it from their side at all.
+/// The banner has to say which token domain it is verifying under, because this seller verifies
+/// under its configured domain rather than one read from the challenge, and a wrong one rejects
+/// every correctly-signed payment with a message about signature recovery.
 #[test]
 fn the_startup_banner_names_the_eip712_token_domain() {
     let run = run(&[("OBOLUS_DEV_TOKEN_NAME", "USD Coin")]);
@@ -936,6 +935,47 @@ fn the_startup_banner_names_the_eip712_token_domain() {
     run.must_have_got_past_startup();
     run.must_say("EIP-712 token domain");
     run.must_say("USD Coin");
+}
+
+/// An option whose `extra` names a token domain this seller does not verify under refuses to start.
+///
+/// A client signs under the domain the challenge shows it; this binary verifies under the one it was
+/// configured with. If the two disagree, every correctly-signed payment is rejected with a recovery
+/// failure the client can do nothing about — so the disagreement is a startup fault, not a request
+/// one.
+#[test]
+fn an_advertised_token_domain_that_disagrees_with_the_configured_one_refuses() {
+    let accepts = format!(
+        r#"[{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000",
+             "extra":{{"name":"USD Coin","version":"2"}}}}]"#
+    );
+    let run = run_accepts(&accepts);
+
+    run.must_say(r#"advertises extra.name = "USD Coin""#);
+    run.must_say("OBOLUS_DEV_TOKEN_NAME");
+    run.must_have_refused_during_startup();
+
+    // The version is checked too, not only the name.
+    let accepts = format!(
+        r#"[{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000",
+             "extra":{{"name":"USDC","version":"1"}}}}]"#
+    );
+    let run = run_accepts(&accepts);
+
+    run.must_say(r#"advertises extra.version = "1""#);
+    run.must_say("OBOLUS_DEV_TOKEN_VERSION");
+    run.must_have_refused_during_startup();
+
+    // The discriminating half: an `extra` that agrees with the defaults gets through. Without it
+    // both refusals above hold on a binary that refuses any `extra` at all.
+    let accepts = format!(
+        r#"[{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
+             "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000",
+             "extra":{{"name":"USDC","version":"2"}}}}]"#
+    );
+    run_accepts(&accepts).must_have_got_past_startup();
 }
 
 /// Under `accept` nothing is verified, so there is no domain to report — and printing one would

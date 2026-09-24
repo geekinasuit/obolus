@@ -82,7 +82,7 @@ flowchart TB
   tfwd -->|"error"| t_unavail["upstream_unavailable"]
   tfwd -->|"non-2xx"| t_refused["upstream_refused"]
   tfwd -->|"2xx"| served["served"]
-  token -->|"no"| hdr{"X-PAYMENT<br/>present?"}
+  token -->|"no"| hdr{"PAYMENT-SIGNATURE<br/>present?"}
   hdr -->|"no"| required["payment_required"]
   hdr -->|"undecodable"| malformed["payment_malformed"]
   hdr --> match{"matches an<br/>offered option?"}
@@ -169,8 +169,8 @@ disagree.
 | `transaction` | string \| null | The settlement transaction, on `settled` when the facilitator reported one. |
 
 Every key is always present on a request line, `null` where it does not apply, so a consumer reads
-a fixed set of keys. Every amount is a decimal string of atomic units, the same shape as
-`maxAmountRequired`, because an amount can exceed what a JSON number holds exactly.
+a fixed set of keys. Every amount is a decimal string of atomic units, the same shape as x402's
+`amount`, because an amount can exceed what a JSON number holds exactly.
 
 ### Dropped lines
 
