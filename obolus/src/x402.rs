@@ -17,6 +17,15 @@
 //! deliberately no baked-in network constants here; the tests use obviously-synthetic
 //! fixtures, and the real identifiers arrive as config at A3 from the facilitator's own
 //! advertised list rather than being guessed here.
+//!
+//! # v2
+//!
+//! [`v2`] holds the x402 v2 types and header codec. Once the gateway moves onto them (#72), they
+//! replace this module's v1 types, header names and encode/decode functions. The base64 and JSON
+//! plumbing, [`CodecError`] and [`validate_atomic_amount`] belong to neither version and stay.
+//! Until then nothing consumes it.
+
+pub mod v2;
 
 use base64::engine::general_purpose::{
     GeneralPurpose, STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD,
@@ -237,7 +246,9 @@ mod tests {
     /// Produced OUTSIDE this codebase (`base64 -i golden-payment.json` on the exact JSON in
     /// [`golden_json`]) so it is an independent oracle. A round-trip test alone would happily
     /// pass with a wrong alphabet or wrong padding, because it would decode its own mistake.
-    const GOLDEN_B64: &str = "eyJ4NDAyVmVyc2lvbiI6MSwic2NoZW1lIjoiZXhhY3QiLCJuZXR3b3JrIjoidGVzdC1uZXR3b3JrLW5vdC1hLXJlYWwtY2FpcDIiLCJwYXlsb2FkIjp7ImF1dGhvcml6YXRpb24iOiJvcGFxdWUtdG8tcGhhc2UtYSJ9fQ==";
+    ///
+    /// Shared with [`super::v2`]'s tests, which use it as a real v1 envelope that v2 must refuse.
+    pub(crate) const GOLDEN_B64: &str = "eyJ4NDAyVmVyc2lvbiI6MSwic2NoZW1lIjoiZXhhY3QiLCJuZXR3b3JrIjoidGVzdC1uZXR3b3JrLW5vdC1hLXJlYWwtY2FpcDIiLCJwYXlsb2FkIjp7ImF1dGhvcml6YXRpb24iOiJvcGFxdWUtdG8tcGhhc2UtYSJ9fQ==";
 
     fn golden_json() -> &'static str {
         r#"{"x402Version":1,"scheme":"exact","network":"test-network-not-a-real-caip2","payload":{"authorization":"opaque-to-phase-a"}}"#
