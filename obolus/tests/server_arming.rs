@@ -1191,6 +1191,29 @@ fn an_accepts_evm_entry_without_the_token_domain_refuses() {
 }
 
 #[test]
+fn an_accepts_entry_naming_a_flow_obolus_does_not_run_refuses() {
+    let run = run(&[(
+        "OBOLUS_ACCEPTS",
+        r#"[{"network":"eip155:84532","asset":"0x0000000000000000000000000000000000000001","payTo":"0x0000000000000000000000000000000000000002","amount":"1000","extra":{"name":"USDC","version":"2","paymentFlow":"upfront"}}]"#,
+    )]);
+
+    run.must_say("OBOLUS_ACCEPTS entry for network \"eip155:84532\"");
+    run.must_say("extra.paymentFlow = \"upfront\" is not supported here");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn a_single_chain_extra_naming_another_transfer_method_refuses_naming_the_variable() {
+    let run = run(&[
+        ("OBOLUS_NETWORK", TESTNET),
+        ("OBOLUS_EXTRA", r#"{"name":"USDC","version":"2","assetTransferMethod":"permit2"}"#),
+    ]);
+
+    run.must_say("OBOLUS_EXTRA: extra.assetTransferMethod = \"permit2\" is not supported here");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
 fn arming_a_network_that_is_already_testnet_refuses() {
     // Armed-but-all-testnet used to be a legal state with an advisory line ("set but changed
     // nothing"). Under scoped arming the value names its target, and a target already on the

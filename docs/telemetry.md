@@ -85,7 +85,7 @@ flowchart TB
   token -->|"no"| hdr{"PAYMENT-SIGNATURE<br/>present?"}
   hdr -->|"no"| required["payment_required"]
   hdr -->|"undecodable"| malformed["payment_malformed"]
-  hdr --> match{"matches an<br/>offered option?"}
+  hdr --> match{"matches an offered<br/>option, method and flow,<br/>no server-owned extension field?"}
   match -->|"no"| unmatched["option_unmatched"]
   match --> verify{"verify"}
   verify -->|"rejected"| v_rej["verify_rejected"]

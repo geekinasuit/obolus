@@ -26,10 +26,11 @@
 pub mod v2;
 
 pub use v2::{
-    decode_payment, decode_payment_required, decode_receipt, encode_payment,
-    encode_payment_required, encode_receipt, PaymentPayload, PaymentRequired, PaymentRequirements,
-    ResourceInfo, SettlementReceipt, HEADER_PAYMENT_REQUIRED, HEADER_PAYMENT_RESPONSE,
-    HEADER_PAYMENT_SIGNATURE, X402_VERSION,
+    decode_payment, decode_payment_required, decode_receipt, default_asset_transfer_method,
+    encode_payment, encode_payment_required, encode_receipt, PaymentPayload, PaymentRequired,
+    PaymentRequirements, ResourceInfo, SettlementReceipt, UnsupportedTransfer, EXTRA_ASSET_TRANSFER_METHOD,
+    EXTRA_PAYMENT_FLOW, HEADER_PAYMENT_REQUIRED, HEADER_PAYMENT_RESPONSE, HEADER_PAYMENT_SIGNATURE,
+    PAYMENT_FLOW_AUTHORIZATION, X402_VERSION,
 };
 
 use base64::engine::general_purpose::{

@@ -985,6 +985,21 @@ fn an_evm_network_without_a_token_domain_refuses_to_start() {
     run.must_have_refused_during_startup();
 }
 
+/// An `extra` naming a transfer method the gateway would refuse every payment for is refused at
+/// startup, naming the variable it came from.
+#[test]
+fn an_extra_naming_another_transfer_method_refuses_to_start() {
+    let run = exec(&[
+        ("OBOLUS_NETWORK", TESTNET),
+        ("OBOLUS_ASSET", SYNTHETIC_ASSET),
+        ("OBOLUS_PAY_TO", SYNTHETIC_PAY_TO),
+        ("OBOLUS_EXTRA", r#"{"name":"TEST-TOKEN-NOT-REAL","version":"1","assetTransferMethod":"permit2"}"#),
+    ]);
+
+    run.must_say(r#"OBOLUS_EXTRA: extra.assetTransferMethod = "permit2" is not supported here"#);
+    run.must_have_refused_during_startup();
+}
+
 /// The retired token-domain variables are refused rather than ignored.
 ///
 /// Silently ignoring them would be the worse failure: an operator who set one believes the seller
