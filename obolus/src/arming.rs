@@ -2,9 +2,10 @@
 //!
 //! Obolus never signs anything — it issues a 402 challenge and delegates verify/settle to a
 //! facilitator. But **the challenge it advertises is the real-money trigger**: a cooperating client
-//! reads the `(network, asset, pay-to)` out of the 402 body and pays against it. So "could this
-//! gateway cause real money to move?" is answered by *what it advertises*, not by whether it holds a
-//! key. This module sits on the only thing Obolus controls — the contents of the `accepts` array.
+//! reads the `(network, asset, pay-to)` out of the 402's `PAYMENT-REQUIRED` header and pays against
+//! it. So "could this gateway cause real money to move?" is answered by *what it advertises*, not by
+//! whether it holds a key. This module sits on the only thing Obolus controls — the contents of the
+//! `accepts` array.
 //!
 //! # Fail-closed, by allowlist
 //!
@@ -80,8 +81,10 @@ pub const PINNED_ON: &str = "2026-07-29";
 /// force an operator on some other genuine testnet to set the mainnet arming flag, which is
 /// precisely the habit this guard must not create.
 ///
-/// Short names (`base-sepolia`) are **not** admitted, deliberately. x402's v1 spec examples still
-/// use them, so an operator can plausibly copy one out of primary documentation — hence
+/// Short names (`base-sepolia`) are **not** admitted, deliberately. x402 v2 names networks in CAIP-2
+/// only, but the v1 specification's examples use short names, and so does much of the documentation
+/// and client code written against v1 — so an operator can plausibly copy one out of primary
+/// documentation. Hence
 /// [`is_not_caip2`] gives them a clause of their own rather than the generic three-cause text, all
 /// three causes of which are false for a short name.
 ///
@@ -184,8 +187,9 @@ fn is_non_ascii(network: &str) -> bool {
 
 /// Is `network` not a CAIP-2 identifier at all — that is, an x402 *short name* like `base-sepolia`?
 ///
-/// x402's v1 spec examples still carry `"network":"base-sepolia"` (see the `SPEC_SETTLE_*` fixtures
-/// in `facilitator.rs`), so this is a value copied *from primary documentation* and refused.
+/// The x402 v1 specification's examples carry `"network":"base-sepolia"`; v2's use CAIP-2 (compare the
+/// `SPEC_SETTLE_*` fixtures in `facilitator.rs`, which are v2's). So this is a value copied *from
+/// primary documentation* — just an older version of it — and refused.
 /// [`near_miss`] cannot help — a short name is not a whitespace- or case-variant of any CAIP-2 id.
 ///
 /// Structural, not a lookup table: a CAIP-2 id is `namespace:reference`, so no colon means not
@@ -596,8 +600,8 @@ pub fn check_arming(
 /// # Both branches, not just the refusal
 ///
 /// `pub` because the **armed** path needs it too. An operator can arm for a genuine `eip155:8453`
-/// entry while the same `OBOLUS_ACCEPTS` array carries `base-sepolia` — the short name x402's own v1
-/// payloads still use. Obolus can say something specific about the second, and flattening both into
+/// entry while the same `OBOLUS_ACCEPTS` array carries `base-sepolia` — the short name x402 v1's
+/// payloads use. Obolus can say something specific about the second, and flattening both into
 /// *"a mainnet, a typo, or a newer testnet, Obolus cannot tell which"* discards knowledge this
 /// binary has.
 ///
@@ -741,7 +745,7 @@ pub fn diagnose(unproven: &[String]) -> String {
     if !short_names.is_empty() {
         clauses.push(format!(
             "Not a CAIP-2 identifier — no `namespace:reference` colon, so it looks like an x402 \
-             short name: {}. x402's own example payloads still use short names, but this guard \
+             short name: {}. x402 v1's example payloads use short names, but this guard \
              compares against CAIP-2 ids byte-exactly, so a short name can never match one however \
              correct the chain it names. TESTNET_NETWORKS carries the CAIP-2 id for every testnet \
              Obolus admits, in that form — Base Sepolia is \"eip155:84532\", Arbitrum Sepolia is \
@@ -1593,8 +1597,8 @@ mod tests {
 
     #[test]
     fn an_x402_short_name_is_diagnosed_as_such_not_as_a_possible_mainnet() {
-        // `base-sepolia` is a genuine testnet, named the way x402's own v1 spec examples name it
-        // (see the SPEC_SETTLE_* fixtures in facilitator.rs). It is refused — comparison is
+        // `base-sepolia` is a genuine testnet, named the way the x402 v1 specification's examples
+        // name it (v2's use CAIP-2). It is refused — comparison is
         // byte-exact — so the refusal has to say *why*, or the operator reads three false causes
         // about an id they copied from the spec and the arming flag is the only actionable thing
         // left in the message.
