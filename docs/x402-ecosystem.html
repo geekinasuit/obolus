@@ -1,3 +1,4 @@
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>x402 — The Ecosystem, End to End</title>
 <style>
   :root {
@@ -122,6 +123,7 @@
   .step.r .step__n{color:var(--rail); background:var(--rail-bg); border-color:var(--rail-line)}
   .step.s .step__n{color:var(--settle-strong); background:var(--settle-bg); border-color:var(--settle-line)}
   .step.d .step__n{color:var(--disc-strong); background:var(--disc-bg); border-color:var(--disc-line)}
+  .step > div{min-width:0} /* let a long .wire scroll inside itself instead of widening the page */
   .step h3{margin-bottom:.2rem; font-size:1rem}
   .step p{margin:0; font-size:.92rem; color:var(--ink-soft); line-height:1.5}
   .step .wire + p{margin-top:.6rem}
@@ -206,12 +208,12 @@
     <h1>x402 <span class="x">—</span> the ecosystem, end to end</h1>
     <p class="dek">How a machine pays for a single HTTP request with no account, no invoice and no identity — who the participants are, what the Bazaar adds on top, and where our own pieces sit on the rail.</p>
     <div class="metabar">
-      <span><b>Prepared</b> 2026-08-05</span><i class="dot"></i>
-      <span>Protocol facts from <b>coinbase/x402 specs/x402-specification-v1.md</b></span><i class="dot"></i>
+      <span><b>Prepared</b> 2026-08-05 · <b>rewritten for x402 v2</b> 2026-09-25</span><i class="dot"></i>
+      <span>Protocol facts from <b>x402-foundation/x402 specs/x402-specification-v2.md</b> and its HTTP transport and <code>exact</code> scheme documents</span><i class="dot"></i>
       <span>Discovery facts from <b>docs.cdp.coinbase.com/x402</b></span><i class="dot"></i>
       <span>Obolus project documentation</span>
     </div>
-    <p class="stale"><b>This page describes x402 v1.</b> Obolus now speaks x402 v2 only (<a href="https://github.com/geekinasuit/obolus/issues/71">#71</a>): the headers are <code>PAYMENT-REQUIRED</code>, <code>PAYMENT-SIGNATURE</code> and <code>PAYMENT-RESPONSE</code>, the price field is <code>amount</code>, and a payment names the whole option it accepted. Where this page and the <a href="https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md">v2 specification</a> disagree, the specification wins. Updating this page is tracked in <a href="https://github.com/geekinasuit/obolus/issues/72">#72</a>.</p>
+    <p class="stale"><b>This page describes x402 v2</b>, the only version Obolus speaks. Where this page and the <a href="https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md">v2 specification</a> disagree, the specification wins.</p>
     <div class="legend">
       <span><i class="l-rail"></i> the rail — protocol surface, challenge and payload</span>
       <span><i class="l-settle"></i> settlement — facilitator, chain, funds</span>
@@ -222,7 +224,7 @@
   <div class="tldr col">
     <h2>The short version</h2>
     <ul>
-      <li><span class="k l-rail"></span><span><strong>x402 revives HTTP 402.</strong> A server answers an unpaid request with <code>402</code> and a machine-readable list of ways to pay; the client picks one, signs it, and retries with the payment attached. No account is created, so nothing identifies the buyer.</span></li>
+      <li><span class="k l-rail"></span><span><strong>x402 revives HTTP 402.</strong> A server answers an unpaid request with <code>402</code> and a machine-readable list of ways to pay in a <code>PAYMENT-REQUIRED</code> header; the client picks one, signs it, and retries with the payment in a <code>PAYMENT-SIGNATURE</code> header. No account is created, so nothing identifies the buyer.</span></li>
       <li><span class="k l-settle"></span><span><strong>The seller never touches a chain.</strong> A <em>facilitator</em> verifies the signed authorization and broadcasts settlement. That is what lets a gateway hold no keys and still take money.</span></li>
       <li><span class="k l-disc"></span><span><strong>The Bazaar is the index.</strong> Discovery turns "you must already know the URL" into a browsable, searchable catalog of payable resources — the same <code>accepts</code> data, published ahead of the request instead of only in the 402.</span></li>
       <li><span class="k l-rail"></span><span><strong>Obolus is a seller on this rail.</strong> It fronts local inference and charges per request — so the buyers it serves are agent harnesses and apps that need a resource for a fee, without either side holding an account with the other.</span></li>
@@ -255,7 +257,7 @@
       <div class="actor chain">
         <div class="role">Settlement</div>
         <h3>Chain &amp; asset</h3>
-        <p>Where value actually moves. Networks are named in CAIP-2 form, and the asset is a token contract address — normally USDC, because a stablecoin makes a per-request price legible.</p>
+        <p>Where value actually moves. Networks are named in CAIP-2 form, and the asset is the token's address, a contract on EVM and a mint on Solana — normally USDC, because a stablecoin makes a per-request price legible.</p>
         <span class="who">Base / Base Sepolia; Solana / devnet</span>
       </div>
       <div class="actor bazaar">
@@ -276,36 +278,40 @@
         <div class="step__n"></div>
         <div>
           <h3>The client asks, and is refused</h3>
-          <p>An ordinary request with nothing attached. The server answers <code>402 Payment Required</code> with a body containing an <code>accepts</code> array — every payment option it will honour, each one complete enough to act on without a follow-up call.</p>
+          <p>An ordinary request with nothing attached. The server answers <code>402 Payment Required</code> with a <code>PAYMENT-REQUIRED</code> header: a base64-encoded <code>PaymentRequired</code> object naming the resource once and listing, in <code>accepts</code>, every payment option the server will honour — each complete enough to act on without a follow-up call. A v2 client reads the header, not the body. The transport leaves the body to the server — the spec's own example sends <code>{}</code>, and Obolus repeats the same JSON there for humans with <code>curl</code>. Decoded:</p>
           <div class="wire">402 Payment Required
+PAYMENT-REQUIRED: &lt;base64 of the object below&gt;
+Cache-Control: no-store
+
 {
-  "x402Version": 1,
+  "x402Version": 2,
+  "resource": {
+    "url":         "https://obolus.example/v1/chat/completions",
+    "description": "One chat completion",
+    "mimeType":    "application/json"
+  },
   "accepts": [
     {
       "scheme":            "exact",
-      "network":           "base-sepolia",
-      "maxAmountRequired": "1000",            ← atomic units. NOT 0.001
+      "network":           "eip155:84532",          ← CAIP-2: Base Sepolia
+      "amount":            "1000",                  ← atomic units. NOT 0.001
       "asset":             "0xUSDC_CONTRACT",
       "payTo":             "0xSELLER_ADDRESS",
-      "resource":          "https://obolus.example/v1/chat/completions",
-      "description":       "One chat completion",
-      "mimeType":          "application/json",
-      "maxTimeoutSeconds": 60
+      "maxTimeoutSeconds": 60,
+      "extra": { "name": "USDC", "version": "2" }   ← the token's EIP-712 domain
     },
     {
       "scheme":            "exact",
-      "network":           "solana-devnet",   ← same price, different rail
-      "maxAmountRequired": "1000",
+      "network":           "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1",   ← Solana Devnet
+      "amount":            "1000",                  ← same price, different rail
       "asset":             "USDC_MINT_ADDRESS",
       "payTo":             "SELLER_PUBKEY",
-      "resource":          "https://obolus.example/v1/chat/completions",
-      "description":       "One chat completion",
-      "mimeType":          "application/json",
-      "maxTimeoutSeconds": 60
+      "maxTimeoutSeconds": 60,
+      "extra": { "feePayer": "SPONSOR_PUBKEY" }     ← who co-signs and pays the fee
     }
   ]
 }</div>
-          <p>Addresses above are placeholders. Two entries, one resource: a wallet funded on Base takes the first, a Solana wallet takes the second, and the seller settles against whichever was actually used.</p>
+          <p>Addresses above are placeholders. Two entries, one resource: a wallet funded on Base takes the first, a Solana wallet takes the second, and the seller settles against whichever was actually used. <code>extra</code> is scheme-specific: an EVM <code>exact</code> client signs under the token's name and version, and a Solana <code>exact</code> client builds a transaction the named fee payer finishes signing.</p>
         </div>
       </div>
       <div class="hop"><span>402 + accepts[]</span></div>
@@ -313,11 +319,16 @@
         <div class="step__n"></div>
         <div>
           <h3>The client picks an option and signs</h3>
-          <p>Options differ by chain, asset and price, so the choice is the client's — a wallet funded on Base cannot pay a Solana option. Under the <code>exact</code> scheme the client signs an authorization to move a precise amount, rather than sending a transaction itself.</p>
+          <p>Options differ by chain, asset and price, so the choice is the client's — a wallet funded on Base cannot pay a Solana option. Under the <code>exact</code> scheme the client signs a payment of the quoted amount, but does not broadcast it: the facilitator does that later, at settle.</p>
           <div class="wire">EVM   EIP-3009 TransferWithAuthorization, signed EIP-712
       from · to · value · validAfter · validBefore · nonce
-SVM   SPL TransferChecked, fixed instruction layout
-      amount must equal maxAmountRequired exactly</div>
+      value must equal the requirement's amount exactly
+      the reference client: validBefore = now + maxTimeoutSeconds
+SVM   SPL TransferChecked, partially signed; the fee payer adds the last signature
+      a transfer of at least the requirement's amount (overpayment is tolerated)
+      the transaction expires with its recent blockhash, after roughly 60–90 s</div>
+          <p>EIP-3009 is the default of three EVM transfer methods, chosen per option with <code>extra.assetTransferMethod</code>: Permit2 covers tokens without EIP-3009, and ERC-7710 covers smart accounts that delegate. Obolus runs only the default.</p>
+          <p>Both lines matter for timing. The authorization carries its own expiry — on EVM, whatever the client chose for <code>validBefore</code>; on Solana, the blockhash lifetime — and everything that follows, verify, the work and settle, has to fit inside it.</p>
         </div>
       </div>
       <div class="hop"><span>retry, payment attached</span></div>
@@ -325,8 +336,16 @@ SVM   SPL TransferChecked, fixed instruction layout
         <div class="step__n"></div>
         <div>
           <h3>The same request, carrying payment</h3>
-          <p>The signed payload rides in a request header. Note what has <em>not</em> happened: nothing has hit a chain, no funds have moved, and the server still has not served anything.</p>
-          <div class="wire">X-PAYMENT: &lt;base64 payment envelope&gt;</div>
+          <p>The signed payload rides in a request header. It carries a copy of the option the client chose, so the server can tell which offer is being paid and refuse it if that offer has changed since. The copy is not quite verbatim: on Solana the client fills in fields such as the recent blockhash itself, and servers leave those out of the match. Note what has <em>not</em> happened: nothing has hit a chain, no funds have moved, and the server still has not served anything.</p>
+          <div class="wire">PAYMENT-SIGNATURE: &lt;base64 PaymentPayload&gt;
+
+{
+  "x402Version": 2,
+  "accepted": { …the chosen entry of accepts… },
+  "payload":  { "signature": "0x…", "authorization": { from, to, value, validAfter, validBefore, nonce } }
+}
+
+on Solana, "payload" is { "transaction": "&lt;base64, partially signed&gt;" }</div>
         </div>
       </div>
       <div class="hop"><span>seller → facilitator</span></div>
@@ -350,8 +369,10 @@ SVM   SPL TransferChecked, fixed instruction layout
         <div class="step__n"></div>
         <div>
           <h3>Settle, and hand back a receipt</h3>
-          <p><code>/settle</code> broadcasts the authorization and money moves. The response carries a settlement receipt back to the client, so the payer learns what it actually paid without watching the chain itself.</p>
-          <div class="wire">X-PAYMENT-RESPONSE: &lt;base64 settlement receipt&gt;</div>
+          <p><code>/settle</code> broadcasts the authorization and money moves. The response carries a settlement receipt back to the client, so the payer learns what it actually paid — and can look the transaction up — without watching the chain itself. If settlement fails, the client gets a <code>402</code> instead of the work.</p>
+          <div class="wire">PAYMENT-RESPONSE: &lt;base64 SettlementResponse&gt;
+
+{ "success": true, "transaction": "0x…", "network": "eip155:84532", "payer": "0x…" }</div>
         </div>
       </div>
     </div>
@@ -360,28 +381,39 @@ SVM   SPL TransferChecked, fixed instruction layout
       <h3>Why the ordering is the interesting part</h3>
       <p>Verify precedes work; settle follows it. A client that cannot pay is turned away before any compute is spent, and a seller that cannot deliver has not yet taken the money. The expensive, irreversible step sits between two cheap reversible ones.</p>
       <p>The same shape is what makes the anonymous path viable at all: because authorization is proved per request, the seller never needs an account to attach it to.</p>
+      <p>v2 names this ordering the <code>authorization</code> payment flow, and it is the default. The spec defines two others, selected per option with <code>extra.paymentFlow</code>: <code>upfront</code> (settle, then serve) and <code>escrow</code> (settle a deposit, serve, then settle the final charge). <code>upfront</code> is required on rails with no way to pull a payment after the fact, and the Solana <code>exact</code> scheme recommends it for long-running handlers; <code>escrow</code> is for a final charge that can differ from the deposit. Either way, the payer is committed before the work runs. When both are offered, the spec says clients should prefer <code>authorization</code>. Obolus runs <code>authorization</code> only.</p>
+    </div>
+
+    <div class="warn">
+      <div class="eyebrow">Implementation trap</div>
+      <h3>The work has to finish inside the payment window</h3>
+      <p>Under <code>authorization</code>, settle comes <em>after</em> the work, but the payment expires on its own clock: on EVM, the reference client sets it <code>maxTimeoutSeconds</code> after signing, and the reference facilitator refuses to settle an authorization that is about to expire; on Solana, the signed transaction dies with its blockhash, whatever <code>maxTimeoutSeconds</code> says. A handler that runs past the window has done the work and cannot be paid for it: the client gets a <code>402</code>, and a client that simply pays again can loop.</p>
+      <p>The specification defines the window as the maximum time allowed for payment completion, and the EVM scheme has the facilitator check that the authorization's validity window meets the requirements. Neither says what a seller should do when its work outlasts the window; the Solana <code>exact</code> scheme recommends <code>upfront</code> for long-running handlers. The TypeScript reference server defaults the window to 300 seconds. Obolus's handling of this is <a href="https://github.com/geekinasuit/obolus/issues/83">#83</a>.</p>
     </div>
   </section>
 
   <section>
     <div class="sec-head"><span class="num">03</span><h2>What is in the challenge</h2></div>
-    <p class="col">Each entry of <code>accepts</code> is one complete offer. A client should be able to evaluate and pay it without asking anything further — which is why price, chain, asset and destination all travel together.</p>
+    <p class="col">The challenge has two parts: <code>resource</code>, which says once what is being sold, and <code>accepts</code>, whose every entry is one complete offer. A client should be able to evaluate and pay an entry without asking anything further — which is why price, chain, asset and destination all travel together.</p>
 
     <div class="tablewrap">
       <table>
         <thead><tr><th>Field</th><th>Required</th><th>What it carries</th></tr></thead>
         <tbody>
-          <tr><th>scheme</th><td class="opt">required</td><td>How payment is constructed — <code>exact</code> is the one in general use.</td></tr>
-          <tr><th>network</th><td class="opt">required</td><td>Which chain, in CAIP-2 form (e.g.&nbsp;<code>base-sepolia</code>).</td></tr>
-          <tr><th>maxAmountRequired</th><td class="opt">required</td><td>The price, in atomic token units — never a decimal.</td></tr>
-          <tr><th>asset</th><td class="opt">required</td><td>Token contract address. Normally USDC.</td></tr>
-          <tr><th>payTo</th><td class="opt">required</td><td>Where the money lands. The seller's address.</td></tr>
-          <tr><th>resource</th><td class="opt">required</td><td>The URL being paid for.</td></tr>
-          <tr><th>description</th><td class="opt">required</td><td>Human-readable statement of what is being sold.</td></tr>
-          <tr><th>maxTimeoutSeconds</th><td class="opt">required</td><td>How long the offer stays payable. A zero window is unpayable.</td></tr>
-          <tr><th>mimeType</th><td class="opt">optional</td><td>Response content type.</td></tr>
-          <tr><th>outputSchema</th><td class="opt">optional</td><td>JSON schema of the response — what a buyer gets for the money.</td></tr>
-          <tr><th>extra</th><td class="opt">optional</td><td>Scheme-specific additions.</td></tr>
+          <tr><th>x402Version</th><td class="opt">required</td><td>The protocol version: <code>2</code>.</td></tr>
+          <tr><th>error</th><td class="opt">optional</td><td>Why payment is required this time — for example, that the last payment was refused.</td></tr>
+          <tr><th>resource.url</th><td class="opt">required</td><td>The URL being paid for.</td></tr>
+          <tr><th>resource.description</th><td class="opt">optional</td><td>Human-readable statement of what is being sold.</td></tr>
+          <tr><th>resource.mimeType</th><td class="opt">optional</td><td>Response content type.</td></tr>
+          <tr><th>resource.serviceName · tags · iconUrl</th><td class="opt">optional</td><td>Presentation and filtering hints, the same ones a discovery listing uses.</td></tr>
+          <tr><th>accepts[].scheme</th><td class="opt">required</td><td>How payment is constructed — <code>exact</code> is the one in general use.</td></tr>
+          <tr><th>accepts[].network</th><td class="opt">required</td><td>Which chain, in CAIP-2 form (e.g.&nbsp;<code>eip155:84532</code> for Base Sepolia). v1's short names such as <code>base-sepolia</code> are gone.</td></tr>
+          <tr><th>accepts[].amount</th><td class="opt">required</td><td>The price, in atomic token units — never a decimal. v1 called it <code>maxAmountRequired</code>.</td></tr>
+          <tr><th>accepts[].asset</th><td class="opt">required</td><td>The token: a contract address on EVM, a mint address on Solana. Normally USDC. The spec also allows an ISO 4217 code for fiat.</td></tr>
+          <tr><th>accepts[].payTo</th><td class="opt">required</td><td>Where the money lands: the seller's address. The spec also allows a role constant such as <code>"merchant"</code>.</td></tr>
+          <tr><th>accepts[].maxTimeoutSeconds</th><td class="opt">required</td><td>The maximum time allowed for payment completion. The reference EVM client also makes it the lifetime of the authorization it signs; a Solana payment expires with its blockhash instead. Obolus refuses to start with a zero window.</td></tr>
+          <tr><th>accepts[].extra</th><td class="opt">optional</td><td>Scheme-specific additions — the EIP-712 token domain on EVM, the fee payer on Solana — plus two reserved keys, <code>assetTransferMethod</code> and <code>paymentFlow</code>, that pick how funds move and when settlement runs.</td></tr>
+          <tr><th>extensions</th><td class="opt">optional</td><td>Optional protocol extensions. The client echoes what the server advertised.</td></tr>
         </tbody>
       </table>
     </div>
@@ -410,8 +442,11 @@ SVM   SPL TransferChecked, fixed instruction layout
         <div>
           <h3>A buyer browses or searches</h3>
           <p>A paginated catalog endpoint returns resources with their payment options attached, filterable and searchable — hybrid full-text plus semantic retrieval, so an agent can ask for a capability rather than a hostname.</p>
-          <div class="wire">GET /v2/x402/discovery/resources?limit=&amp;offset=
-→ { resources[], partialResults, searchMethod, x402Version }</div>
+          <div class="wire">spec §8.1   GET /discovery/resources?limit=&amp;offset=
+            → { x402Version, items[], pagination }
+CDP         GET /v2/x402/discovery/resources?limit=&amp;offset=
+            → { resources[], partialResults, searchMethod, x402Version }</div>
+          <p>The two shapes differ. Code written against one will not parse the other. The field table below is CDP's; several of its fields are not in the spec's discovery item.</p>
         </div>
       </div>
       <div class="hop"><span>resource + accepts[]</span></div>
@@ -426,7 +461,7 @@ SVM   SPL TransferChecked, fixed instruction layout
 
     <div class="tablewrap">
       <table>
-        <thead><tr><th>Discovery resource field</th><th>What it carries</th></tr></thead>
+        <thead><tr><th>CDP discovery resource field</th><th>What it carries</th></tr></thead>
         <tbody>
           <tr><th class="d">resource</th><td>The URL of the payable resource.</td></tr>
           <tr><th class="d">accepts[]</th><td>The payment options — <code>scheme</code>, <code>network</code>, <code>amount</code>, <code>asset</code>, <code>payTo</code>, <code>maxTimeoutSeconds</code>.</td></tr>
@@ -447,9 +482,9 @@ SVM   SPL TransferChecked, fixed instruction layout
 
     <div class="warn">
       <div class="eyebrow">Implementation trap</div>
-      <h3>The discovery entry is not byte-identical to the challenge</h3>
-      <p>The 402 challenge names the price <code>maxAmountRequired</code>; the discovery entry names it <code>amount</code>. They describe the same thing, and code that assumes one shape will silently mis-read the other — a price field that parses to nothing is the worst possible field to get wrong.</p>
-      <p>Treat the catalog entry as an <em>advertisement</em> of an offer and the 402 body as the offer itself. When they disagree, the challenge is authoritative: it is the one the seller will actually settle against.</p>
+      <h3>The discovery entry is an advertisement, not the offer</h3>
+      <p>In v2 the offers inside <code>accepts</code> share their field names — both price in <code>amount</code>, which under v1 the challenge called <code>maxAmountRequired</code>. The envelopes around them still differ: a challenge's <code>resource</code> is an object with a <code>url</code>, a discovery item's <code>resource</code> is the URL string itself. Code that assumes one shape silently mis-reads the other. A listing also names the <code>x402Version</code> it speaks, so check that before reading its fields.</p>
+      <p>Shared names do not make them the same thing. Treat the catalog entry as an <em>advertisement</em> of an offer and the 402 challenge as the offer itself. When they disagree, the challenge is authoritative: it is the one the seller will actually settle against, and a v2 payment names the exact challenge entry it accepted.</p>
     </div>
 
     <div class="callout">
@@ -470,7 +505,7 @@ SVM   SPL TransferChecked, fixed instruction layout
           <span class="chip">any x402-aware client</span>
         </div>
       </div>
-      <div class="down"><span>402 · X-PAYMENT · X-PAYMENT-RESPONSE</span></div>
+      <div class="down"><span>PAYMENT-REQUIRED · PAYMENT-SIGNATURE · PAYMENT-RESPONSE</span></div>
       <div class="tier railband">
         <div class="lbl">The rail — one protocol, many participants</div>
         <div class="row">
@@ -510,7 +545,7 @@ SVM   SPL TransferChecked, fixed instruction layout
 
   <section>
     <div class="sec-head"><span class="num">06</span><h2>The pricing seam</h2></div>
-    <p class="col">x402 prices a <em>request</em>, in atomic units, at the moment of asking. The model world prices <em>tokens</em>, in fractions of a cent, in published tables. A gateway selling inference over x402 stands exactly on that seam and has to reconcile the two.</p>
+    <p class="col">x402's <code>exact</code> scheme prices a <em>request</em>, in atomic units, at the moment of asking. The model world prices <em>tokens</em>, in fractions of a cent, in published tables. A gateway selling inference over x402 stands exactly on that seam and has to reconcile the two.</p>
 
     <div class="tablewrap">
       <table>
@@ -519,14 +554,15 @@ SVM   SPL TransferChecked, fixed instruction layout
           <tr><th>Unit</th><td>One request</td><td>Per input / output token</td></tr>
           <tr><th>Denomination</th><td>Atomic token units of a specific asset</td><td>Fiat fractions, provider-published</td></tr>
           <tr><th>Where it lives</th><td><code>accepts[]</code> — challenge or catalog entry</td><td>A models endpoint or a pricing registry</td></tr>
-          <tr><th>Known when?</th><td>Before the work — it is the offer</td><td>After the work — it depends on token count</td></tr>
+          <tr><th>Known when?</th><td>Under <code>exact</code>, before the work — it is the offer. Under <code>upto</code>, a ceiling before and the actual charge after</td><td>After the work — it depends on token count</td></tr>
         </tbody>
       </table>
     </div>
 
     <div class="callout">
       <h3>The reconciliation is a product decision, not a formatting one</h3>
-      <p>A per-request price must be fixed before the response length is known, so a seller either charges a flat rate per resource, estimates from the input and eats the variance, or splits the resource so each price band is its own URL. Discovery pushes toward the last of these: catalog entries are keyed on a resource, so per-model pricing means per-model resources.</p>
+      <p>Under <code>exact</code>, the price is fixed before the response length is known, so a seller either charges a flat rate per resource, estimates from the input and eats the variance, or splits the resource so each price band is its own URL. Discovery pushes toward the last of these: catalog entries are keyed on a resource, so per-model pricing means per-model resources.</p>
+      <p>v2 also offers a way out of that bind. The <code>upto</code> scheme has the client authorize a maximum, and the server settles the amount the work actually cost — for inference, the tokens generated. Obolus runs <code>exact</code> only today, and refuses to advertise any other scheme.</p>
       <p>Where the protocol is silent — capability flags, context windows, per-token rates — the sensible move is to follow whoever the ecosystem already follows rather than coin new names: a live models endpoint shaped as an OpenAI superset, and cost/capability field <em>vocabulary</em> borrowed from the widely-mirrored pricing registries. Both are additive, so an OpenAI-shaped client keeps working and simply ignores what it does not understand.</p>
     </div>
   </section>
@@ -538,7 +574,11 @@ SVM   SPL TransferChecked, fixed instruction layout
     <div class="status">
       <div class="st live">
         <div class="lbl">Live</div>
-        <p>Obolus issues real 402 challenges and advertises a multi-option <code>accepts</code> array. Deployed loopback-only.</p>
+        <p>Obolus speaks x402 v2: real 402 challenges in <code>PAYMENT-REQUIRED</code>, a multi-option <code>accepts</code> array, payments matched against the whole option they name, and receipts in <code>PAYMENT-RESPONSE</code>.</p>
+      </div>
+      <div class="st live">
+        <div class="lbl">Proven once</div>
+        <p>A real payment round trip on Base Sepolia on 2026-09-24: the reference <code>@x402/fetch</code> client paid, x402.org settled, and the <a href="https://sepolia.basescan.org/tx/0x4a824c849216eb3d1dc87073a1000b3ba0b13847ad30f882904ddfed80acc6e7">transaction</a> matches the receipt and the gateway's telemetry (<a href="https://github.com/geekinasuit/obolus/issues/72">#72</a>). Run by hand, outside the merge gate.</p>
       </div>
       <div class="st live">
         <div class="lbl">Live</div>
@@ -549,34 +589,43 @@ SVM   SPL TransferChecked, fixed instruction layout
         <p>A bearer-token path exists alongside the 402 branch, fail-closed: anything not positively verified takes the payment branch.</p>
       </div>
       <div class="st gap">
-        <div class="lbl">Blocked</div>
-        <p>No outbound TLS client, so the facilitator URL must be <code>http://</code>. A real facilitator is <code>https://</code> — settlement therefore cannot run yet.</p>
+        <div class="lbl">Worked around</div>
+        <p>No outbound TLS client, so the facilitator URL must be <code>http://</code>. A real facilitator is <code>https://</code>, so reaching one takes a TLS-terminating proxy in front of it, as the round trip did (<a href="https://github.com/geekinasuit/obolus/issues/35">#35</a>).</p>
       </div>
       <div class="st gap">
-        <div class="lbl">Not yet</div>
-        <p>The deployed instance is deliberately unpayable: placeholder network, no pay-to wallet. Inert by construction rather than by configuration.</p>
+        <div class="lbl">Known gap</div>
+        <p>A request whose work outlasts its payment window is served and then cannot be settled — the trap in section&nbsp;02 (<a href="https://github.com/geekinasuit/obolus/issues/83">#83</a>).</p>
+      </div>
+      <div class="st gap">
+        <div class="lbl">Not yet proven</div>
+        <p>Solana options can be advertised, but no Solana payment has settled. A reference client needs <code>extra.feePayer</code> in the option, which Obolus neither fills in nor requires yet, so the operator has to supply it (<a href="https://github.com/geekinasuit/obolus/issues/81">#81</a>).</p>
+      </div>
+      <div class="st gap">
+        <div class="lbl">By design</div>
+        <p>An unconfigured gateway is unpayable: placeholder network, no pay-to wallet. Inert by construction rather than by configuration.</p>
       </div>
       <div class="st next">
         <div class="lbl">Not yet</div>
-        <p>No discovery listing, no catalog presence, and no per-model resource split.</p>
+        <p>No discovery listing and no catalog presence. Prices can already differ by backend; per-model rates are later work.</p>
       </div>
     </div>
 
     <div class="warn">
-      <div class="eyebrow">The one that gates the rest</div>
-      <h3>Everything downstream waits on reaching a real facilitator</h3>
-      <p>Verification and settlement are the only steps that leave the building, and they are the steps we cannot yet take. Until an <code>https://</code> facilitator is reachable — by wiring a TLS client or by terminating TLS in front of the gateway — the 402 path is exercisable only against fakes, and a fake we wrote proves nothing about a rail we do not control.</p>
-      <p>That is also why a payable testnet instance is the milestone worth aiming at rather than a broader feature set: it is the first point at which the protocol claims stop being claims.</p>
+      <div class="eyebrow">What the round trip settled</div>
+      <h3>The protocol claims are no longer only claims</h3>
+      <p>Verification and settlement are the only steps that leave the building, and a fake we wrote proves nothing about a rail we do not control. The round trip against x402.org is the first evidence from outside our own authorship: a third-party facilitator accepted the challenge as we advertise it, the signature a reference client made under it, and the payment it settled.</p>
+      <p>It is one run by hand, not a check. Making it repeatable — outside the merge gate, so that its flakiness cannot block a merge — is still to do.</p>
     </div>
   </section>
 
   <div class="foot col">
     <h3>Sources &amp; provenance</h3>
     <ul>
-      <li><span class="v-ok">SPEC</span> — <code>accepts</code> field names, facilitator <code>/verify</code>, <code>/settle</code>, <code>/supported</code>, and the <code>exact</code> scheme's EVM (EIP-3009 / EIP-712) and Solana (SPL <code>TransferChecked</code>) constructions: <a href="https://github.com/coinbase/x402/blob/main/specs/x402-specification-v1.md">coinbase/x402 · x402-specification-v1.md</a>, the same spec our gateway is built against.</li>
-      <li><span class="v-ok">DOCS</span> — Bazaar behaviour, the discovery resource schema and the paginated catalog endpoint: <a href="https://docs.cdp.coinbase.com/x402/bazaar">CDP · x402 Bazaar</a> and <a href="https://docs.cdp.coinbase.com/api-reference/v2/rest-api/x402-facilitator/search-x402-resources">Search x402 resources</a>.</li>
-      <li><span class="v-soft">OURS</span> — <code>X-PAYMENT</code> / <code>X-PAYMENT-RESPONSE</code> header names read from our own implementation. The core specification scopes transport headers to separate transport documents, so treat these as what we send, corroborated by ecosystem convention, rather than as quoted from the core spec.</li>
-      <li><span class="v-ok">OURS</span> — the status section reflects the gateway source directly, including the <code>https://</code> rejection and the test that pins it.</li>
+      <li><span class="v-ok">SPEC</span> — <code>PaymentRequired</code>, <code>PaymentPayload</code> and <code>SettlementResponse</code> fields, the payment flows, and facilitator <code>/verify</code>, <code>/settle</code>, <code>/supported</code>: <a href="https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md">x402-foundation/x402 · x402-specification-v2.md</a>, the spec our gateway is built against.</li>
+      <li><span class="v-ok">SPEC</span> — the <code>PAYMENT-REQUIRED</code> / <code>PAYMENT-SIGNATURE</code> / <code>PAYMENT-RESPONSE</code> headers: <a href="https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/http.md">transports-v2/http.md</a>. The <code>exact</code> scheme's constructions: <a href="https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_evm.md">scheme_exact_evm.md</a> (EIP-3009, Permit2 and ERC-7710) and <a href="https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md">scheme_exact_svm.md</a> (SPL <code>TransferChecked</code>, the fee payer, and the <code>upfront</code> recommendation for long-running handlers).</li>
+      <li><span class="v-soft">CODE</span> — <code>validBefore = now + maxTimeoutSeconds</code>, the facilitator's refusal to settle an authorization about to expire, and the 300-second default window are read from the reference implementation (<code>@x402/core</code> and <code>@x402/evm</code> 2.27.0), not from the specification, which does not state them.</li>
+      <li><span class="v-ok">DOCS</span> — Bazaar behaviour, the discovery resource schema and the paginated catalog endpoint: <a href="https://docs.cdp.coinbase.com/x402/bazaar">CDP · x402 Bazaar</a> and <a href="https://docs.cdp.coinbase.com/api-reference/v2/rest-api/x402-facilitator/search-x402-resources">Search x402 resources</a>. Read 2026-08-05 and not re-checked for this rewrite.</li>
+      <li><span class="v-ok">OURS</span> — the status section reflects the gateway source directly, including the <code>https://</code> rejection and the test that pins it, and the round trip recorded on <a href="https://github.com/geekinasuit/obolus/issues/72">#72</a>.</li>
     </ul>
     <p class="note">Living document — re-verify load-bearing protocol facts before requoting; the x402 surface, and the discovery layer especially, is still moving. Orientation material for anyone picking up Obolus: this describes the rail Obolus sells on, not the gateway's own internals (see the project <code>README</code>).</p>
   </div>
