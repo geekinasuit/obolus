@@ -122,6 +122,10 @@ pub enum Outcome {
     UpstreamUnavailable,
     /// The upstream answered with a non-success status, which was passed back uncharged.
     UpstreamRefused,
+    /// The payment's window ran out before the upstream's response head arrived, leaving too little
+    /// time to settle. Nothing was charged. The upstream was not called at all if verify alone used
+    /// up the window.
+    PaymentWindowElapsed,
     /// Settlement was refused, or reported that it did not complete. Nothing was charged.
     SettleRejected,
     /// The facilitator failed during settlement. Whether funds moved is unknown.
@@ -238,6 +242,7 @@ impl Trace {
             | Outcome::VerifyUnavailable
             | Outcome::UpstreamUnavailable
             | Outcome::UpstreamRefused
+            | Outcome::PaymentWindowElapsed
             | Outcome::SettleRejected => zero(),
         };
         RequestEvent {

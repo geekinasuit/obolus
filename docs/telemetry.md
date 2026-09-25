@@ -90,7 +90,9 @@ flowchart TB
   match --> verify{"verify"}
   verify -->|"rejected"| v_rej["verify_rejected"]
   verify -->|"unavailable"| v_unavail["verify_unavailable"]
+  verify -->|"window, less the<br/>settle reserve, used up"| w_elapsed["payment_window_elapsed"]
   verify --> fwd{"forward"}
+  fwd -->|"no head before the<br/>payment window, less<br/>the settle reserve"| w_elapsed
   fwd -->|"error"| u_unavail["upstream_unavailable"]
   fwd -->|"non-2xx"| u_refused["upstream_refused"]
   fwd --> settle{"settle"}
@@ -117,6 +119,12 @@ The details that matter:
   `revenue: "0"`. An `upstream_unavailable` or `upstream_refused` also carries the declared cost:
   whether a backend bills a failed or refused call depends on the backend and is not knowable from
   the gateway, and overstating a loss is the safer error than hiding one.
+- **`payment_window_elapsed` is a slow answer, not a dead one.** Too little of the payment's window
+  was left to settle, so the gateway gave up and charged nothing. `upstream_invoked` says which side
+  was slow. When it is `true`, the upstream's response head had not arrived; the event carries the
+  declared cost, since the model may have kept working, and a run of these means the window
+  (`OBOLUS_MAX_TIMEOUT_SECS`) is short for the model behind it. When it is `false`, verify alone
+  used up the window; the event carries `"0"`, and a run of these points at a slow facilitator.
 - **An unknown cost is `null`, never `"0"`.** Under the static rate no backend declares a cost, so
   every served request records `cost: null`. A zero would read as free. Revenue-versus-cost is
   computable only under the cost-plus rate, where every backend is required to declare a cost.
