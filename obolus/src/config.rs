@@ -14,7 +14,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::backends::Backends;
-use crate::x402::{validate_atomic_amount, PaymentRequirements, ResourceInfo, SCHEME_EXACT};
+use crate::x402::{
+    validate_atomic_amount, PaymentRequirements, ResourceInfo, UnsupportedTransfer, SCHEME_EXACT,
+};
 
 /// One per-chain entry in `OBOLUS_ACCEPTS`: network / asset / pay-to / price, and optionally the
 /// scheme's `extra`. The gateway-wide fields come from [`SharedOffer`].
@@ -116,6 +118,11 @@ pub enum ConfigError {
     /// [`EntryDefect::MissingTokenDomain`].
     #[error("OBOLUS_ACCEPTS entry for network {network:?}: {defect}")]
     MissingTokenDomain { network: String, defect: EntryDefect },
+
+    /// An entry's `extra` names a transfer method or payment flow this gateway does not run. See
+    /// [`EntryDefect::UnsupportedTransfer`].
+    #[error("OBOLUS_ACCEPTS entry for network {network:?}: {defect}")]
+    UnsupportedTransfer { network: String, defect: EntryDefect },
 }
 
 impl ConfigError {
@@ -129,6 +136,9 @@ impl ConfigError {
             EntryDefect::BadAmount(detail) => ConfigError::BadAmount { network, detail },
             defect @ EntryDefect::MissingTokenDomain { .. } => {
                 ConfigError::MissingTokenDomain { network, defect }
+            }
+            defect @ EntryDefect::UnsupportedTransfer { .. } => {
+                ConfigError::UnsupportedTransfer { network, defect }
             }
         }
     }
@@ -198,6 +208,11 @@ pub enum EntryDefect {
          {{\"name\":\"USDC\",\"version\":\"2\"}}); extra.{key} is missing or not a non-empty string"
     )]
     MissingTokenDomain { key: &'static str },
+
+    /// `extra` names a transfer method or payment flow — core spec §6.1's reserved keys — that this
+    /// gateway does not run. See [`PaymentRequirements::unsupported_transfer`] for the policy.
+    #[error("extra.{key} = {value} is not supported here: {supported}")]
+    UnsupportedTransfer { key: &'static str, value: String, supported: String },
 }
 
 /// The CAIP-2 namespace of EVM chains. Every option this gateway builds is `exact`, and on these
@@ -246,7 +261,7 @@ pub fn validated_option(
             }
         }
     }
-    Ok(PaymentRequirements {
+    let option = PaymentRequirements {
         scheme: SCHEME_EXACT.to_string(),
         network,
         amount,
@@ -254,7 +269,11 @@ pub fn validated_option(
         pay_to,
         max_timeout_seconds: shared.max_timeout_seconds,
         extra: extra.map(Value::Object),
-    })
+    };
+    if let Some(UnsupportedTransfer { key, value, supported }) = option.unsupported_transfer() {
+        return Err(EntryDefect::UnsupportedTransfer { key, value, supported });
+    }
+    Ok(option)
 }
 
 /// Parse an `OBOLUS_ACCEPTS` JSON array into the payment options a gateway advertises, folding in
@@ -1014,6 +1033,87 @@ mod tests {
             );
             assert!(parse_accepts(&raw, &shared()).is_ok(), "{network}");
         }
+    }
+
+    const TOKEN_DOMAIN: &str = r#""name":"USDC","version":"2""#;
+
+    #[test]
+    fn an_option_may_name_the_authorization_flow_and_its_networks_default_method() {
+        let options = evm_entry(Some(&format!(
+            r#"{{{TOKEN_DOMAIN},"assetTransferMethod":"eip3009","paymentFlow":"authorization"}}"#
+        )))
+        .unwrap();
+        assert_eq!(options[0].extra.as_ref().unwrap()["assetTransferMethod"], "eip3009");
+
+        let solana = r#"[{"network":"solana:test-genesis-not-real","asset":"a","payTo":"p","amount":"1","extra":{"assetTransferMethod":"default"}}]"#;
+        assert!(parse_accepts(solana, &shared()).is_ok());
+    }
+
+    #[test]
+    fn an_option_naming_another_payment_flow_is_rejected() {
+        for flow in [r#""upfront""#, r#""escrow""#, "null", "1"] {
+            let err = evm_entry(Some(&format!(r#"{{{TOKEN_DOMAIN},"paymentFlow":{flow}}}"#)))
+                .unwrap_err();
+            let ConfigError::UnsupportedTransfer { network, defect } = &err else {
+                panic!("paymentFlow {flow}: got {err:?}")
+            };
+            assert_eq!(network, "eip155:84532");
+            assert!(
+                matches!(defect, EntryDefect::UnsupportedTransfer { key: "paymentFlow", value, .. } if value == flow),
+                "paymentFlow {flow}: got {defect:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("extra.paymentFlow") && message.contains("\"authorization\""), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_option_naming_a_method_other_than_its_networks_default_is_rejected() {
+        for method in [r#""permit2""#, r#""default""#, "7"] {
+            let err = evm_entry(Some(&format!(r#"{{{TOKEN_DOMAIN},"assetTransferMethod":{method}}}"#)))
+                .unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::UnsupportedTransfer {
+                    defect: EntryDefect::UnsupportedTransfer { key: "assetTransferMethod", .. }, ..
+                }),
+                "assetTransferMethod {method}: got {err:?}"
+            );
+            assert!(err.to_string().contains("\"eip3009\""), "names the default: {err}");
+        }
+    }
+
+    #[test]
+    fn a_method_on_a_network_without_a_known_default_is_rejected() {
+        let raw = r#"[{"network":"test-network-not-a-real-caip2","asset":"a","payTo":"p","amount":"1","extra":{"assetTransferMethod":"eip3009"}}]"#;
+        let err = parse_accepts(raw, &shared()).unwrap_err();
+        assert!(matches!(err, ConfigError::UnsupportedTransfer { .. }), "got {err:?}");
+        assert!(err.to_string().contains("knows no default transfer method"), "{err}");
+    }
+
+    #[test]
+    fn the_single_chain_door_applies_the_same_transfer_rules() {
+        // `validated_option` is the seam both configuration forms go through; OBOLUS_EXTRA reaches it
+        // directly, without `parse_accepts`.
+        let extra = |raw: &str| parse_extra(Some(raw)).unwrap();
+        let option = |raw: &str| {
+            validated_option(
+                "eip155:84532".into(),
+                "0xAAA".into(),
+                "0xPAYA".into(),
+                "1000",
+                extra(raw),
+                &shared(),
+            )
+        };
+        assert!(option(&format!(r#"{{{TOKEN_DOMAIN},"paymentFlow":"authorization"}}"#)).is_ok());
+        assert!(matches!(
+            option(&format!(r#"{{{TOKEN_DOMAIN},"paymentFlow":"upfront"}}"#)),
+            Err(EntryDefect::UnsupportedTransfer { key: "paymentFlow", .. })
+        ));
+        assert!(matches!(
+            option(&format!(r#"{{{TOKEN_DOMAIN},"assetTransferMethod":"permit2"}}"#)),
+            Err(EntryDefect::UnsupportedTransfer { key: "assetTransferMethod", .. })
+        ));
     }
 
     #[test]

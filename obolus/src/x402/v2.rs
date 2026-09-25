@@ -48,6 +48,59 @@ pub const HEADER_PAYMENT_SIGNATURE: &str = "PAYMENT-SIGNATURE";
 /// The header a settled response carries its receipt in: a base64 [`SettlementReceipt`].
 pub const HEADER_PAYMENT_RESPONSE: &str = "PAYMENT-RESPONSE";
 
+/// The `extra` key naming **how** value moves — `eip3009` or `permit2` on EVM `exact`, say. Core spec
+/// §6.1 reserves it, so it is interpreted here rather than passed through as scheme data.
+pub const EXTRA_ASSET_TRANSFER_METHOD: &str = "assetTransferMethod";
+
+/// The `extra` key naming **when** settlement happens relative to serving the request. Reserved by
+/// core spec §6.1, like [`EXTRA_ASSET_TRANSFER_METHOD`].
+pub const EXTRA_PAYMENT_FLOW: &str = "paymentFlow";
+
+/// The one payment flow obolus runs: verify, serve, then settle. The spec's other flows (`upfront`,
+/// `escrow`) settle before the resource is served, which this gateway never does.
+pub const PAYMENT_FLOW_AUTHORIZATION: &str = "authorization";
+
+/// The transfer method `scheme` uses on `network` when `extra` names none — the mechanism's default,
+/// as the reference declares it for `exact` (`@x402/evm` 2.27.0: `eip3009`; `@x402/svm` 2.27.0:
+/// `default`) — or `None` for a mechanism this module holds no such fact for. The default is per
+/// mechanism, not per network: EVM `upto` defaults to `permit2`, where EVM `exact` does not.
+pub fn default_asset_transfer_method(scheme: &str, network: &str) -> Option<&'static str> {
+    if scheme != super::SCHEME_EXACT {
+        None
+    } else if network.starts_with("eip155:") {
+        Some("eip3009")
+    } else if network.starts_with("solana:") {
+        Some("default")
+    } else {
+        None
+    }
+}
+
+/// The `extra` keys a scheme lets a client fill in differently from the offer, which the reference
+/// drops from both sides before comparing (`dynamicExtraFields`). `@x402/svm` 2.27.0 declares these
+/// two for `exact` — a recent blockhash goes stale in about a minute, so the client supplies its own;
+/// `@x402/evm` 2.27.0 declares none.
+fn dynamic_extra_fields(scheme: &str, network: &str) -> &'static [&'static str] {
+    if scheme == super::SCHEME_EXACT && network.starts_with("solana:") {
+        &["recentBlockhash", "lastValidBlockHeight"]
+    } else {
+        &[]
+    }
+}
+
+/// `extra` with `fields` removed, when it is an object; anything else as it is.
+fn without_fields(extra: Option<Value>, fields: &[&str]) -> Option<Value> {
+    match extra {
+        Some(Value::Object(mut extra)) => {
+            for field in fields {
+                extra.remove(*field);
+            }
+            Some(Value::Object(extra))
+        }
+        other => other,
+    }
+}
+
 /// What is being paid for — stated once per challenge, where v1 repeated it on every option.
 ///
 /// The spec also defines optional `serviceName`, `tags` and `iconUrl` for discovery. Obolus
@@ -101,10 +154,9 @@ impl PaymentRequirements {
     /// [`PaymentPayload::accepted`]: re-typing drops unknown fields, and a field obolus does not
     /// know is precisely one this option does not contain.
     ///
-    /// One step of the reference is not ported: it first removes the scheme's `dynamicExtraFields`
-    /// — `extra` keys the client is allowed to fill in differently — from both sides. `@x402/evm`
-    /// 2.27.0 declares none for `exact`, so EVM `exact` matches exactly as the reference does. A
-    /// scheme that declares some would have its payments refused here until obolus learns its list.
+    /// Like the reference, it first drops the scheme's `dynamicExtraFields` — `extra` keys the client
+    /// is allowed to fill in differently — from both sides; see [`dynamic_extra_fields`] for the
+    /// lists it knows. A scheme whose list it lacks would have such payments refused here.
     pub fn is_accepted_by(&self, payment: &PaymentPayload) -> bool {
         let Some(accepted) = payment.received.get("accepted").and_then(Value::as_object) else {
             return false;
@@ -113,9 +165,10 @@ impl PaymentRequirements {
         let Value::Object(mut offered) = offered else {
             unreachable!("PaymentRequirements serializes to a JSON object")
         };
-        let offered_extra = offered.remove("extra");
+        let dynamic = dynamic_extra_fields(&self.scheme, &self.network);
+        let offered_extra = without_fields(offered.remove("extra"), dynamic);
         let mut accepted = accepted.clone();
-        let accepted_extra = accepted.remove("extra");
+        let accepted_extra = without_fields(accepted.remove("extra"), dynamic);
         if offered != accepted {
             return false;
         }
@@ -126,6 +179,105 @@ impl PaymentRequirements {
             }
         }
     }
+
+    /// Why `payment` names a transfer method or payment flow other than the ones this option
+    /// resolves to, or `None` when it does not.
+    ///
+    /// Core spec §6.1 reserves `extra.assetTransferMethod` and `extra.paymentFlow`, and says a
+    /// resource server MUST reject combinations it does not support. [`is_accepted_by`] lets a
+    /// client add `extra` keys, so it would accept a client that adds either of these to an option
+    /// naming neither. This refuses that, unless the added value is what the option resolves to
+    /// anyway: an explicit `"assetTransferMethod": "eip3009"` on EVM, as the EVM `exact` spec's own
+    /// example sends, still agrees.
+    ///
+    /// Stricter than the reference, which resolves the flow from the server's option alone and never
+    /// looks at what the client echoed. That costs a conforming client nothing: the reference client
+    /// echoes the option it chose verbatim. It is also not a guard on how the facilitator settles —
+    /// `@x402/evm` 2.27.0 chooses the method from the shape of the payload, which obolus never opens.
+    ///
+    /// [`is_accepted_by`]: Self::is_accepted_by
+    pub fn transfer_disagreement(&self, payment: &PaymentPayload) -> Option<String> {
+        let ours = |key: &str| self.extra.as_ref().and_then(|extra| extra.get(key));
+        let method = ours(EXTRA_ASSET_TRANSFER_METHOD)
+            .and_then(Value::as_str)
+            .or_else(|| default_asset_transfer_method(&self.scheme, &self.network));
+        let flow = ours(EXTRA_PAYMENT_FLOW).and_then(Value::as_str).unwrap_or(PAYMENT_FLOW_AUTHORIZATION);
+
+        let theirs = payment.received.get("accepted").and_then(|accepted| accepted.get("extra"));
+        for (key, resolved) in [(EXTRA_ASSET_TRANSFER_METHOD, method), (EXTRA_PAYMENT_FLOW, Some(flow))] {
+            let Some(named) = theirs.and_then(|extra| extra.get(key)) else { continue };
+            if named.as_str().is_none() || named.as_str() != resolved {
+                let expected = match resolved {
+                    Some(resolved) => format!("this option resolves to {resolved:?}"),
+                    None => "this option names none, and obolus knows no default for its scheme and \
+                             network"
+                        .into(),
+                };
+                return Some(format!("payment names extra.{key} = {named}, but {expected}"));
+            }
+        }
+        None
+    }
+
+    /// The transfer method or payment flow this option names that obolus does not run, or `None`
+    /// when it names neither or only what obolus runs.
+    ///
+    /// Obolus runs the `authorization` flow — verify, serve, then settle — and only the network's
+    /// default method. Advertising anything else would promise a way of paying that the gateway does
+    /// not honour: it would still verify, serve and settle, whatever the option said. Stricter than
+    /// the reference, which accepts any method its mechanism supports (`permit2` on EVM, say); the
+    /// default is the only method this gateway and its devseller have been exercised against.
+    ///
+    /// Held twice: the configuration check reports it against the entry or variable it came from,
+    /// and [`crate::gateway::Gateway::new`] refuses it for a caller that builds options directly.
+    /// Only `exact`'s defaults are known here, so this cannot judge an option of another scheme that
+    /// names no method; `Gateway::new` refuses every scheme but `exact` for that reason.
+    pub fn unsupported_transfer(&self) -> Option<UnsupportedTransfer> {
+        let named = |key: &str| self.extra.as_ref().and_then(|extra| extra.get(key));
+        if let Some(flow) = named(EXTRA_PAYMENT_FLOW) {
+            if flow.as_str() != Some(PAYMENT_FLOW_AUTHORIZATION) {
+                return Some(UnsupportedTransfer {
+                    key: EXTRA_PAYMENT_FLOW,
+                    value: flow.to_string(),
+                    supported: format!(
+                        "the only payment flow here is {PAYMENT_FLOW_AUTHORIZATION:?} (verify, serve, \
+                         then settle); leave it out or set that"
+                    ),
+                });
+            }
+        }
+        if let Some(method) = named(EXTRA_ASSET_TRANSFER_METHOD) {
+            let default = default_asset_transfer_method(&self.scheme, &self.network);
+            if method.as_str().is_none() || method.as_str() != default {
+                let supported = match default {
+                    Some(default) => format!(
+                        "the only transfer method here is the {} default on this network, \
+                         {default:?}; leave it out or set that",
+                        self.scheme
+                    ),
+                    None => "obolus knows no default transfer method for this scheme and network, \
+                             so leave it out"
+                        .to_string(),
+                };
+                return Some(UnsupportedTransfer {
+                    key: EXTRA_ASSET_TRANSFER_METHOD,
+                    value: method.to_string(),
+                    supported,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// An option's `extra` names a transfer method or payment flow obolus does not run — see
+/// [`PaymentRequirements::unsupported_transfer`]. `value` is the JSON as configured.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error("extra.{key} = {value} is not supported here: {supported}")]
+pub struct UnsupportedTransfer {
+    pub key: &'static str,
+    pub value: String,
+    pub supported: String,
 }
 
 /// Does `actual` contain everything in `expected`? Objects compare key by key, recursively, with
@@ -180,8 +332,12 @@ impl PaymentRequired {
 /// "As decoded" is JSON-exact, not byte-exact: key order and whitespace are not kept, and nothing
 /// downstream of a JSON parser can tell the difference.
 ///
-/// Forwarding everything includes a client's `extensions`, although obolus advertises none; they
-/// reach the facilitator unexamined until refusing unadvertised ones lands (#72).
+/// Forwarding everything includes a client's `extensions`, although obolus advertises none. The
+/// reference server does the same: its `validateExtensions` (`@x402/core` 2.27.0) compares the
+/// extensions a server advertised, and the reference client adds extensions of its own, so refusing
+/// unadvertised ones would refuse conforming clients. Its one check on an unadvertised extension —
+/// a field only the server may set — obolus makes too: see
+/// [`server_owned_extension_field`](Self::server_owned_extension_field).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PaymentPayload {
     accepted: PaymentRequirements,
@@ -224,7 +380,32 @@ impl PaymentPayload {
     pub fn as_received(&self) -> &Value {
         &self.received
     }
+
+    /// The extension field this payment sets that only a server may set — as
+    /// `"<extension>.info.<field>"` — or `None`.
+    ///
+    /// The reference refuses a client that sets one of these to anything the server did not
+    /// advertise (`SERVER_OWNED_INFO_FIELDS` and `serverOwnedInfoFieldsMatch`, `@x402/core` 2.27.0).
+    /// Obolus advertises no extensions, so any such field present is one it never set. An
+    /// extension's info is its `info` member when it has one, else the extension value itself, as
+    /// the reference reads it.
+    pub fn server_owned_extension_field(&self) -> Option<String> {
+        let extensions = self.received.get("extensions")?.as_object()?;
+        for (extension, fields) in SERVER_OWNED_EXTENSION_FIELDS {
+            let Some(value) = extensions.get(*extension) else { continue };
+            let info = value.get("info").unwrap_or(value);
+            let Some(info) = info.as_object() else { continue };
+            if let Some(field) = fields.iter().find(|field| info.contains_key(**field)) {
+                return Some(format!("{extension}.info.{field}"));
+            }
+        }
+        None
+    }
 }
+
+/// Extension `info` fields only a server may set, by extension — `SERVER_OWNED_INFO_FIELDS` in
+/// `@x402/core` 2.27.0.
+const SERVER_OWNED_EXTENSION_FIELDS: &[(&str, &[&str])] = &[("builder-code", &["a"])];
 
 impl Serialize for PaymentPayload {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -659,5 +840,167 @@ mod tests {
         assert!(json["accepts"][0].get("extra").is_none());
         assert_eq!(json["x402Version"], json!(2));
         assert_eq!(challenge.with_error("expired").error.as_deref(), Some("expired"));
+    }
+
+    /// Obviously-synthetic networks in the two other namespaces the transfer rules know about.
+    const FIXTURE_SOLANA: &str = "solana:test-genesis-not-real";
+    const FIXTURE_UNKNOWN: &str = "test-namespace:not-a-real-caip2";
+
+    /// The spec's option moved to `network`, and a payment that accepted it with `edit` applied.
+    fn on_network(network: &str, edit: impl FnOnce(&mut Value)) -> (PaymentRequirements, PaymentPayload) {
+        let mut option = offered();
+        option.network = network.to_string();
+        let payment = paying(|accepted| {
+            accepted["network"] = json!(network);
+            edit(accepted);
+        });
+        (option, payment)
+    }
+
+    #[test]
+    fn a_payment_naming_no_method_or_flow_agrees_with_any_option() {
+        for network in ["eip155:84532", FIXTURE_SOLANA, FIXTURE_UNKNOWN] {
+            let (option, payment) = on_network(network, |_| {});
+            assert_eq!(option.transfer_disagreement(&payment), None, "{network}");
+        }
+    }
+
+    #[test]
+    fn naming_the_method_an_option_resolves_to_agrees() {
+        // The EVM `exact` spec's own example sends `"eip3009"` explicitly; it must not be refused
+        // for spelling out the default.
+        let payment = paying(|accepted| accepted["extra"]["assetTransferMethod"] = json!("eip3009"));
+        assert_eq!(offered().transfer_disagreement(&payment), None);
+
+        let (option, payment) =
+            on_network(FIXTURE_SOLANA, |accepted| accepted["extra"]["assetTransferMethod"] = json!("default"));
+        assert_eq!(option.transfer_disagreement(&payment), None);
+
+        let mut explicit = offered();
+        explicit.extra.as_mut().unwrap()["assetTransferMethod"] = json!("eip3009");
+        let payment = paying(|accepted| accepted["extra"]["assetTransferMethod"] = json!("eip3009"));
+        assert_eq!(explicit.transfer_disagreement(&payment), None);
+    }
+
+    #[test]
+    fn naming_another_method_is_refused_naming_both() {
+        let payment = paying(|accepted| accepted["extra"]["assetTransferMethod"] = json!("permit2"));
+        let refusal = offered().transfer_disagreement(&payment).expect("permit2 on an eip3009 option");
+        assert!(refusal.contains("assetTransferMethod") && refusal.contains("permit2"), "{refusal}");
+        assert!(refusal.contains("\"eip3009\""), "names what the option resolves to: {refusal}");
+
+        let (option, payment) =
+            on_network(FIXTURE_SOLANA, |accepted| accepted["extra"]["assetTransferMethod"] = json!("eip3009"));
+        assert!(option.transfer_disagreement(&payment).is_some(), "an EVM method on Solana");
+    }
+
+    #[test]
+    fn a_method_on_a_network_with_no_known_default_is_refused() {
+        // Nothing to agree with: obolus holds no default for the namespace, and the option names none.
+        let (option, payment) =
+            on_network(FIXTURE_UNKNOWN, |accepted| accepted["extra"]["assetTransferMethod"] = json!("eip3009"));
+        let refusal = option.transfer_disagreement(&payment).expect("no method to agree with");
+        assert!(refusal.contains("names none"), "{refusal}");
+    }
+
+    #[test]
+    fn only_the_authorization_flow_agrees() {
+        let authorization = paying(|accepted| accepted["extra"]["paymentFlow"] = json!("authorization"));
+        assert_eq!(offered().transfer_disagreement(&authorization), None);
+
+        for flow in ["upfront", "escrow"] {
+            let payment = paying(|accepted| accepted["extra"]["paymentFlow"] = json!(flow));
+            let refusal = offered().transfer_disagreement(&payment).unwrap_or_else(|| panic!("{flow}"));
+            assert!(refusal.contains("paymentFlow") && refusal.contains(flow), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_method_or_flow_that_is_not_a_string_is_refused() {
+        for key in [EXTRA_ASSET_TRANSFER_METHOD, EXTRA_PAYMENT_FLOW] {
+            for value in [json!(null), json!(1), json!(["eip3009"]), json!({ "name": "eip3009" })] {
+                let payment = paying(|accepted| accepted["extra"][key] = value.clone());
+                assert!(offered().transfer_disagreement(&payment).is_some(), "{key} = {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn solana_lets_the_client_supply_its_own_blockhash() {
+        // `@x402/svm` declares these dynamic: the client fetches a fresh blockhash, so its value
+        // differs from any the offer carried, and the reference still matches the payment.
+        let offer_extra = json!({ "feePayer": "TEST-FEE-PAYER", "recentBlockhash": "offer-hash", "lastValidBlockHeight": 1 });
+        let (mut option, payment) = on_network(FIXTURE_SOLANA, |accepted| {
+            accepted["extra"] =
+                json!({ "feePayer": "TEST-FEE-PAYER", "recentBlockhash": "client-hash", "lastValidBlockHeight": 2 });
+        });
+        option.extra = Some(offer_extra.clone());
+        assert!(option.is_accepted_by(&payment));
+
+        let (mut option, payment) = on_network(FIXTURE_SOLANA, |accepted| {
+            accepted["extra"] = json!({ "feePayer": "ANOTHER-FEE-PAYER", "recentBlockhash": "offer-hash" });
+        });
+        option.extra = Some(offer_extra);
+        assert!(!option.is_accepted_by(&payment), "only the declared fields are dynamic");
+    }
+
+    #[test]
+    fn the_default_transfer_method_is_per_scheme_not_per_network() {
+        assert_eq!(default_asset_transfer_method("exact", "eip155:84532"), Some("eip3009"));
+        assert_eq!(default_asset_transfer_method("exact", FIXTURE_SOLANA), Some("default"));
+        // EVM `upto` defaults to `permit2` in the reference; obolus holds no fact for it, and must not
+        // lend it `exact`'s.
+        assert_eq!(default_asset_transfer_method("upto", "eip155:84532"), None);
+
+        let mut upto = offered();
+        upto.scheme = "upto".to_string();
+        let payment = paying(|accepted| {
+            accepted["scheme"] = json!("upto");
+            accepted["extra"]["assetTransferMethod"] = json!("eip3009");
+        });
+        let refusal = upto.transfer_disagreement(&payment).expect("no upto default to agree with");
+        assert!(refusal.contains("no default for its scheme"), "{refusal}");
+
+        upto.extra.as_mut().unwrap()["assetTransferMethod"] = json!("permit2");
+        let refusal = upto.unsupported_transfer().expect("no upto method is known here");
+        assert!(!refusal.to_string().contains("eip3009"), "must not cite exact's default: {refusal}");
+    }
+
+    /// The spec's payment carrying `extensions`.
+    fn with_extensions(extensions: Value) -> PaymentPayload {
+        let mut payment = spec_payment();
+        payment["extensions"] = extensions;
+        decode_payment(&encoded(payment)).unwrap()
+    }
+
+    #[test]
+    fn a_server_owned_extension_field_is_found_in_info_or_the_bare_value() {
+        let in_info = with_extensions(json!({ "builder-code": { "info": { "a": "someone-else" } } }));
+        assert_eq!(in_info.server_owned_extension_field().as_deref(), Some("builder-code.info.a"));
+        let bare = with_extensions(json!({ "builder-code": { "a": null } }));
+        assert_eq!(bare.server_owned_extension_field().as_deref(), Some("builder-code.info.a"));
+    }
+
+    #[test]
+    fn extensions_without_a_server_owned_field_are_left_alone() {
+        assert_eq!(paying(|_| {}).server_owned_extension_field(), None, "no extensions at all");
+        for extensions in [
+            json!({ "builder-code": { "info": { "b": "client-set" } } }),
+            json!({ "builder-code": { "info": null } }),
+            json!({ "builder-code": "not-an-object" }),
+            json!({ "some-extension": { "info": { "a": "only builder-code owns a" } } }),
+            json!(["not", "an", "object"]),
+        ] {
+            let payment = with_extensions(extensions.clone());
+            assert_eq!(payment.server_owned_extension_field(), None, "{extensions}");
+        }
+    }
+
+    #[test]
+    fn evm_declares_no_dynamic_fields() {
+        let mut option = offered();
+        option.extra.as_mut().unwrap()["recentBlockhash"] = json!("offer-hash");
+        let payment = paying(|accepted| accepted["extra"]["recentBlockhash"] = json!("client-hash"));
+        assert!(!option.is_accepted_by(&payment));
     }
 }

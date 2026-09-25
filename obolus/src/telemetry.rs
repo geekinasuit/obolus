@@ -109,8 +109,10 @@ pub enum Outcome {
     /// A payment header was present but not a decodable x402 payment.
     PaymentMalformed,
     /// The option the payment accepted is not one this gateway offers as given — a different
-    /// scheme, network, asset, pay-to, timeout or `extra`, or a price the gateway no longer quotes.
-    /// The client was re-challenged; the line does not say which field differed.
+    /// scheme, network, asset, pay-to, timeout or `extra`, a price the gateway no longer quotes, or
+    /// a transfer method or payment flow the offered option does not resolve to, or an extension
+    /// field only the server may set. The client was
+    /// re-challenged; the line does not say which field differed.
     OptionUnmatched,
     /// The facilitator evaluated the payment and refused it.
     VerifyRejected,

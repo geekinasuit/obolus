@@ -62,6 +62,7 @@ use crate::upstream::{Upstream, UpstreamResponse};
 use crate::arming::ArmedRequirements;
 use crate::x402::{
     self, PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo, SettlementReceipt,
+    UnsupportedTransfer,
 };
 
 /// Why a [`Gateway`] could not be built from a set of payment options.
@@ -87,6 +88,21 @@ pub enum GatewayError {
          base58 genesis hash is case-sensitive), so canonicalize your ids before configuring them"
     )]
     DuplicateOption { scheme: String, network: String },
+
+    /// An option is for a scheme other than `exact`, the only one this gateway runs. Another scheme
+    /// brings its own transfer methods and defaults (EVM `upto` defaults to `permit2`), none of which
+    /// the transfer checks here know, so an option naming none would pass them unexamined.
+    #[error(
+        "payment option for network {network:?} uses scheme {scheme:?}, but obolus runs only \
+         {exact:?}",
+        exact = x402::SCHEME_EXACT
+    )]
+    UnsupportedScheme { scheme: String, network: String },
+
+    /// An option names a transfer method or payment flow this gateway does not run. It would still
+    /// verify, serve and settle, whatever the option promised, so the option is refused instead.
+    #[error("payment option for network {network:?}: {refusal}")]
+    UnsupportedTransfer { network: String, refusal: UnsupportedTransfer },
 }
 
 /// A payment-gated route in front of a registry of upstream backends.
@@ -115,15 +131,16 @@ pub struct Gateway<F: Facilitator> {
 }
 
 impl<F: Facilitator> Gateway<F> {
-    /// Build a gateway advertising `requirements` for `resource`. Fails if the list is empty, or if
-    /// two entries share a `(scheme, network)` — see [`GatewayError`].
+    /// Build a gateway advertising `requirements` for `resource`. Fails if the list is empty, if two
+    /// entries share a `(scheme, network)`, or if one is not `exact` or names a transfer method or
+    /// payment flow this gateway does not run — see [`GatewayError`].
     ///
     /// `resource` has no default: it is the address a payer is told they are paying for, and only
     /// the caller knows where this gateway can be reached.
     ///
-    /// The uniqueness invariant is enforced *here*, at the type that later hands one of these
-    /// requirements to `settle`, rather than only at the config boundary — so it holds for a future
-    /// caller that builds a `Gateway` directly too.
+    /// The uniqueness and transfer invariants are enforced *here*, at the type that later hands one
+    /// of these requirements to `settle`, rather than only at the config boundary — so they hold for
+    /// a caller that builds a `Gateway` directly too.
     ///
     /// The arming invariant is enforced by the *parameter type*: an [`ArmedRequirements`] can only
     /// be obtained from [`arming::check_arming`](crate::arming::check_arming), so every option set
@@ -152,6 +169,17 @@ impl<F: Facilitator> Gateway<F> {
                         network: a.network.clone(),
                     });
                 }
+            }
+        }
+        for option in &requirements {
+            if option.scheme != x402::SCHEME_EXACT {
+                return Err(GatewayError::UnsupportedScheme {
+                    scheme: option.scheme.clone(),
+                    network: option.network.clone(),
+                });
+            }
+            if let Some(refusal) = option.unsupported_transfer() {
+                return Err(GatewayError::UnsupportedTransfer { network: option.network.clone(), refusal });
             }
         }
         Ok(Self {
@@ -376,6 +404,20 @@ async fn paid_completion<F: Facilitator>(
         };
         return (challenge(resource, &priced, Some(error)), Outcome::OptionUnmatched);
     };
+    // The option matched, but a client may add `extra` keys — including the two §6.1 reserves for
+    // how and when a payment settles. One naming a method or flow this option does not resolve to
+    // is paying for something this gateway does not run, so it goes no further than here.
+    if let Some(disagreement) = requirements.transfer_disagreement(&payment) {
+        let error = format!("{disagreement}; accept the option in this challenge exactly as given");
+        return (challenge(resource, &priced, Some(error)), Outcome::OptionUnmatched);
+    }
+    if let Some(field) = payment.server_owned_extension_field() {
+        let error = format!(
+            "payment sets extensions.{field}, which only the server may set, and this gateway \
+             advertises no extensions"
+        );
+        return (challenge(resource, &priced, Some(error)), Outcome::OptionUnmatched);
+    }
     trace.paid = Some(Offer::from(requirements));
 
     match gateway.facilitator.verify(&payment, requirements).await {
@@ -951,6 +993,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_payment_naming_a_flow_this_option_does_not_run_is_refused_before_the_facilitator() {
+        // The option names no flow, so the client's added `paymentFlow` passes the extra-subset
+        // match; it is the transfer check that refuses it.
+        let upfront = paying(PaymentRequirements {
+            extra: Some(serde_json::json!({ "paymentFlow": "upfront" })),
+            ..requirements()
+        });
+        let (app, calls) = app_with(FakeFacilitator::accepting(), FakeUpstream::streaming());
+        let (status, headers, body) =
+            send(app, completion_request(Some(&x402::encode_payment(&upfront)))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let error = challenge_error(&body).unwrap();
+        assert!(error.contains("extra.paymentFlow") && error.contains("upfront"), "{error}");
+        assert_challenge_headers(&headers, &body);
+        assert_eq!((calls.verifies(), calls.settles()), (0, 0), "the facilitator never sees it");
+
+        let request = completion_request(Some(&x402::encode_payment(&upfront)));
+        let event = recorded(FakeFacilitator::accepting(), FakeUpstream::streaming(), request).await;
+        assert_eq!(event.outcome, Outcome::OptionUnmatched);
+        assert_eq!(event.paid, None);
+        assert!(!event.upstream_invoked);
+    }
+
+    #[tokio::test]
+    async fn a_payment_setting_a_server_owned_extension_field_is_refused_before_the_facilitator() {
+        let mut sent = serde_json::to_value(payment()).unwrap();
+        sent["extensions"] = serde_json::json!({ "builder-code": { "info": { "a": "not-ours" } } });
+        let header = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(sent.to_string())
+        };
+        let (app, calls) = app_with(FakeFacilitator::accepting(), FakeUpstream::streaming());
+        let (status, headers, body) = send(app, completion_request(Some(&header))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        let error = challenge_error(&body).unwrap();
+        assert!(error.contains("extensions.builder-code.info.a"), "{error}");
+        assert_challenge_headers(&headers, &body);
+        assert_eq!((calls.verifies(), calls.settles()), (0, 0), "the facilitator never sees it");
+    }
+
+    #[tokio::test]
     async fn a_payment_at_a_price_no_longer_quoted_is_told_the_price_changed() {
         // Everything matches but the amount — the client paid a price the gateway has since moved
         // off. It is re-challenged, told so, and nothing is verified or charged.
@@ -1350,6 +1433,71 @@ mod tests {
         .err()
         .expect("duplicate (scheme, network) must be rejected");
         assert!(matches!(err, GatewayError::DuplicateOption { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn construction_refuses_an_option_naming_a_flow_or_method_this_gateway_does_not_run() {
+        // The configuration doors refuse these too, but a caller building options directly never
+        // passes through them. An option promising `upfront` would still be verified, served and
+        // settled — so it is refused here, where every gateway is built.
+        for (key, value) in [("paymentFlow", "upfront"), ("assetTransferMethod", "permit2")] {
+            let option = PaymentRequirements {
+                extra: Some(serde_json::json!({ key: value })),
+                ..requirements()
+            };
+            let err = Gateway::new(
+                FakeFacilitator::accepting(),
+                one_backend(FakeUpstream::streaming()),
+                resource(),
+                // Second, behind a clean option: every option is checked, not only the first.
+                armed(vec![
+                    PaymentRequirements {
+                        network: "test-network-b-not-a-real-caip2".to_string(),
+                        ..requirements()
+                    },
+                    option,
+                ]),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("extra.{key} = {value:?} must be refused"));
+            assert!(
+                matches!(&err, GatewayError::UnsupportedTransfer { refusal, .. } if refusal.key == key),
+                "got {err:?}"
+            );
+            assert!(err.to_string().contains(&format!("extra.{key} = \"{value}\"")), "{err}");
+        }
+        let authorization = PaymentRequirements {
+            extra: Some(serde_json::json!({ "paymentFlow": "authorization" })),
+            ..requirements()
+        };
+        let built = Gateway::new(
+            FakeFacilitator::accepting(),
+            one_backend(FakeUpstream::streaming()),
+            resource(),
+            armed(vec![authorization]),
+        );
+        assert!(built.is_ok(), "the flow obolus runs is accepted");
+    }
+
+    #[test]
+    fn construction_refuses_a_scheme_other_than_exact_even_naming_no_method() {
+        // EVM `upto` resolves an unnamed method to `permit2` in the reference; the transfer checks
+        // know no `upto` default, so only the scheme itself can stop it.
+        let upto = PaymentRequirements { scheme: "upto".to_string(), ..requirements() };
+        assert_eq!(upto.unsupported_transfer(), None, "names no method, so passes that check");
+        let err = Gateway::new(
+            FakeFacilitator::accepting(),
+            one_backend(FakeUpstream::streaming()),
+            resource(),
+            armed(vec![upto]),
+        )
+        .err()
+        .expect("a non-exact scheme must be refused");
+        assert!(
+            matches!(&err, GatewayError::UnsupportedScheme { scheme, .. } if scheme == "upto"),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("obolus runs only \"exact\""), "{err}");
     }
 
     // ---- the access branch (#33) ----

@@ -334,6 +334,19 @@ reference client refuses to sign without them. Obolus requires both, as non-empt
 `eip155:` entry, and refuses to start without them. Whether the values are *right* for the token
 contract is not something Obolus can check; a wrong domain boots and fails at the facilitator.
 
+The Solana entry above is not payable as written: x402's Solana `exact` client also needs
+`extra.feePayer`, the facilitator's fee-paying account, which Obolus neither fills in nor requires yet
+([#81](https://github.com/geekinasuit/obolus/issues/81)).
+
+Two `extra` keys are reserved by the x402 spec rather than passed through as scheme data:
+`assetTransferMethod` (how value moves) and `paymentFlow` (when settlement happens). Obolus advertises
+only `exact`'s default method on the network — `eip3009` on `eip155:`, `default` on `solana:` — and only the
+`authorization` flow (verify, serve, then settle). That governs what is offered, not how a payment
+settles: on EVM, x402's facilitator picks the method from the shape of the payload, which Obolus does
+not open. What Obolus checks is the option a client says it accepted. An `OBOLUS_ACCEPTS` entry or `OBOLUS_EXTRA` may
+leave either out or name exactly that; anything else is refused at startup, and a payment that names
+anything else is re-challenged.
+
 `network` must be the **CAIP-2** `namespace:reference` id (Base Sepolia and Solana Devnet above), not
 an x402 short name like `base-sepolia`. The arming guard compares byte-exactly against a CAIP-2
 allowlist, so a short name refuses to boot even when it names a genuine testnet — the refusal
@@ -364,8 +377,8 @@ Two rules the startup checks enforce:
 empty `network` / `asset` / `payTo` (network is the match key, so an empty one can never match a real
 payment and would 402 forever; an empty asset or pay-to would advertise an option that sends money
 nowhere), a missing `amount` or one that is not a plain integer, the v1 key `maxAmountRequired`,
-an `extra` that is not a JSON object, or an `eip155:` entry whose `extra` lacks the token's `name` or
-`version` aborts the launch rather than advertising an unpayable or wrong challenge. Setting
+an `extra` that is not a JSON object, an `eip155:` entry whose `extra` lacks the token's `name` or
+`version`, or an `extra` naming a transfer method or payment flow Obolus does not run aborts the launch rather than advertising an unpayable or wrong challenge. Setting
 `OBOLUS_ACCEPTS` **together with** any of the single-chain `OBOLUS_NETWORK` / `OBOLUS_ASSET` /
 `OBOLUS_PAY_TO` / `OBOLUS_PRICE` / `OBOLUS_EXTRA` vars is likewise a
 startup error, naming the ignored vars — a gateway that silently advertises a different network than
