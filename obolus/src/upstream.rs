@@ -73,6 +73,8 @@ pub struct FakeUpstream {
     error: Option<String>,
     /// Set to fail the body *after* the head has been returned.
     midstream_error: Option<String>,
+    /// Set to never return a head at all: `forward` counts the call and then pends forever.
+    hangs: bool,
     /// How many times `forward` was called.
     ///
     /// The access tests need "we did not serve" as a positive assertion. A 402 alone cannot
@@ -112,6 +114,7 @@ impl FakeUpstream {
             ],
             error: None,
             midstream_error: None,
+            hangs: false,
             forwards: UpstreamCalls::default(),
         }
     }
@@ -135,6 +138,7 @@ impl FakeUpstream {
             chunks: vec!["{\"error\":\"upstream refused\"}"],
             error: None,
             midstream_error: None,
+            hangs: false,
             forwards: UpstreamCalls::default(),
         }
     }
@@ -147,8 +151,15 @@ impl FakeUpstream {
             chunks: vec![],
             error: Some(reason.into()),
             midstream_error: None,
+            hangs: false,
             forwards: UpstreamCalls::default(),
         }
+    }
+
+    /// The upstream was reached and never answered: no head, no error, ever. The shape of a
+    /// non-streaming generation that outlasts everything waiting on it.
+    pub fn hanging() -> Self {
+        Self { hangs: true, ..Self::streaming() }
     }
 
     /// A `200 OK` head, then a body that dies partway through.
@@ -165,6 +176,7 @@ impl FakeUpstream {
             chunks: vec!["data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n"],
             error: None,
             midstream_error: Some("upstream closed the connection".to_string()),
+            hangs: false,
             forwards: UpstreamCalls::default(),
         }
     }
@@ -185,6 +197,9 @@ impl Upstream for FakeUpstream {
             // Counted before the error arm: reaching an upstream that then refuses is still reaching
             // it, and the access tests care about arrival, not outcome.
             self.forwards.0.fetch_add(1, Ordering::SeqCst);
+            if self.hangs {
+                std::future::pending::<()>().await;
+            }
             if let Some(reason) = &self.error {
                 return Err(UpstreamError(reason.clone()));
             }

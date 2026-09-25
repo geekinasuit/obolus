@@ -214,6 +214,11 @@ The gateway has no refund or retry path for that today; it is the refund / failu
 under [planned work](#what-is-planned-and-where-it-goes) and in [`pricing.md`](pricing.md), and a
 real gap to weigh before running this in production.
 
+The payment also expires on its own clock, so the wait for the upstream's `200` is bounded by the
+payment window (`maxTimeoutSeconds`, counted from the request's arrival) less a reserve kept for
+settling. An upstream that has not answered by then gets a `504`, and the payment is not settled.
+Serving it would give the work away against an authorization that could no longer be settled.
+
 ```mermaid
 sequenceDiagram
   participant C as Client
@@ -231,7 +236,7 @@ sequenceDiagram
   G->>F: verify(payment, requirement)
   F-->>G: ok
   G->>U: forward to routed backend
-  U-->>G: 200 OK (body not yet streamed)
+  U-->>G: 200 OK (body not yet streamed),<br/>inside the payment window less the settle reserve
   G->>F: settle(payment)
   F-->>G: receipt
   G->>G: record one telemetry event

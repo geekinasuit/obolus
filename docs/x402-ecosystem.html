@@ -411,7 +411,7 @@ on Solana, "payload" is { "transaction": "&lt;base64, partially signed&gt;" }</d
           <tr><th>accepts[].amount</th><td class="opt">required</td><td>The price, in atomic token units — never a decimal. v1 called it <code>maxAmountRequired</code>.</td></tr>
           <tr><th>accepts[].asset</th><td class="opt">required</td><td>The token: a contract address on EVM, a mint address on Solana. Normally USDC. The spec also allows an ISO 4217 code for fiat.</td></tr>
           <tr><th>accepts[].payTo</th><td class="opt">required</td><td>Where the money lands: the seller's address. The spec also allows a role constant such as <code>"merchant"</code>.</td></tr>
-          <tr><th>accepts[].maxTimeoutSeconds</th><td class="opt">required</td><td>The maximum time allowed for payment completion. The reference EVM client also makes it the lifetime of the authorization it signs; a Solana payment expires with its blockhash instead. Obolus refuses to start with a zero window.</td></tr>
+          <tr><th>accepts[].maxTimeoutSeconds</th><td class="opt">required</td><td>The maximum time allowed for payment completion. The reference EVM client also makes it the lifetime of the authorization it signs; a Solana payment expires with its blockhash instead. Obolus keeps the last 15&nbsp;s of each window for settling, and refuses to start with a window of 15&nbsp;s or less.</td></tr>
           <tr><th>accepts[].extra</th><td class="opt">optional</td><td>Scheme-specific additions — the EIP-712 token domain on EVM, the fee payer on Solana — plus two reserved keys, <code>assetTransferMethod</code> and <code>paymentFlow</code>, that pick how funds move and when settlement runs.</td></tr>
           <tr><th>extensions</th><td class="opt">optional</td><td>Optional protocol extensions. The client echoes what the server advertised.</td></tr>
         </tbody>
@@ -593,8 +593,8 @@ CDP         GET /v2/x402/discovery/resources?limit=&amp;offset=
         <p>No outbound TLS client, so the facilitator URL must be <code>http://</code>. A real facilitator is <code>https://</code>, so reaching one takes a TLS-terminating proxy in front of it, as the round trip did (<a href="https://github.com/geekinasuit/obolus/issues/35">#35</a>).</p>
       </div>
       <div class="st gap">
-        <div class="lbl">Known gap</div>
-        <p>A request whose work outlasts its payment window is served and then cannot be settled — the trap in section&nbsp;02 (<a href="https://github.com/geekinasuit/obolus/issues/83">#83</a>).</p>
+        <div class="lbl">Bounded</div>
+        <p>The trap in section&nbsp;02: a paid request's upstream must answer within the payment window, less 15&nbsp;s kept for settling. If it does not, the request fails uncharged with a <code>504</code> rather than being served and left unpaid. The window defaults to 300&nbsp;s (<a href="https://github.com/geekinasuit/obolus/issues/83">#83</a>). Giving up stops the wait, not the model, which can keep generating until an abort reaches it (<a href="https://github.com/geekinasuit/obolus/issues/31">#31</a>).</p>
       </div>
       <div class="st gap">
         <div class="lbl">Not yet proven</div>

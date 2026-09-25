@@ -13,6 +13,15 @@
 //! payment until the upstream has committed to a successful response, charge at that moment,
 //! and only then emit headers and stream.
 //!
+//! ## The payment's own clock
+//!
+//! Holding the payment has a limit: it expires. The reference EVM client signs an authorization
+//! valid for `maxTimeoutSeconds`, and a facilitator will not settle one about to lapse. A head
+//! that arrives after that has bought work nobody can be charged for, and a 402 then would invite
+//! the client to pay for the same wait again. So each paid request's wait for its head is bounded by
+//! its window, less [`SETTLE_RESERVE_SECS`] kept back for settling. When that bound fires, the
+//! request fails with a 504 and nothing is charged.
+//!
 //! ## Exactly how far "costs the client nothing" goes
 //!
 //! It covers everything up to and including the response head: an upstream that cannot be
@@ -35,14 +44,18 @@
 //!
 //! Anything the client can fix by paying properly gets another 402 carrying the challenge
 //! *and* an `error` explaining the previous attempt. Anything that is our fault or the
-//! facilitator's gets a 502. A payment that was never actually evaluated must never come back
-//! looking like a rejected one.
+//! facilitator's gets a 502, except an upstream too slow for the payment's window, which gets a
+//! 504. A payment that was never actually evaluated must never come back looking like a rejected
+//! one.
 //!
 //! Every 402 carries its challenge twice: base64 in the `PAYMENT-REQUIRED` header, which is the one
 //! an x402 v2 client reads, and as the JSON body, for a person with curl. Both are the same object,
 //! and both are marked `Cache-Control: no-store`, since a challenge quotes a price for one request.
 
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -103,7 +116,44 @@ pub enum GatewayError {
     /// verify, serve and settle, whatever the option promised, so the option is refused instead.
     #[error("payment option for network {network:?}: {refusal}")]
     UnsupportedTransfer { network: String, refusal: UnsupportedTransfer },
+
+    /// An option's payment window is no longer than [`SETTLE_RESERVE_SECS`], so no upstream would
+    /// get any time to answer and every paid request would fail.
+    #[error(
+        "payment option for network {network:?} advertises maxTimeoutSeconds = \
+         {max_timeout_seconds}, but obolus keeps the last {reserve} seconds of every payment's \
+         window for settlement, which leaves no time to serve the request; advertise more than \
+         {reserve}",
+        reserve = SETTLE_RESERVE_SECS
+    )]
+    WindowTooShort { network: String, max_timeout_seconds: u64 },
 }
+
+/// How much of each payment's window is kept back for settlement: the upstream's response head
+/// must arrive at least this long before the window closes.
+///
+/// The window is `maxTimeoutSeconds`, counted from when the paid request reached the handler. The
+/// client signed earlier than that (the reference EVM client sets `validBefore` to signing time
+/// plus `maxTimeoutSeconds`), so counting from arrival *overstates* the time left. The reserve has
+/// to cover:
+///
+/// - the floor the reference facilitator keeps before `validBefore`: it refuses to settle an
+///   authorization with less than 6 s left;
+/// - the settle call's trip to the facilitator;
+/// - an ordinary gap between signing and arrival, plus the second the reference client can lose by
+///   flooring its clock to whole seconds, plus modest clock skew between client and facilitator.
+///
+/// It cannot cover a gap the client makes arbitrarily long. Arrival is taken after the request body
+/// has been read, so a client that uploads slowly spends its own window unseen. If that leaves
+/// too little, the head is served and settlement is then refused: that request costs compute and
+/// earns nothing, and the client does not receive the answer.
+///
+/// A live Base Sepolia round trip (#72) took about 10 s end to end, including about 4 s of
+/// inference, so 15 s leaves room for a slower facilitator without taking much from a
+/// minutes-long window.
+///
+/// Solana payments expire with their blockhash, not the window. This bound does not model that.
+pub const SETTLE_RESERVE_SECS: u64 = 15;
 
 /// A payment-gated route in front of a registry of upstream backends.
 ///
@@ -180,6 +230,12 @@ impl<F: Facilitator> Gateway<F> {
             }
             if let Some(refusal) = option.unsupported_transfer() {
                 return Err(GatewayError::UnsupportedTransfer { network: option.network.clone(), refusal });
+            }
+            if option.max_timeout_seconds <= SETTLE_RESERVE_SECS {
+                return Err(GatewayError::WindowTooShort {
+                    network: option.network.clone(),
+                    max_timeout_seconds: option.max_timeout_seconds,
+                });
             }
         }
         Ok(Self {
@@ -303,6 +359,23 @@ fn upstream_failure(detail: String) -> Response {
         .into_response()
 }
 
+/// The upstream did not answer early enough to settle this payment, so it was not settled and
+/// nothing was charged.
+///
+/// Not a 402: a client that paid again would meet the same wait and the same expiry. A 504 rather
+/// than [`upstream_failure`]'s 502, because the upstream may well be working, only too slowly for
+/// the window.
+fn payment_window_elapsed() -> Response {
+    eprintln!("obolus: payment window elapsed before the upstream's response head; not settling");
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(serde_json::json!({
+            "error": "the upstream did not answer within the payment window; nothing was charged",
+        })),
+    )
+        .into_response()
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -358,12 +431,15 @@ fn route_failure(err: RouteError) -> Response {
 /// Returns the response together with how the request ended, so that every exit has to name an
 /// [`Outcome`] — the compiler, not a reviewer, holds "each request is recorded as something". The
 /// facts gathered on the way (which option was paid, whether the upstream ran) go into `trace`.
+///
+/// `arrival` is when the handler first saw this request; the payment window is counted from it.
 async fn paid_completion<F: Facilitator>(
     gateway: Arc<Gateway<F>>,
     upstream: Arc<dyn Upstream>,
     priced: Vec<PaymentRequirements>,
     headers: HeaderMap,
     body: Bytes,
+    arrival: Instant,
     trace: &mut Trace,
 ) -> (Response, Outcome) {
     trace.offers = priced.iter().map(Offer::from).collect();
@@ -430,11 +506,21 @@ async fn paid_completion<F: Facilitator>(
         }
     }
 
-    // Payment is good. Commit the upstream BEFORE charging.
+    // Payment is good. Commit the upstream BEFORE charging, but only for as long as the payment can
+    // still be settled: its head has to arrive before the window, less the settle reserve, runs out.
+    // `Gateway::new` refused any window no longer than the reserve, so the subtraction holds.
+    let budget = Duration::from_secs(requirements.max_timeout_seconds - SETTLE_RESERVE_SECS);
+    let remaining = budget.saturating_sub(arrival.elapsed());
+    if remaining.is_zero() {
+        return (payment_window_elapsed(), Outcome::PaymentWindowElapsed);
+    }
     trace.upstream_invoked = true;
-    let response = match upstream.forward(body).await {
-        Ok(response) => response,
-        Err(err) => return (upstream_failure(err.to_string()), Outcome::UpstreamUnavailable),
+    // Giving up here stops the gateway waiting, not the model: a dropped request can keep generating
+    // upstream until an abort reaches it (#31).
+    let response = match tokio::time::timeout(remaining, upstream.forward(body)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => return (upstream_failure(err.to_string()), Outcome::UpstreamUnavailable),
+        Err(_) => return (payment_window_elapsed(), Outcome::PaymentWindowElapsed),
     };
     trace.upstream_status = Some(response.status.as_u16());
     if !response.status.is_success() {
@@ -543,8 +629,11 @@ async fn completion<F: Facilitator>(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Taken first, before routing or anything else can spend the payment's window. The body has
+    // already been read by now, so its upload is not counted; see `SETTLE_RESERVE_SECS`.
+    let arrival = Instant::now();
     let mut recorder = Recorder::new(access.gateway.telemetry.clone());
-    let (response, outcome) = serve(&access, headers, body, &mut recorder.trace).await;
+    let (response, outcome) = serve(&access, headers, body, arrival, &mut recorder.trace).await;
     recorder.complete(outcome);
     response
 }
@@ -553,6 +642,7 @@ async fn serve<F: Facilitator>(
     access: &Arc<Access<F>>,
     headers: HeaderMap,
     body: Bytes,
+    arrival: Instant,
     trace: &mut Trace,
 ) -> (Response, Outcome) {
     // Route before anything else. An unroutable request is refused here — before the token check
@@ -601,7 +691,7 @@ async fn serve<F: Facilitator>(
     // the challenge and charged at settlement (see [`paid_completion`]).
     trace.access = Some(AccessPath::Payment);
     let priced = access.gateway.priced(model.as_deref(), backend);
-    paid_completion(access.gateway.clone(), upstream, priced, headers, body, trace).await
+    paid_completion(access.gateway.clone(), upstream, priced, headers, body, arrival, trace).await
 }
 
 /// Wire an access surface into an OpenAI-compatible route plus an ungated health check.
@@ -625,7 +715,7 @@ mod tests {
     use crate::facilitator::{FakeCalls, FakeFacilitator};
     use crate::pricing::{CostPlus, FlatPrice, Promotional, StaticPrice};
     use crate::telemetry::{FakeTelemetry, RequestEvent};
-    use crate::upstream::{FakeUpstream, UpstreamCalls};
+    use crate::upstream::{FakeUpstream, OllamaUpstream, UpstreamCalls};
     use crate::arming::{check_arming, is_provably_testnet};
     use crate::x402::{PaymentPayload, SettlementReceipt, SCHEME_EXACT, X402_VERSION};
     use serde_json::json;
@@ -2158,5 +2248,269 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(headers.contains_key(x402::HEADER_PAYMENT_RESPONSE));
         assert_eq!(body, FakeUpstream::streamed_text());
+    }
+
+    // ---- the payment window (#83) ----
+    //
+    // A payment expires on its own clock, and settle comes after the upstream's head. Each test
+    // bounds its request with an outer timeout, so a missing bound fails the test instead of hanging
+    // it.
+
+    /// The shortest window a gateway accepts: one second left for the upstream's head.
+    const SHORTEST_WINDOW: u64 = SETTLE_RESERVE_SECS + 1;
+
+    /// Longer than any bound under test should let a request run.
+    const OUTER_GUARD: Duration = Duration::from_secs(5);
+
+    fn requirements_with_window(secs: u64) -> PaymentRequirements {
+        PaymentRequirements { max_timeout_seconds: secs, ..requirements() }
+    }
+
+    /// A paid request for the one option of a `window`-second gateway, exactly as offered.
+    fn paid_request_with_window(window: u64) -> Request<Body> {
+        completion_request(Some(&x402::encode_payment(&paying(requirements_with_window(window)))))
+    }
+
+    /// A gateway advertising one option with a `window`-second payment window over one costed
+    /// backend, recording to a fake sink.
+    fn windowed_app<F: Facilitator>(
+        facilitator: F,
+        upstream: Arc<dyn Upstream>,
+        window: u64,
+    ) -> (Router, FakeTelemetry) {
+        windowed_app_offering(facilitator, upstream, vec![requirements_with_window(window)])
+    }
+
+    /// A gateway advertising `options`, each with its own payment window, over one costed backend,
+    /// recording to a fake sink.
+    fn windowed_app_offering<F: Facilitator>(
+        facilitator: F,
+        upstream: Arc<dyn Upstream>,
+        options: Vec<PaymentRequirements>,
+    ) -> (Router, FakeTelemetry) {
+        let sink = FakeTelemetry::default();
+        let backend = Backend::for_test("default", vec![], None, upstream).with_cost(TEST_COST);
+        let gateway = Gateway::new(
+            facilitator,
+            Arc::new(Backends::from_parts(vec![backend])),
+            resource(),
+            armed(options),
+        )
+        .unwrap()
+        .with_telemetry(Arc::new(sink.clone()));
+        (router(Access::new(gateway, None)), sink)
+    }
+
+    #[tokio::test]
+    async fn an_upstream_that_outlasts_the_payment_window_fails_uncharged_before_settle() {
+        let facilitator = FakeFacilitator::accepting();
+        let calls = facilitator.calls();
+        let upstream = FakeUpstream::hanging();
+        let forwards = upstream.calls();
+        let (app, sink) = windowed_app(facilitator, Arc::new(upstream), SHORTEST_WINDOW);
+
+        let started = std::time::Instant::now();
+        let (status, headers, body) =
+            tokio::time::timeout(OUTER_GUARD, send(app, paid_request_with_window(SHORTEST_WINDOW)))
+                .await
+                .expect("the payment window must bound the wait for the upstream's head");
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "the upstream gets the window less the reserve, not nothing: gave up after {:?}",
+            started.elapsed()
+        );
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        // Not a 402: a client that paid again would meet the same wait and the same expiry.
+        assert!(headers.get(x402::HEADER_PAYMENT_REQUIRED).is_none());
+        assert!(headers.get(x402::HEADER_PAYMENT_RESPONSE).is_none());
+        assert!(body.contains("payment window"), "the client is told which bound fired: {body}");
+        assert_eq!(calls.verifies(), 1);
+        assert_eq!(calls.settles(), 0, "an authorization about to expire is not settled");
+        assert_eq!(forwards.count(), 1, "the upstream was reached");
+
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::PaymentWindowElapsed);
+        assert!(event.upstream_invoked);
+        assert_eq!(event.cost, Some(TEST_COST.to_string()), "the upstream ran, so it cost");
+        assert_eq!(event.revenue.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn the_window_that_bounds_a_request_is_the_one_its_payment_matched() {
+        // Offered first, with a window no test would wait out.
+        let generous = requirements_with_window(3600);
+        let brief = PaymentRequirements {
+            network: "test-network-other-not-a-real-caip2".to_string(),
+            ..requirements_with_window(SHORTEST_WINDOW)
+        };
+        let upstream = FakeUpstream::hanging();
+        let (app, sink) = windowed_app_offering(
+            FakeFacilitator::accepting(),
+            Arc::new(upstream),
+            vec![generous, brief.clone()],
+        );
+
+        let request = completion_request(Some(&x402::encode_payment(&paying(brief))));
+        let (status, _, _) = tokio::time::timeout(OUTER_GUARD, send(app, request))
+            .await
+            .expect("a payment for the brief option is bounded by the brief option's window");
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(sink.only().outcome, Outcome::PaymentWindowElapsed);
+    }
+
+    /// Accepts every payment, but only after `delay`; settles never.
+    struct SlowVerify {
+        delay: Duration,
+    }
+
+    impl Facilitator for SlowVerify {
+        fn verify(
+            &self,
+            _payment: &PaymentPayload,
+            _requirements: &PaymentRequirements,
+        ) -> impl std::future::Future<Output = Result<(), FacilitatorError>> + Send {
+            let delay = self.delay;
+            async move {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            }
+        }
+
+        fn settle(
+            &self,
+            _payment: &PaymentPayload,
+            _requirements: &PaymentRequirements,
+        ) -> impl std::future::Future<Output = Result<SettlementReceipt, FacilitatorError>> + Send
+        {
+            std::future::pending()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verify_that_uses_up_the_payment_window_never_reaches_the_upstream() {
+        let upstream = FakeUpstream::streaming();
+        let forwards = upstream.calls();
+        let facilitator = SlowVerify { delay: Duration::from_millis(1200) };
+        let (app, sink) = windowed_app(facilitator, Arc::new(upstream), SHORTEST_WINDOW);
+
+        let (status, headers, _) =
+            tokio::time::timeout(OUTER_GUARD, send(app, paid_request_with_window(SHORTEST_WINDOW)))
+                .await
+                .expect("an expired window must not wait on settle");
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(headers.get(x402::HEADER_PAYMENT_REQUIRED).is_none());
+        assert_eq!(forwards.count(), 0, "no work is started that could not be paid for");
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::PaymentWindowElapsed);
+        assert!(!event.upstream_invoked);
+        assert_eq!(event.cost.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn time_spent_in_verify_comes_out_of_the_upstreams_share_of_the_window() {
+        // A 2 s share of the window, 1 s of it spent verifying: the upstream gets the other second,
+        // not a fresh 2 s. Counting the share from the end of verify would give up at about 3 s.
+        let upstream = FakeUpstream::hanging();
+        let forwards = upstream.calls();
+        let facilitator = SlowVerify { delay: Duration::from_secs(1) };
+        let window = SETTLE_RESERVE_SECS + 2;
+        let (app, sink) = windowed_app(facilitator, Arc::new(upstream), window);
+
+        let started = std::time::Instant::now();
+        let (status, _, _) =
+            tokio::time::timeout(OUTER_GUARD, send(app, paid_request_with_window(window)))
+                .await
+                .expect("the payment window must bound the wait for the upstream's head");
+        let took = started.elapsed();
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(forwards.count(), 1, "a second was left, so the upstream was called");
+        assert!(
+            took < Duration::from_millis(2500),
+            "the window is counted from arrival, so verify's second is not given back: took {took:?}"
+        );
+        assert_eq!(sink.only().outcome, Outcome::PaymentWindowElapsed);
+    }
+
+    #[tokio::test]
+    async fn the_upstreams_own_head_timeout_still_governs_when_it_is_the_shorter() {
+        // A real upstream whose origin accepts connections and never answers. Its 150 ms head
+        // timeout is far inside the 60 s window less the reserve, so it is what fires, and the
+        // request ends as an unreachable upstream rather than an elapsed window.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let upstream = OllamaUpstream::new(format!("http://{addr}"))
+            .with_head_timeout(Duration::from_millis(150));
+        let (app, sink) = windowed_app(FakeFacilitator::accepting(), Arc::new(upstream), 60);
+
+        let (status, _, _) = tokio::time::timeout(OUTER_GUARD, send(app, paid_request_with_window(60)))
+            .await
+            .expect("the head timeout must bound the wait");
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(sink.only().outcome, Outcome::UpstreamUnavailable);
+    }
+
+    #[tokio::test]
+    async fn a_window_too_large_for_a_deadline_still_serves_and_settles() {
+        // `maxTimeoutSeconds` is operator-supplied and unbounded above. An instant that far out does
+        // not exist, and computing one must not panic the handler.
+        let facilitator = FakeFacilitator::accepting();
+        let calls = facilitator.calls();
+        let (app, sink) = windowed_app(facilitator, Arc::new(FakeUpstream::streaming()), u64::MAX);
+
+        let (status, headers, _) =
+            tokio::time::timeout(OUTER_GUARD, send(app, paid_request_with_window(u64::MAX)))
+                .await
+                .expect("a fast upstream answers well inside any window");
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.contains_key(x402::HEADER_PAYMENT_RESPONSE));
+        assert_eq!(calls.settles(), 1);
+        assert_eq!(sink.only().outcome, Outcome::Settled);
+    }
+
+    #[test]
+    fn construction_refuses_a_payment_window_no_longer_than_the_settle_reserve() {
+        // A window the reserve swallows whole leaves no time for any upstream: every paid request
+        // would fail. Refused where every gateway is built, as the configuration door does too.
+        for window in [0, 1, SETTLE_RESERVE_SECS] {
+            let err = Gateway::new(
+                FakeFacilitator::accepting(),
+                one_backend(FakeUpstream::streaming()),
+                resource(),
+                // Second, behind a clean option: every option is checked, not only the first.
+                armed(vec![
+                    PaymentRequirements {
+                        network: "test-network-b-not-a-real-caip2".to_string(),
+                        ..requirements()
+                    },
+                    requirements_with_window(window),
+                ]),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a {window}-second window must be refused"));
+            assert!(
+                matches!(&err, GatewayError::WindowTooShort { max_timeout_seconds, .. } if *max_timeout_seconds == window),
+                "got {err:?}"
+            );
+            assert!(err.to_string().contains(&format!("maxTimeoutSeconds = {window}")), "{err}");
+        }
+        let built = Gateway::new(
+            FakeFacilitator::accepting(),
+            one_backend(FakeUpstream::streaming()),
+            resource(),
+            armed(vec![requirements_with_window(SHORTEST_WINDOW)]),
+        );
+        assert!(built.is_ok(), "one second more than the reserve is accepted");
     }
 }

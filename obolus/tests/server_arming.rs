@@ -1753,6 +1753,35 @@ fn a_request_to_the_running_binary_is_recorded_as_one_json_line_on_stdout() {
     assert!(line.contains(r#""upstream_invoked":false"#), "{line}");
 }
 
+// ---- the payment window (#83) ----
+
+#[test]
+fn an_unset_payment_window_advertises_five_minutes() {
+    // The reference servers' default. Read off a real challenge rather than the banner, because the
+    // challenge is what a client signs against.
+    let live = serve_live(&[]);
+    let response = post_unpaid(&live.addr);
+    assert!(response.starts_with("HTTP/1.1 402"), "expected a challenge; got:\n{response}");
+    assert!(response.contains(r#""maxTimeoutSeconds":300"#), "{response}");
+}
+
+#[test]
+fn a_payment_window_the_settle_reserve_would_swallow_refuses_to_start() {
+    // 15 s is the reserve kept for settlement, so a 15 s window leaves no upstream any time at all.
+    let run = run(&[("OBOLUS_MAX_TIMEOUT_SECS", "15")]);
+    run.must_say(BAILED);
+    run.must_say("OBOLUS_MAX_TIMEOUT_SECS must be greater than 15");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn a_payment_window_one_second_past_the_reserve_boots_and_names_the_upstream_budget() {
+    let run = run(&[("OBOLUS_MAX_TIMEOUT_SECS", "16")]);
+    run.must_have_got_past_startup();
+    run.must_say("obolus: payment window 16 s");
+    run.must_say("response head within 1 s");
+}
+
 #[test]
 fn with_telemetry_off_the_running_binary_writes_nothing_to_stdout() {
     let live = serve_live(&[("OBOLUS_TELEMETRY", "off")]);

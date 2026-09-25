@@ -36,7 +36,7 @@ use obolus::config::{
 };
 use obolus::backends::{load_backends, Backends};
 use obolus::facilitator::DelegatedFacilitator;
-use obolus::gateway::{router, Access, Gateway};
+use obolus::gateway::{router, Access, Gateway, SETTLE_RESERVE_SECS};
 use obolus::pricing::{CostPlus, PriceDeterminer, Promotional, StaticPrice};
 use obolus::telemetry::LineSink;
 use obolus::x402::PaymentRequirements;
@@ -57,7 +57,15 @@ const DEFAULT_UPSTREAM_URL: &str = "http://127.0.0.1:11434";
 const PLACEHOLDER_PAY_TO: &str = "0xTEST-PAY-TO-ADDRESS-NOT-REAL";
 const PLACEHOLDER_ASSET: &str = "0xTEST-ASSET-ADDRESS-NOT-REAL";
 
+/// The payment window advertised when `OBOLUS_MAX_TIMEOUT_SECS` is unset: 300 s, the default in the
+/// TypeScript reference server. The spec's examples use 60, which leaves a non-streaming
+/// completion less than 45 s once the settle reserve is taken out.
+const DEFAULT_MAX_TIMEOUT_SECS: u64 = 300;
+
 /// Seconds added on top of the challenge's `maxTimeoutSeconds` to bound a single settle call.
+///
+/// Not the same quantity as [`SETTLE_RESERVE_SECS`], which is kept back *inside* the window: this
+/// one lets the settle call itself run past the window, while the facilitator waits on the chain.
 /// Settlement can legitimately block while the facilitator waits for an on-chain receipt, so we
 /// wait a little longer than the authorization we advertised is valid for, then give up as
 /// unavailable rather than hanging.
@@ -142,14 +150,17 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
 
-    // Advertised to the client in the 402 challenge AND the basis for the settle deadline below —
-    // configurable so that derivation is not frozen in code.
-    let max_timeout_seconds = env_u64("OBOLUS_MAX_TIMEOUT_SECS", 60)?;
-    if max_timeout_seconds == 0 {
+    // Advertised to the client in the 402 challenge, the bound on each paid request's wait for its
+    // upstream, AND the basis for the settle deadline below — configurable so that derivation is not
+    // frozen in code. The default is the reference servers'.
+    let max_timeout_seconds = env_u64("OBOLUS_MAX_TIMEOUT_SECS", DEFAULT_MAX_TIMEOUT_SECS)?;
+    // `Gateway::new` refuses this too, for any caller; this names the variable an operator can fix.
+    if max_timeout_seconds <= SETTLE_RESERVE_SECS {
         anyhow::bail!(
-            "OBOLUS_MAX_TIMEOUT_SECS must be greater than 0: it is advertised to payers as the \
-             challenge's maxTimeoutSeconds (a 0-second payment window is unpayable) and it also \
-             floors the settle deadline."
+            "OBOLUS_MAX_TIMEOUT_SECS must be greater than {SETTLE_RESERVE_SECS}, but is \
+             {max_timeout_seconds}: it is advertised to payers as the challenge's maxTimeoutSeconds, \
+             and the last {SETTLE_RESERVE_SECS} seconds of every payment's window are kept for \
+             settlement, so a window no longer than that leaves no time to serve a request."
         );
     }
     let settle_timeout =
@@ -469,6 +480,12 @@ async fn main() -> anyhow::Result<()> {
          every caller unless a bearer-token line below says otherwise."
     );
     eprintln!("obolus: facilitator (verify/settle) -> {facilitator_url}");
+    eprintln!(
+        "obolus: payment window {max_timeout_seconds} s (advertised as maxTimeoutSeconds): a paid \
+         request's upstream must send its response head within {} s of arrival, or the request \
+         fails uncharged, leaving {SETTLE_RESERVE_SECS} s to settle",
+        max_timeout_seconds - SETTLE_RESERVE_SECS
+    );
     // Off the constructed registry, not the configuration that built it, so the line describes what
     // was actually wired. One line per backend the router can reach; the "keyed"/"keyless" note says
     // whether a bearer is attached without ever naming the credential. A backend with no `models` is
