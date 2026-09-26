@@ -15,7 +15,7 @@
 //!   carries no amount, and the signed authorization is opaque here, so the amount actually signed
 //!   is checked by the facilitator, not by the gateway. Given a facilitator that enforces `exact`'s
 //!   amount rule, it equals what moved on EVM, where the authorized amount must equal the quote,
-//!   and is at most what moved on Solana, where the transfer must be at least the quote. For any
+//!   and is at most what moved on Solana, where a payer may overpay but never underpay. For any
 //!   other network, no amount rule is recorded here. Every outcome that definitely took nothing
 //!   records `"0"`. [`Outcome::SettleUnavailable`], and an [`Outcome::Abandoned`] request whose
 //!   settlement had begun, record no revenue at all: whether the chain moved funds is not something
