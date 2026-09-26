@@ -128,11 +128,21 @@ The details that matter:
 - **An unknown cost is `null`, never `"0"`.** Under the static rate no backend declares a cost, so
   every served request records `cost: null`. A zero would read as free. Revenue-versus-cost is
   computable only under the cost-plus rate, where every backend is required to declare a cost.
-- **Revenue is the price charged, a lower bound on what moved.** It is the quoted amount of the
-  option the payment matched. x402's `exact` scheme accepts an authorization for *at least* that
-  amount, the settlement receipt carries no amount of its own, and the gateway never opens the
-  payment payload — so a client that authorized more than the quote may have been settled for more
-  than `revenue` says. Summed revenue can undercount; it never overcounts.
+- **Revenue is the price charged,** the quoted amount of the option the payment matched. The
+  settlement receipt carries no amount of its own. The gateway checks that the option the client
+  names carries the quoted amount, but never opens the signed authorization, so it never checks the
+  amount actually signed: the facilitator does. So how revenue compares with what moved depends on
+  the chain family's `exact` rule, and on the facilitator enforcing it:
+  - **EVM:** the authorized amount must equal the quote. The
+    [core spec](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md)'s
+    error `invalid_exact_evm_payload_authorization_value_mismatch` (§9) is for an amount that "does
+    not exactly match". Revenue is what moved.
+  - **Solana:** the transfer must be *at least* the amount
+    ([`scheme_exact_svm.md`](https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md)).
+    Revenue can be less than what moved, never more.
+  - **Any other network**, whether from the testnet allowlist (`TESTNET_NETWORKS` in
+    `obolus/src/arming.rs`) or armed by name: this document records no amount rule. Revenue is the
+    quote, and how it compares with what moved is unverified.
 - **`settle_unavailable` records no revenue**, and neither does an `abandoned` request whose
   settlement had begun. The settle call may or may not have landed; whether funds moved on chain is
   not something the gateway can know. Reconcile these against the chain using the paid option's

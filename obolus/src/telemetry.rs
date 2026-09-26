@@ -11,13 +11,15 @@
 //! # What an event can and cannot claim
 //!
 //! - **Revenue** is the price the gateway charged: the quoted amount of the option the client paid,
-//!   and only on [`Outcome::Settled`]. It is a lower bound on what moved on chain, not a measurement
-//!   of it. The receipt carries no amount, the payment payload is opaque here, and x402's `exact`
-//!   scheme accepts an authorization for *at least* the quoted amount — so a client that authorized
-//!   more may have been settled for more than this records. Every outcome that definitely took
-//!   nothing records `"0"`. [`Outcome::SettleUnavailable`], and an [`Outcome::Abandoned`] request
-//!   whose settlement had begun, record no revenue at all: whether the chain moved funds is not
-//!   something this side can know.
+//!   and only on [`Outcome::Settled`]. It is not a measurement of what moved on chain: the receipt
+//!   carries no amount, and the signed authorization is opaque here, so the amount actually signed
+//!   is checked by the facilitator, not by the gateway. Given a facilitator that enforces `exact`'s
+//!   amount rule, it equals what moved on EVM, where the authorized amount must equal the quote,
+//!   and is at most what moved on Solana, where the transfer must be at least the quote. For any
+//!   other network, no amount rule is recorded here. Every outcome that definitely took nothing
+//!   records `"0"`. [`Outcome::SettleUnavailable`], and an [`Outcome::Abandoned`] request whose
+//!   settlement had begun, record no revenue at all: whether the chain moved funds is not something
+//!   this side can know.
 //! - **Cost** is the routed backend's *declared* per-request cost, and is charged to any request
 //!   whose upstream was invoked — including one whose settlement then failed, which is exactly the
 //!   loss this record exists to expose, and one the upstream refused, since whether a refused call is
