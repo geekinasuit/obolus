@@ -594,7 +594,7 @@ CDP         GET /v2/x402/discovery/resources?limit=&amp;offset=
       </div>
       <div class="st gap">
         <div class="lbl">Bounded</div>
-        <p>The trap in section&nbsp;02: a paid request's upstream must answer within the payment window, less 15&nbsp;s kept for settling. If it does not, the request fails uncharged with a <code>504</code> rather than being served and left unpaid. The window defaults to 300&nbsp;s (<a href="https://github.com/geekinasuit/obolus/issues/83">#83</a>). Giving up stops the wait, not the model, which can keep generating until an abort reaches it (<a href="https://github.com/geekinasuit/obolus/issues/31">#31</a>).</p>
+        <p>The trap in section&nbsp;02: a paid request's upstream must answer within the payment window, less 15&nbsp;s kept for settling. If it does not, the request fails uncharged with a <code>504</code> rather than being served and left unpaid. The window defaults to 300&nbsp;s (<a href="https://github.com/geekinasuit/obolus/issues/83">#83</a>). Giving up closes the connection to the model, and Ollama stops generating when that happens: seen on Ollama 0.34.4's MLX runner for streaming and non-streaming requests alike (<a href="https://github.com/geekinasuit/obolus/issues/31">#31</a>).</p>
       </div>
       <div class="st gap">
         <div class="lbl">Not yet proven</div>

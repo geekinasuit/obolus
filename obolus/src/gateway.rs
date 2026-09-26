@@ -22,6 +22,23 @@
 //! its window, less [`SETTLE_RESERVE_SECS`] kept back for settling. When that bound fires, the
 //! request fails with a 504 and nothing is charged.
 //!
+//! ## Giving up on an upstream
+//!
+//! When the gateway abandons an upstream request — the payment window runs out before the head, or
+//! settlement fails after it — it drops the request or the response. While the answer is still
+//! arriving, dropping closes the upstream connection: the client neither reads the rest of the body
+//! nor returns the connection to its pool. That close is the only signal the origin gets that nobody
+//! is waiting for its answer; an origin that stops generating when its client goes away, as Ollama
+//! 0.34.4's MLX runner was seen to, stops there. See
+//! `an_upstream_abandoned_before_its_head_sees_its_connection_close` and the three
+//! `an_upstream_abandoned_midstream_after_…` tests, one for each way a settle can fail.
+//!
+//! A body that has already arrived in full, as a short `stream: false` answer does with its head,
+//! may be read out and the connection kept for reuse instead; nothing is still generating by then.
+//! All of this is hyper's HTTP/1 client, which is all
+//! [`OllamaUpstream`](crate::upstream::OllamaUpstream) builds. Under HTTP/2 a drop would reset the
+//! stream rather than close the connection.
+//!
 //! ## Exactly how far "costs the client nothing" goes
 //!
 //! It covers everything up to and including the response head: an upstream that cannot be
@@ -515,8 +532,8 @@ async fn paid_completion<F: Facilitator>(
         return (payment_window_elapsed(), Outcome::PaymentWindowElapsed);
     }
     trace.upstream_invoked = true;
-    // Giving up here stops the gateway waiting, not the model: a dropped request can keep generating
-    // upstream until an abort reaches it (#31).
+    // Giving up drops the request, which closes its upstream connection; see "Giving up on an
+    // upstream" above.
     let response = match tokio::time::timeout(remaining, upstream.forward(body)).await {
         Ok(Ok(response)) => response,
         Ok(Err(err)) => return (upstream_failure(err.to_string()), Outcome::UpstreamUnavailable),
@@ -2458,6 +2475,124 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(sink.only().outcome, Outcome::UpstreamUnavailable);
+    }
+
+    // ---- abandoning an upstream (#31) ----
+    //
+    // When the gateway gives up on a request the model is still working on, the only signal the
+    // model's server can act on is its connection closing. These tests stand up a raw origin that
+    // reports when its side of the connection sees EOF or a reset.
+
+    /// How long an abandoned connection may stay open once the gateway has answered.
+    const CLOSE_BOUND: Duration = Duration::from_secs(2);
+
+    /// A raw HTTP origin for one connection. It reads the request, writes `response` (if any), then
+    /// waits, sending on the returned channel when the gateway's side closes the connection.
+    async fn watched_origin(
+        response: Option<&'static [u8]>,
+    ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            if let Some(response) = response {
+                stream.write_all(response).await.unwrap();
+            }
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed.send(());
+        });
+        (addr, closed_rx)
+    }
+
+    /// A real upstream to `addr`, and a second handle on it for the test to hold. `send` consumes the
+    /// router and drops the gateway with it; if that took the upstream's client too, tearing down its
+    /// pool would close every connection, and a test could not tell a close from a connection kept
+    /// for reuse. Holding the handle across the wait keeps the pool alive.
+    fn held_upstream(addr: std::net::SocketAddr) -> (Arc<dyn Upstream>, Arc<dyn Upstream>) {
+        let upstream: Arc<dyn Upstream> = Arc::new(OllamaUpstream::new(format!("http://{addr}")));
+        (upstream.clone(), upstream)
+    }
+
+    #[tokio::test]
+    async fn an_upstream_abandoned_before_its_head_sees_its_connection_close() {
+        let (addr, closed) = watched_origin(None).await;
+        let (upstream, _held) = held_upstream(addr);
+        let (app, _) = windowed_app(FakeFacilitator::accepting(), upstream, SHORTEST_WINDOW);
+
+        let (status, _, _) =
+            tokio::time::timeout(OUTER_GUARD, send(app, paid_request_with_window(SHORTEST_WINDOW)))
+                .await
+                .expect("the payment window bounds the wait");
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+
+        tokio::time::timeout(CLOSE_BOUND, closed)
+            .await
+            .expect("the upstream's connection must close once the gateway gives up on it")
+            .unwrap();
+    }
+
+    /// Serves a streaming head and one chunk, then nothing, so the model is still generating when
+    /// `facilitator` fails the settle; asserts the gateway answers `expected` and the upstream's
+    /// connection then closes.
+    async fn assert_a_failed_settle_closes_a_midstream_upstream(
+        facilitator: FakeFacilitator,
+        expected: StatusCode,
+    ) {
+        let (addr, closed) = watched_origin(Some(
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+              transfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+        ))
+        .await;
+        let (upstream, _held) = held_upstream(addr);
+        let (app, _) = windowed_app(facilitator, upstream, 60);
+
+        let (status, _, _) = tokio::time::timeout(OUTER_GUARD, send(app, paid_request_with_window(60)))
+            .await
+            .expect("a failed settle answers at once");
+        assert_eq!(status, expected);
+
+        tokio::time::timeout(CLOSE_BOUND, closed)
+            .await
+            .expect("the upstream's connection must close once the gateway drops its response")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_upstream_abandoned_midstream_after_a_refused_settle_sees_its_connection_close() {
+        assert_a_failed_settle_closes_a_midstream_upstream(
+            FakeFacilitator::rejecting_settlement("no"),
+            StatusCode::PAYMENT_REQUIRED,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_upstream_abandoned_midstream_after_an_unsuccessful_receipt_sees_its_connection_close(
+    ) {
+        assert_a_failed_settle_closes_a_midstream_upstream(
+            FakeFacilitator::returning_unsuccessful_receipt(),
+            StatusCode::PAYMENT_REQUIRED,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn an_upstream_abandoned_midstream_after_an_unavailable_settle_sees_its_connection_close()
+    {
+        assert_a_failed_settle_closes_a_midstream_upstream(
+            FakeFacilitator::failing_settlement("timed out"),
+            StatusCode::BAD_GATEWAY,
+        )
+        .await;
     }
 
     #[tokio::test]
