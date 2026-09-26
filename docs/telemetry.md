@@ -139,7 +139,8 @@ The details that matter:
     not exactly match". Revenue is what moved.
   - **Solana:** the transfer must be *at least* the amount
     ([`scheme_exact_svm.md`](https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md)).
-    Revenue can be less than what moved, never more.
+    A payer may overpay, which the spec tolerates for smart wallets that round fees, but never
+    underpay. So revenue is at most what moved: the excess moves but is not recorded.
   - **Any other network**, whether from the testnet allowlist (`TESTNET_NETWORKS` in
     `obolus/src/arming.rs`) or armed by name: this document records no amount rule. Revenue is the
     quote, and how it compares with what moved is unverified.
