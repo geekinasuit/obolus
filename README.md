@@ -44,6 +44,7 @@ without crypto, and A1's types are built to preserve it.
 | `obolus/src/gateway.rs` | Route wiring, and the decision of *when we charge* |
 | `obolus/src/telemetry.rs` | The `Telemetry` seam, the one event recorded per request, the `LineSink` that writes it as a JSON line without ever blocking a request, and the test-only `FakeTelemetry` |
 | `obolus/src/main.rs` | The `obolus` binary, wired to the real facilitator + Ollama upstream (env-configured); testnet-by-construction |
+| `devseller/` | `obolus-devseller`, a seller to test an x402 *client* against: real challenges, offline verification, failure on command. Settles nothing; [not a gateway](#testing-a-client-obolus-devseller) |
 | `docs/x402-ecosystem.html` | **Orientation:** what x402 is, who the participants are, the Bazaar discovery layer, and where Obolus sits on the rail. Start here if the protocol is new to you — this README assumes it |
 | `docs/architecture.md` | **The map:** what Obolus is, the components and seams it is built from, and the paths a request takes — for a reader with no prior context |
 | `docs/pricing.md` | **Pricing design:** how a request's price is decided — the cost-vs-quote denomination frame, the rate structures, the config, and the granularity decision |
@@ -476,6 +477,56 @@ intact.
 
 Not in this slice: revocation, token minting, per-token rate limits or accounting, and any
 distinction between token-holders. See [#33](https://github.com/geekinasuit/obolus/issues/33).
+
+## Testing a client: `obolus-devseller`
+
+**`obolus-devseller` is not the gateway. Do not deploy it.** It settles no payment: it verifies
+authorizations offline and returns a synthetic receipt, so everything it serves is served for free.
+It ships beside `obolus` because people writing x402 *clients* need a seller that issues real 402
+challenges and fails on command, and a real facilitator on a real testnet cannot be asked to reject
+the next payment.
+
+It needs a testnet payment option before it will start: with nothing set it falls back to the
+built-in placeholder network, which it refuses. For USDC on Base Sepolia, with your own testnet
+address as the recipient:
+
+```bash
+OBOLUS_NETWORK=eip155:84532 OBOLUS_ASSET=0x036CbD53842c5426634e7929541eC2318f3dCF7e OBOLUS_PAY_TO=<your 0x… testnet address> OBOLUS_EXTRA='{"name":"USDC","version":"2"}' cargo run -p obolus-devseller
+```
+
+It listens on `127.0.0.1:8404` (not 8403, so it can run beside a real gateway), is configured by the
+same `OBOLUS_ACCEPTS` or single-chain variables as `obolus`, and serves a canned answer unless
+`OBOLUS_UPSTREAM_URL` names a real model. `cargo run -p obolus-devseller -- --help` (or `--help` on a
+released binary) lists every variable.
+
+Failure comes from two independent knobs, because verification and settlement fail independently.
+Verification passing and settlement *then* failing is the case that decides whether a client
+retries, re-signs, or pays twice:
+
+| Variable | Modes |
+|---|---|
+| `OBOLUS_DEV_VERIFY` | `verify` (default): the EIP-712 digest is recomputed, the signer recovered, and the transfer compared with what was advertised · `accept`: every payment passes uninspected · `reject`: every payment is refused |
+| `OBOLUS_DEV_SETTLE` | `succeed` (default) · `empty-receipt` · `unsuccessful` · `rejected` · `unavailable` · `timeout`. Only the first two serve the work. `unsuccessful` and `rejected` answer 402, and `unavailable` and `timeout` answer 502, each after the client's nonce is, as far as it can tell, spent. `timeout` holds the request for `OBOLUS_DEV_SETTLE_DELAY_SECS` (120 s by default), past the 60 s payment window the seller advertises |
+
+`verify` is the offline way to catch a broken client signer, and the mode the published EIP-3009
+vectors exist to gate. **It is not an access control.** It checks a signature over a payer address
+the caller chooses, against no balance and no record of spent nonces, and nothing settles, so a
+throwaway keypair satisfies it. Reading "verification is on" as "only paying clients get through"
+is a misreading.
+
+Startup refuses:
+
+- any network it cannot prove is a testnet, and the built-in placeholder network. Setting
+  `OBOLUS_ALLOW_MAINNET` is itself a refusal here;
+- a non-loopback bind, plus `accept`, plus a real upstream, which is an unauthenticated open proxy
+  to somebody's model, unless `OBOLUS_DEV_ALLOW_OPEN_PROXY=1` acknowledges it. To test from a phone,
+  forward the port (`adb reverse tcp:8404 tcp:8404`) instead of widening the bind.
+
+The first guards the money path, the second what it exposes. Other refusals, such as a set-but-empty
+variable or an option `verify` cannot check, each print their own remedy at startup. A non-loopback
+bind also prints `*** BOUND BEYOND LOOPBACK ***`. That warning and the open-proxy refusal read only
+the bind address, so a reverse proxy or `tailscale serve` in front of a loopback dev seller bypasses
+both. See [`docs/exposure.md`](docs/exposure.md#the-development-seller-is-stricter-on-purpose).
 
 ## The fake is never a gate
 
