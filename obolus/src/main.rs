@@ -464,17 +464,167 @@ async fn main() -> anyhow::Result<()> {
     };
     let gateway = gateway.with_price_determiner(determiner);
 
-    // "starting on", not "listening on" — the bind is ~100 lines below and every check between here
-    // and there can still refuse. A posture line an operator trusts must be true *where it is
-    // printed*, and "listening" was false on every failed bind (port in use, privileged port, an
-    // address that does not resolve). The real claim is made below, after `bind` returns.
+    // The bearer-token path and the access surface it joins, here — after the arming guard and
+    // `Gateway::new`, before the first posture line below — so that every configuration refusal this
+    // process can make lands before it prints anything claiming to start, advertise, or be on
+    // testnet (#42). A refusal printed under an all-clear reads as a gateway that came up and then
+    // died of something unrelated.
+    //
+    // Below the arming guard rather than above it, deliberately. When an operator's network and
+    // token configuration are both wrong, the network refusal is the one they see: it is about the
+    // advertisement a client pays against, the one configuration here that can move real funds.
+    // Nothing between the guard and here prints, so this placement orders the token refusals
+    // against the banner and against nothing else. Both halves are checked, not merely asserted
+    // here: in tests/server_arming.rs every token-refusal test asserts that no startup line printed
+    // first, and `a_network_refusal_is_reported_before_a_token_refusal` has a row for each refusal
+    // below. They run this binary and fail if any one refusal moves below the banner or above the
+    // guard.
+    //
+    // Which variable, if either, names the verifying keys. Both forms collapse to one list here so
+    // everything downstream — issuer, audience, file reading, the verifier — is written once rather
+    // than twice and left to drift.
+    //
+    // All four OBOLUS_TOKEN_* variables count a whitespace-only value as empty, and refuse it. None
+    // of them has a meaning for one: no key file is named `   `, and an issuer or audience of spaces
+    // is one no token carries, so it would boot a token path that honours nobody while its banner
+    // says it is enabled.
+    //
+    // `OBOLUS_TOKEN_KEYS` supersedes the single-key variable exactly as `OBOLUS_ACCEPTS` supersedes
+    // the single-chain ones above, and refuses to start when both are set for the same reason. It is
+    // worse here, if anything: an ignored payment variable produces a challenge nobody can pay, but
+    // an ignored *verifying key* produces a gateway that looks correct until a token signed with
+    // that key is refused — possibly weeks later, mid-rotation.
+    let key_source: Option<(&str, Vec<TokenKeyEntry>)> =
+        match (std::env::var("OBOLUS_TOKEN_KEYS"), std::env::var(SINGLE_KEY_VAR)) {
+            // Set-but-empty first, and ahead of the supersession bail below, for the reason the
+            // OBOLUS_ACCEPTS arms above give: that bail is actionable but its premise is false here.
+            // It would tell an operator whose array arrived empty that it supersedes their
+            // single-key configuration, when the true statement is that it configures nothing while
+            // superseding everything. Whitespace-only counts as empty for the same reason it does
+            // there — the operator did not mean to write JSON, so serde's "EOF while parsing a
+            // value" names no remedy they can act on.
+            (Ok(raw), _) if raw.trim().is_empty() => anyhow::bail!(
+                "OBOLUS_TOKEN_KEYS is set but empty. It reached this process carrying nothing — an \
+                 unexpanded ${{VAR}} or an EnvironmentFile line ending in `=` — which asks for a \
+                 token path and names no key to build one from."
+            ),
+            (Ok(_), Ok(_)) => anyhow::bail!(
+                "OBOLUS_TOKEN_KEYS and {SINGLE_KEY_VAR} are both set. The array form supersedes the \
+                 single-key one, which would then sit inert — and an inert verifying key stays \
+                 silent until a token signed with it is refused. Keep whichever one you meant."
+            ),
+            (Ok(raw), Err(_)) => Some(("OBOLUS_TOKEN_KEYS", parse_token_keys(&raw)?)),
+            (Err(_), Ok(path)) if path.trim().is_empty() => anyhow::bail!(
+                "{SINGLE_KEY_VAR} is set but empty. It is the variable whose presence decides \
+                 whether a token path exists at all, so an empty one asks for a token path and \
+                 names no key to build it from. Unset it to run with the 402 path alone, or point \
+                 it at the public key tokens are signed with."
+            ),
+            (Err(_), Ok(path)) => {
+                Some((SINGLE_KEY_VAR, vec![TokenKeyEntry { kid: None, file: path }]))
+            }
+            (Err(_), Err(_)) => None,
+        };
+
+    // The token path (#33). No key configured means no token path at all: every caller pays,
+    // which is both the previous behaviour and the fail-closed direction to default to.
+    let token: Option<TokenPath> = match key_source {
+        None => {
+            // ...but "no key configured" and "the key variable did not arrive" look identical from
+            // here, and the second one is silent: no token path, no error, and every caller getting
+            // a 402 is indistinguishable from a correctly working anonymous gateway. The operator
+            // who set an issuer meant to have a token path. Same argument, and the same shape, as
+            // `superseded_single_chain_vars` above — configuration that cannot mean what it says
+            // must refuse rather than be dropped.
+            let orphaned: Vec<&str> = ["OBOLUS_TOKEN_ISSUER", "OBOLUS_TOKEN_AUDIENCE"]
+                .into_iter()
+                .filter(|name| std::env::var(name).is_ok())
+                .collect();
+            if !orphaned.is_empty() {
+                anyhow::bail!(
+                    "{} set without OBOLUS_TOKEN_KEYS or {SINGLE_KEY_VAR}. Those configure a \
+                     bearer-token path that cannot exist without a verifying key, so this would \
+                     start a gateway that answers 402 to every caller while looking configured. \
+                     Name the key(s), or unset {}.",
+                    orphaned.join(" and "),
+                    orphaned.join(" and "),
+                );
+            }
+            None
+        }
+        Some((source, entries)) => {
+            // Required alongside the key, not optional: a signing key usually belongs to an
+            // identity provider rather than to one service, so with no `iss` to check, every token
+            // that key has ever minted — for anything — would buy inference here.
+            let issuer = std::env::var("OBOLUS_TOKEN_ISSUER").map_err(|_| {
+                anyhow::anyhow!(
+                    "{source} is set but OBOLUS_TOKEN_ISSUER is not. Set the issuer every honoured \
+                     token must carry, or unset the key to run with the 402 path alone."
+                )
+            })?;
+            // Set-but-empty is a startup error here for the same reason it is for the payment
+            // vars: it means something arrived carrying nothing (an unexpanded `${VAR}`, an
+            // `EnvironmentFile` line ending in `=`), and an empty issuer no token can match would
+            // boot a token path that silently honours nobody.
+            if issuer.trim().is_empty() {
+                anyhow::bail!(
+                    "OBOLUS_TOKEN_ISSUER is set but empty. No token can carry an empty `iss`, so \
+                     this would start a token path that refuses every caller."
+                );
+            }
+            // Optional, and its absence is not permissive: with no expected audience a token
+            // carrying `aud` is refused rather than honoured, because `aud` names the service the
+            // token was minted for and we cannot tell "for us" from "for something else".
+            let audience = match std::env::var("OBOLUS_TOKEN_AUDIENCE") {
+                Err(_) => None,
+                Ok(audience) if audience.trim().is_empty() => anyhow::bail!(
+                    "OBOLUS_TOKEN_AUDIENCE is set but empty. Unset it to refuse tokens that carry \
+                     an `aud` claim, or give it the audience Obolus should answer to."
+                ),
+                Ok(audience) => Some(audience),
+            };
+            // Read every named file before building anything: a set half-loaded is a rotation half
+            // armed, and the operator should hear about the unreadable one at startup rather than
+            // discover it when a token signed with that key is refused.
+            let mut keys = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let pem = std::fs::read(&entry.file)
+                    // Through `legible` although this is a bail: a bail is the last thing the
+                    // process prints, so a bare path carrying a newline could append a line of its
+                    // own — a forged `listening on` — to a gateway that refused to start (#16).
+                    .map_err(|e| anyhow::anyhow!("{source} {}: {e}", legible(&entry.file)))?;
+                keys.push((entry.kid, pem));
+            }
+            let verifier = PublicKeyTokenVerifier::with_keys(&keys, &issuer, audience.as_deref())
+                .map_err(|e| anyhow::anyhow!("{source}: {e}"))?;
+            // No description composed here, deliberately. This file *could* format one from
+            // `issuer` and `audience` that the verifier does not hold — with `None` passed above,
+            // a banner announcing the configured audience while the `Validation` enforces none
+            // leaves both test targets green. The line comes off the verifier's own enforcing
+            // state instead — see `TokenVerifier::description`.
+            Some(TokenPath::new(Arc::new(verifier)))
+        }
+    };
+
+    // Installed last, after every refusal: starting the writer thread is the one side effect of
+    // selecting a sink, and a process that is about to refuse has nothing to record.
+    let gateway = match telemetry {
+        TelemetryChoice::Stdout => gateway.with_telemetry(Arc::new(LineSink::stdout()?)),
+        TelemetryChoice::Off => gateway,
+    };
+    let access = Access::new(gateway, token);
+
+    // "starting on", not "listening on". Every configuration refusal has fired by here, but the bind
+    // below can still fail (port in use, privileged port, an address this host does not own), and a
+    // posture line an operator trusts must be true *where it is printed*. The real claim is made
+    // below, after `bind` returns.
     eprintln!("obolus: starting on http://{addr}");
     // "unless a bearer-token line below says otherwise" rather than a flat "payment-gated": on a
     // token-configured instance that route is gated by payment only for callers without an honoured
-    // token, and the ENABLED line saying so lands well below this one. Same standard as "starting
-    // on" above — a posture line has to be true where it is printed. Made conditional on the token
-    // path instead would mean hoisting that block above the arming guard, which reorders which
-    // refusal an operator sees when both their network and their token config are wrong.
+    // token, and the ENABLED line saying so is printed further down, read off the routed `Access`.
+    // Same standard as "starting on" above — a posture line has to be true where it is printed. The
+    // token path is already known here, but this line defers to the ENABLED line rather than
+    // restating the token posture, so that line stays the one place it is described.
     eprintln!(
         "obolus: POST /v1/chat/completions is gated; GET /health is not. The gate is payment for \
          every caller unless a bearer-token line below says otherwise."
@@ -669,139 +819,6 @@ async fn main() -> anyhow::Result<()> {
             requirements.len()
         );
     }
-
-    // Which variable, if either, names the verifying keys. Both forms collapse to one list here so
-    // everything downstream — issuer, audience, file reading, the verifier — is written once rather
-    // than twice and left to drift.
-    //
-    // All four OBOLUS_TOKEN_* variables count a whitespace-only value as empty, and refuse it. None
-    // of them has a meaning for one: no key file is named `   `, and an issuer or audience of spaces
-    // is one no token carries, so it would boot a token path that honours nobody while its banner
-    // says it is enabled.
-    //
-    // `OBOLUS_TOKEN_KEYS` supersedes the single-key variable exactly as `OBOLUS_ACCEPTS` supersedes
-    // the single-chain ones above, and refuses to start when both are set for the same reason. It is
-    // worse here, if anything: an ignored payment variable produces a challenge nobody can pay, but
-    // an ignored *verifying key* produces a gateway that looks correct until a token signed with
-    // that key is refused — possibly weeks later, mid-rotation.
-    let key_source: Option<(&str, Vec<TokenKeyEntry>)> =
-        match (std::env::var("OBOLUS_TOKEN_KEYS"), std::env::var(SINGLE_KEY_VAR)) {
-            // Set-but-empty first, and ahead of the supersession bail below, for the reason the
-            // OBOLUS_ACCEPTS arms above give: that bail is actionable but its premise is false here.
-            // It would tell an operator whose array arrived empty that it supersedes their
-            // single-key configuration, when the true statement is that it configures nothing while
-            // superseding everything. Whitespace-only counts as empty for the same reason it does
-            // there — the operator did not mean to write JSON, so serde's "EOF while parsing a
-            // value" names no remedy they can act on.
-            (Ok(raw), _) if raw.trim().is_empty() => anyhow::bail!(
-                "OBOLUS_TOKEN_KEYS is set but empty. It reached this process carrying nothing — an \
-                 unexpanded ${{VAR}} or an EnvironmentFile line ending in `=` — which asks for a \
-                 token path and names no key to build one from."
-            ),
-            (Ok(_), Ok(_)) => anyhow::bail!(
-                "OBOLUS_TOKEN_KEYS and {SINGLE_KEY_VAR} are both set. The array form supersedes the \
-                 single-key one, which would then sit inert — and an inert verifying key stays \
-                 silent until a token signed with it is refused. Keep whichever one you meant."
-            ),
-            (Ok(raw), Err(_)) => Some(("OBOLUS_TOKEN_KEYS", parse_token_keys(&raw)?)),
-            (Err(_), Ok(path)) if path.trim().is_empty() => anyhow::bail!(
-                "{SINGLE_KEY_VAR} is set but empty. It is the variable whose presence decides \
-                 whether a token path exists at all, so an empty one asks for a token path and \
-                 names no key to build it from. Unset it to run with the 402 path alone, or point \
-                 it at the public key tokens are signed with."
-            ),
-            (Err(_), Ok(path)) => {
-                Some((SINGLE_KEY_VAR, vec![TokenKeyEntry { kid: None, file: path }]))
-            }
-            (Err(_), Err(_)) => None,
-        };
-
-    // The token path (#33). No key configured means no token path at all: every caller pays,
-    // which is both the previous behaviour and the fail-closed direction to default to.
-    let token: Option<TokenPath> = match key_source {
-        None => {
-            // ...but "no key configured" and "the key variable did not arrive" look identical from
-            // here, and the second one is silent: no token path, no error, and every caller getting
-            // a 402 is indistinguishable from a correctly working anonymous gateway. The operator
-            // who set an issuer meant to have a token path. Same argument, and the same shape, as
-            // `superseded_single_chain_vars` above — configuration that cannot mean what it says
-            // must refuse rather than be dropped.
-            let orphaned: Vec<&str> = ["OBOLUS_TOKEN_ISSUER", "OBOLUS_TOKEN_AUDIENCE"]
-                .into_iter()
-                .filter(|name| std::env::var(name).is_ok())
-                .collect();
-            if !orphaned.is_empty() {
-                anyhow::bail!(
-                    "{} set without OBOLUS_TOKEN_KEYS or {SINGLE_KEY_VAR}. Those configure a \
-                     bearer-token path that cannot exist without a verifying key, so this would \
-                     start a gateway that answers 402 to every caller while looking configured. \
-                     Name the key(s), or unset {}.",
-                    orphaned.join(" and "),
-                    orphaned.join(" and "),
-                );
-            }
-            None
-        }
-        Some((source, entries)) => {
-            // Required alongside the key, not optional: a signing key usually belongs to an
-            // identity provider rather than to one service, so with no `iss` to check, every token
-            // that key has ever minted — for anything — would buy inference here.
-            let issuer = std::env::var("OBOLUS_TOKEN_ISSUER").map_err(|_| {
-                anyhow::anyhow!(
-                    "{source} is set but OBOLUS_TOKEN_ISSUER is not. Set the issuer every honoured \
-                     token must carry, or unset the key to run with the 402 path alone."
-                )
-            })?;
-            // Set-but-empty is a startup error here for the same reason it is for the payment
-            // vars: it means something arrived carrying nothing (an unexpanded `${VAR}`, an
-            // `EnvironmentFile` line ending in `=`), and an empty issuer no token can match would
-            // boot a token path that silently honours nobody.
-            if issuer.trim().is_empty() {
-                anyhow::bail!(
-                    "OBOLUS_TOKEN_ISSUER is set but empty. No token can carry an empty `iss`, so \
-                     this would start a token path that refuses every caller."
-                );
-            }
-            // Optional, and its absence is not permissive: with no expected audience a token
-            // carrying `aud` is refused rather than honoured, because `aud` names the service the
-            // token was minted for and we cannot tell "for us" from "for something else".
-            let audience = match std::env::var("OBOLUS_TOKEN_AUDIENCE") {
-                Err(_) => None,
-                Ok(audience) if audience.trim().is_empty() => anyhow::bail!(
-                    "OBOLUS_TOKEN_AUDIENCE is set but empty. Unset it to refuse tokens that carry \
-                     an `aud` claim, or give it the audience Obolus should answer to."
-                ),
-                Ok(audience) => Some(audience),
-            };
-            // Read every named file before building anything: a set half-loaded is a rotation half
-            // armed, and the operator should hear about the unreadable one at startup rather than
-            // discover it when a token signed with that key is refused.
-            let mut keys = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let pem = std::fs::read(&entry.file)
-                    // Through `legible` although this is a bail: it prints after the posture lines
-                    // above, so a bare path carrying a newline could append one of its own.
-                    .map_err(|e| anyhow::anyhow!("{source} {}: {e}", legible(&entry.file)))?;
-                keys.push((entry.kid, pem));
-            }
-            let verifier = PublicKeyTokenVerifier::with_keys(&keys, &issuer, audience.as_deref())
-                .map_err(|e| anyhow::anyhow!("{source}: {e}"))?;
-            // No description composed here, deliberately. This file *could* format one from
-            // `issuer` and `audience` that the verifier does not hold — with `None` passed above,
-            // a banner announcing the configured audience while the `Validation` enforces none
-            // leaves both test targets green. The line comes off the verifier's own enforcing
-            // state instead — see `TokenVerifier::description`.
-            Some(TokenPath::new(Arc::new(verifier)))
-        }
-    };
-
-    // Installed last, after every refusal: starting the writer thread is the one side effect of
-    // selecting a sink, and a process that is about to refuse has nothing to record.
-    let gateway = match telemetry {
-        TelemetryChoice::Stdout => gateway.with_telemetry(Arc::new(LineSink::stdout()?)),
-        TelemetryChoice::Off => gateway,
-    };
-    let access = Access::new(gateway, token);
 
     // Read off the access surface, not off the configuration that built it — and printed before
     // `router` consumes it. This file is compiled by no test target, so anything keyed on a local

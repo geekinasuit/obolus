@@ -388,18 +388,32 @@ impl Run {
         self.must_say(PAST_STARTUP);
     }
 
-    /// A token-path guard fired: the binary bailed for the stated reason and announced no token
-    /// path.
+    /// A token-path guard fired: the binary bailed for the stated reason, before it printed any
+    /// posture line, and announced no token path.
     ///
-    /// Deliberately **not** [`Self::must_have_refused_during_startup`]. That one asserts the absence
-    /// of [`PAST_STARTUP`], which `main` prints ~130 lines *above* the token block — so every token
-    /// refusal has already printed it, and reusing it here would assert something that is false by
-    /// construction. What distinguishes a token refusal is the bail plus the absence of
-    /// [`TOKEN_ENABLED`]: nothing was served, and nothing claimed a token path exists.
+    /// The absence of every [`STARTUP_LINE`]-prefixed line is the ordering claim `main` makes for
+    /// the token block (#42): a token refusal lands before the banner, like every other
+    /// configuration refusal, so the refusal is the only thing the operator reads. Checked for the
+    /// prefix rather than for chosen banner lines, so a posture line printed early is caught whichever
+    /// line it is. `main` prints nothing with that prefix before the banner, so a run that refused in
+    /// time has none. [`TOKEN_ENABLED`]'s absence is the separate claim that nothing said a token
+    /// path exists.
     fn must_have_refused_the_token_path(&self, because: &str) {
         self.must_say(BAILED);
         self.must_say(because);
+        self.must_have_refused_during_startup();
+        self.must_have_printed_no_startup_line();
         self.must_not_say(TOKEN_ENABLED);
+    }
+
+    /// No line of stderr carries `main`'s [`STARTUP_LINE`] prefix: the process refused before it
+    /// printed any part of the banner.
+    fn must_have_printed_no_startup_line(&self) {
+        assert!(
+            !self.stderr.lines().any(|line| line.starts_with(STARTUP_LINE)),
+            "expected no {STARTUP_LINE:?} line before the refusal; got:\n{}",
+            self.stderr
+        );
     }
 }
 
@@ -1071,7 +1085,8 @@ fn a_newline_in_an_operator_value_cannot_forge_a_startup_line() {
     // all-clear posture line to a gateway that never printed it (#16).
     //
     // One variable per site that prints one, each on its own run, so a site that drops `legible` is
-    // named by the failure. The key file is a bail, not a banner: it prints after the posture lines.
+    // named by the failure. The key file is a bail, not a banner: it prints in place of the posture
+    // lines, so a forged all-clear there would be the only one in the log.
     for (var, value) in [
         ("OBOLUS_ASSET", "0xusdc"),
         ("OBOLUS_PAY_TO", "0xpayee"),
@@ -1080,12 +1095,14 @@ fn a_newline_in_an_operator_value_cannot_forge_a_startup_line() {
         ("OBOLUS_TOKEN_PUBKEY_FILE", "/nonexistent/key.pem"),
     ] {
         let forged = format!("{value}\nobolus: {ALL_CLEAR_CLAIM}.");
-        let run = run(&[
-            ("OBOLUS_NETWORK", TESTNET),
-            ("OBOLUS_EXTRA", EVM_EXTRA),
-            ("OBOLUS_TOKEN_ISSUER", TEST_ISSUER),
-            (var, &forged),
-        ]);
+        let mut vars =
+            vec![("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA), (var, forged.as_str())];
+        // Only the key file needs an issuer: set without a key, the issuer is itself refused, before
+        // the banner lines the other variables print on.
+        if var == "OBOLUS_TOKEN_PUBKEY_FILE" {
+            vars.push(("OBOLUS_TOKEN_ISSUER", TEST_ISSUER));
+        }
+        let run = run(&vars);
 
         assert!(
             !run.stderr.lines().any(|line| line.starts_with("obolus: every advertised")),
@@ -1096,7 +1113,7 @@ fn a_newline_in_an_operator_value_cannot_forge_a_startup_line() {
     }
 
     // A JSON-structured variable cannot carry the payload as a suffix, but serde names an unknown
-    // field verbatim, and that parse error also prints after the posture lines.
+    // field verbatim, and that parse error is a bail too.
     let keys = format!(r#"[{{"file":"/nonexistent/key.pem","k\nobolus: {ALL_CLEAR_CLAIM}.":1}}]"#);
     let run = run(&[
         ("OBOLUS_NETWORK", TESTNET),
@@ -1489,18 +1506,17 @@ fn a_malformed_key_array_refuses_rather_than_dropping_keys() {
     let empty_kid = format!(r#"[{{"file":"{readable}","kid":""}}]"#);
 
     // Each of these would otherwise arm fewer keys than the operator wrote — which is silent until
-    // the missing key's tokens arrive.
-    for raw in [
-        "[]",
-        "",
-        r#"[{"kid":"alpha"}]"#,
-        r#"[{"file":"/nope.pem","kid":"alpha"}]"#,
-        empty_kid.as_str(),
+    // the missing key's tokens arrive. Each needle is that row's own refusal.
+    for (raw, because) in [
+        ("[]", "OBOLUS_TOKEN_KEYS is an empty array"),
+        ("", "OBOLUS_TOKEN_KEYS is set but empty"),
+        (r#"[{"kid":"alpha"}]"#, "OBOLUS_TOKEN_KEYS must be a JSON array"),
+        (r#"[{"file":"/nope.pem","kid":"alpha"}]"#, "/nope.pem"),
+        (empty_kid.as_str(), "a key has an empty kid"),
     ] {
         let run = run(&[("OBOLUS_TOKEN_KEYS", raw), ("OBOLUS_TOKEN_ISSUER", TEST_ISSUER)]);
 
-        run.must_say(BAILED);
-        run.must_not_say(TOKEN_ENABLED);
+        run.must_have_refused_the_token_path(because);
     }
 }
 
@@ -1556,6 +1572,79 @@ fn an_instance_with_no_token_configuration_announces_no_token_path() {
 
     run.must_have_got_past_startup();
     run.must_not_say(TOKEN_ENABLED);
+}
+
+#[test]
+fn a_token_refusal_never_advertises_anything_first() {
+    // The token block's half of the ordering `a_refusal_never_advertises_anything_first` pins for the
+    // arming guard (#42). On a real testnet, not the harness's placeholder baseline: the placeholder
+    // never earns the all-clear, so its absence there would prove nothing about ordering.
+    let fixture = [("OBOLUS_NETWORK", TESTNET), ("OBOLUS_EXTRA", EVM_EXTRA)];
+
+    // The control: this fixture does print the all-clear once nothing refuses, so its absence below
+    // is the ordering and not the fixture.
+    let clean = run(&fixture);
+    clean.must_have_got_past_startup();
+    clean.must_say(ALL_CLEAR_CLAIM);
+
+    let refused = run(&[fixture[0], fixture[1], ("OBOLUS_TOKEN_PUBKEY_FILE", ABSENT_KEY_PATH)]);
+    refused.must_have_refused_the_token_path("OBOLUS_TOKEN_ISSUER is not");
+    refused.must_not_say(ALL_CLEAR_CLAIM);
+}
+
+#[test]
+fn a_network_refusal_is_reported_before_a_token_refusal() {
+    // The other half of where the token block sits: below the arming guard, not above it. With both
+    // the network and the token configuration wrong, the operator is told about the network — the
+    // advertisement a client pays against — and hears about the token path once that is fixed.
+    //
+    // One row per refusal the block can make, since any one of them could be hoisted on its own.
+    // Each needle is that refusal's own text.
+    let key = temp_file("obolus-token-precedence.pem", SYNTHETIC_PUBKEY_PEM);
+    let keys = format!("[{{\"kid\":\"alpha\",\"file\":\"{key}\"}}]");
+    let empty_kid = format!(r#"[{{"file":"{key}","kid":""}}]"#);
+    let issuer = ("OBOLUS_TOKEN_ISSUER", TEST_ISSUER);
+    for (token_vars, token_refusal) in [
+        (vec![("OBOLUS_TOKEN_KEYS", ""), issuer], "OBOLUS_TOKEN_KEYS is set but empty"),
+        (
+            vec![
+                ("OBOLUS_TOKEN_KEYS", keys.as_str()),
+                ("OBOLUS_TOKEN_PUBKEY_FILE", key.as_str()),
+                issuer,
+            ],
+            "OBOLUS_TOKEN_KEYS and OBOLUS_TOKEN_PUBKEY_FILE are both set",
+        ),
+        (vec![("OBOLUS_TOKEN_KEYS", "[]"), issuer], "OBOLUS_TOKEN_KEYS is an empty array"),
+        (
+            vec![("OBOLUS_TOKEN_PUBKEY_FILE", ""), issuer],
+            "OBOLUS_TOKEN_PUBKEY_FILE is set but empty",
+        ),
+        (vec![issuer], "without OBOLUS_TOKEN_KEYS"),
+        (vec![("OBOLUS_TOKEN_PUBKEY_FILE", ABSENT_KEY_PATH)], "OBOLUS_TOKEN_ISSUER is not"),
+        (
+            vec![("OBOLUS_TOKEN_PUBKEY_FILE", key.as_str()), ("OBOLUS_TOKEN_ISSUER", "")],
+            "OBOLUS_TOKEN_ISSUER is set but empty",
+        ),
+        (
+            vec![("OBOLUS_TOKEN_PUBKEY_FILE", key.as_str()), issuer, ("OBOLUS_TOKEN_AUDIENCE", "")],
+            "OBOLUS_TOKEN_AUDIENCE is set but empty",
+        ),
+        (vec![("OBOLUS_TOKEN_PUBKEY_FILE", ABSENT_KEY_PATH), issuer], ABSENT_KEY_PATH),
+        (vec![("OBOLUS_TOKEN_KEYS", empty_kid.as_str()), issuer], "a key has an empty kid"),
+    ] {
+        let on = |network| {
+            [vec![("OBOLUS_NETWORK", network), ("OBOLUS_EXTRA", EVM_EXTRA)], token_vars.clone()]
+                .concat()
+        };
+
+        // The control: the token configuration alone does refuse, with this needle.
+        run(&on(TESTNET)).must_have_refused_the_token_path(token_refusal);
+
+        let run = run(&on(MAINNET));
+        run.must_say("not on Obolus's pinned testnet allowlist");
+        run.must_have_refused_during_startup();
+        run.must_not_say(token_refusal);
+    }
 }
 
 // ---- backend configuration, OBOLUS_BACKENDS_FILE (#55) ----
