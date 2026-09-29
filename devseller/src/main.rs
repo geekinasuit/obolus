@@ -164,6 +164,32 @@ fn env_or(key: &str, default: &str) -> anyhow::Result<String> {
     }
 }
 
+/// One line per advertised option that `check` refuses, each naming the option's position, its
+/// network and the reason — for a startup guard to report every offender at once rather than
+/// stopping at the first. Empty when every option passes.
+///
+/// The position is what locates an option in an `OBOLUS_ACCEPTS` array: several entries can share
+/// a network, and `PaymentRequirements` carries no other printed field to find one by.
+fn offenders<E: std::fmt::Display>(
+    requirements: &[PaymentRequirements],
+    check: impl Fn(&PaymentRequirements) -> Result<(), E>,
+) -> Vec<String> {
+    requirements
+        .iter()
+        .enumerate()
+        .filter_map(|(index, r)| {
+            check(r).err().map(|e| {
+                format!(
+                    "\n  · option {} of {} (network {}): {e}",
+                    index + 1,
+                    requirements.len(),
+                    legible(&r.network)
+                )
+            })
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Before anything reads the environment. An unconfigured process falls through to the
@@ -323,35 +349,41 @@ async fn main() -> anyhow::Result<()> {
     // to name. Obolus's pinned allowlist admits non-EVM testnets whose recipients are not hex at all
     // — Solana's are base58 — and refusing those would reject configurations this binary can
     // legitimately serve under `accept`. What cannot be checked is left alone rather than guessed at.
+    //
+    // Every offender is collected and named in one refusal, like the placeholder guard above, so an
+    // operator with two bad recipients in an array fixes both on one restart — and so the count this
+    // prints is a census, not the position of the first one found. The census is per guard: an
+    // array that also fails the verify-mode guard below is told about that on the next start.
     let via_accepts = std::env::var("OBOLUS_ACCEPTS").is_ok();
-    for (index, r) in requirements.iter().enumerate() {
+    let unpayable_recipients = offenders(&requirements, |r| {
         if verify::chain_id_of(&r.network).is_err() {
-            continue;
+            return Ok(());
         }
-        verify::pay_to_of(r).map_err(|e| {
-            // The remedy has to match the door the operator actually used. The two are mutually
-            // exclusive, so telling an OBOLUS_ACCEPTS user to set OBOLUS_PAY_TO sends them into a
-            // second refusal rather than out of the first. The contrast with `obolus` goes on the
-            // single-chain branch for the same reason: only there is the offending value something
-            // an *unset* variable defaulted to, so only there does it explain where it came from.
-            let remedy = if via_accepts {
-                "Give that entry's \"payTo\" key a 20-byte hex address. Setting OBOLUS_PAY_TO will \
-                 not work here: OBOLUS_ACCEPTS supersedes the single-chain variables, so setting \
-                 both is itself a startup refusal."
-            } else {
-                "Set OBOLUS_PAY_TO to a 20-byte hex address. `obolus` boots on the built-in \
-                 placeholder this falls back to, because a gateway with no configured recipient is \
-                 still a gateway waiting to be configured."
-            };
-            anyhow::anyhow!(
-                "{e}\nAdvertised option {} of {} (network {}) cannot be paid. {remedy}\nA seller \
-                 that cannot be paid exercises nothing, and the client author debugging it sees \
-                 their own signing code fail.",
-                index + 1,
-                requirements.len(),
-                r.network
-            )
-        })?;
+        verify::pay_to_of(r).map(|_| ())
+    });
+    if !unpayable_recipients.is_empty() {
+        // The remedy has to match the door the operator actually used. The two are mutually
+        // exclusive, so telling an OBOLUS_ACCEPTS user to set OBOLUS_PAY_TO sends them into a
+        // second refusal rather than out of the first. The contrast with `obolus` goes on the
+        // single-chain branch for the same reason: only there is the offending value something an
+        // *unset* variable defaulted to, so only there does it explain where it came from.
+        let remedy = if via_accepts {
+            "Give each such entry's \"payTo\" key a 20-byte hex address. Setting OBOLUS_PAY_TO will \
+             not work here: OBOLUS_ACCEPTS supersedes the single-chain variables, so setting both \
+             is itself a startup refusal."
+        } else {
+            "Set OBOLUS_PAY_TO to a 20-byte hex address. `obolus` boots on the built-in \
+             placeholder this falls back to, because a gateway with no configured recipient is \
+             still a gateway waiting to be configured."
+        };
+        anyhow::bail!(
+            "{} of {} advertised option(s) cannot be paid:{}\n{remedy}\nA seller that cannot be \
+             paid exercises nothing, and the client author debugging it sees their own signing \
+             code fail.",
+            unpayable_recipients.len(),
+            requirements.len(),
+            unpayable_recipients.join("")
+        );
     }
 
     // The same two-directions argument as the placeholder network, on the other placeholder. The
@@ -381,16 +413,20 @@ async fn main() -> anyhow::Result<()> {
     // Under real verification every advertised option must actually be verifiable, and that is
     // knowable now. Left to request time it becomes a rejection on every payment, which reads to a
     // client author as "my signing is broken" rather than "the seller is misconfigured".
+    // Every offender is named, for the reason the recipient guard above gives.
     if dev.verify == VerifyMode::Verify {
-        for r in &requirements {
-            verify::domain_for(r).map_err(|e| {
-                anyhow::anyhow!(
-                    "{e}\nOBOLUS_DEV_VERIFY=verify checks signatures offline, so every advertised \
-                     option must carry an EVM chain id, a 20-byte asset address, and the token's \
-                     EIP-712 name and version in its extra. Fix the option, or set \
-                     OBOLUS_DEV_VERIFY=accept to serve without inspecting payments."
-                )
-            })?;
+        let unverifiable = offenders(&requirements, |r| verify::domain_for(r).map(|_| ()));
+        if !unverifiable.is_empty() {
+            anyhow::bail!(
+                "{} of {} advertised option(s) cannot be verified:{}\nOBOLUS_DEV_VERIFY=verify \
+                 checks signatures offline, so every advertised option must carry an EVM chain id, \
+                 a 20-byte asset address, and the token's EIP-712 name and version in its extra. \
+                 Fix each such option, or set OBOLUS_DEV_VERIFY=accept to serve without inspecting \
+                 payments.",
+                unverifiable.len(),
+                requirements.len(),
+                unverifiable.join("")
+            );
         }
     }
 

@@ -754,6 +754,52 @@ fn the_unpayable_recipient_remedy_matches_the_configuration_door() {
     via_one_entry_array.must_say("option 1 of 1");
 }
 
+/// Two bad recipients in one array are both named, in one refusal (#24).
+///
+/// An operator who mistyped two entries should fix both on one restart, and the count the refusal
+/// prints should be a census rather than the position of the first offender found. The good entry
+/// sits between the two bad ones so that "stops at the first" and "names every one" cannot both
+/// satisfy the assertions.
+#[test]
+fn every_unpayable_recipient_is_named_in_one_refusal() {
+    let good = format!(
+        r#"{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
+            "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}}"#
+    );
+    let bad = format!(
+        r#"{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
+            "payTo":"{PLACEHOLDER_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}}"#
+    );
+    let run = run_accepts(&format!("[{bad},{good},{bad}]"));
+
+    run.must_say("2 of 3 advertised option(s) cannot be paid");
+    run.must_say(&format!("option 1 of 3 (network {TESTNET:?})"));
+    run.must_say(&format!("option 3 of 3 (network {TESTNET:?})"));
+    run.must_not_say("option 2 of 3");
+    run.must_have_refused_during_startup();
+}
+
+/// The verify-mode domain guard names every option it cannot verify, for the same reason (#24).
+#[test]
+fn every_unverifiable_option_is_named_in_one_refusal() {
+    let good = format!(
+        r#"{{"network":"{TESTNET}","asset":"{SYNTHETIC_ASSET}",
+            "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}}"#
+    );
+    let bad = format!(
+        r#"{{"network":"{TESTNET}","asset":"{UNVERIFIABLE_ASSET}",
+            "payTo":"{SYNTHETIC_PAY_TO}","amount":"1000","extra":{SYNTHETIC_EXTRA}}}"#
+    );
+    let run = run_accepts(&format!("[{bad},{good},{bad}]"));
+
+    run.must_say("2 of 3 advertised option(s) cannot be verified");
+    run.must_say(&format!("option 1 of 3 (network {TESTNET:?})"));
+    run.must_say(&format!("option 3 of 3 (network {TESTNET:?})"));
+    run.must_not_say("option 2 of 3");
+    run.must_say("OBOLUS_DEV_VERIFY=verify checks signatures offline");
+    run.must_have_refused_during_startup();
+}
+
 /// The built-in placeholder recipient is refused on a network whose recipients cannot be inspected.
 ///
 /// The shape check cannot reach this: it declines to judge a base58 recipient, correctly, and this
