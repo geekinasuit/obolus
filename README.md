@@ -48,6 +48,7 @@ without crypto, and A1's types are built to preserve it.
 | `docs/architecture.md` | **The map:** what Obolus is, the components and seams it is built from, and the paths a request takes — for a reader with no prior context |
 | `docs/pricing.md` | **Pricing design:** how a request's price is decided — the cost-vs-quote denomination frame, the rate structures, the config, and the granularity decision |
 | `docs/telemetry.md` | **Telemetry design:** the one event recorded per request, how its cost and revenue are derived, and the line format an operator's tooling reads |
+| `docs/exposure.md` | **Exposing it:** terminating TLS in front of the gateway (reverse proxy, `tailscale serve`), the wider bind and what it costs, and the development seller's open-proxy refusal |
 | `docs/vision.md` | Product vision and the settled design directions the seams are built to honor |
 
 ## Build and test
@@ -182,8 +183,8 @@ settle deadline.
 This is **outbound** TLS: the gateway as a client. Inbound TLS — clients reaching the gateway — is a
 separate question with the same answer for a different reason: it is terminated outside the process
 so that the binary holds no private key. [Serving without payment](#serving-without-payment) says
-what that costs on the token path, and [#26](https://github.com/geekinasuit/obolus/issues/26) tracks
-the exposure guide.
+what that costs on the token path, and [`docs/exposure.md`](docs/exposure.md) covers how to put a
+reverse proxy or `tailscale serve` in front of the gateway, and what a wider bind costs.
 
 ## Refusing to advertise an unproven network
 
