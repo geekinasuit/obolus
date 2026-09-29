@@ -597,6 +597,34 @@ mod kat_tests {
     }
 }
 
+/// Refusal wording pinned whole, so that changing what a client author reads is a deliberate edit
+/// rather than an incidental one (#39). The values are ours, not a published vector.
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+
+    /// The message a client author reads when their signature does not recover. A cryptographic
+    /// mismatch has no single wrong field to point at, so the wording — which domain was used and
+    /// what to check — is most of the diagnosis.
+    #[test]
+    fn a_signature_that_does_not_recover_names_both_parties_and_the_domain() {
+        let error = VerifyError::NotRecovered {
+            expected: "0xaa".to_string(),
+            recovered: "0xbb".to_string(),
+            domain: "the-domain".to_string(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "signature does not recover to the authorizing party.\n  authorization.from: 0xaa\n  \
+             recovered:          0xbb\n  verified under EIP-712 domain: the-domain\n  That is the \
+             domain this seller advertised (extra.name and extra.version, the asset, the chain \
+             id). A client that signs under the challenge's extra agrees with it, so check that \
+             the client signed under the advertised extra, over this exact authorization."
+        );
+    }
+}
+
 #[cfg(test)]
 mod decode_tests {
     use super::*;
