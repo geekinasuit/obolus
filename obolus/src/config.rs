@@ -13,6 +13,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::arming::{escape_controls, legible};
 use crate::backends::Backends;
 use crate::x402::{
     validate_atomic_amount, PaymentRequirements, ResourceInfo, UnsupportedTransfer, SCHEME_EXACT,
@@ -271,6 +272,9 @@ pub fn validated_option(
         extra: extra.map(Value::Object),
     };
     if let Some(UnsupportedTransfer { key, value, supported }) = option.unsupported_transfer() {
+        // `value` is the configured JSON, whose own escaping leaves U+2028 and the bidi characters
+        // raw, and this defect is printed at startup.
+        let value = escape_controls(&value);
         return Err(EntryDefect::UnsupportedTransfer { key, value, supported });
     }
     Ok(option)
@@ -283,8 +287,10 @@ pub fn parse_accepts(
     raw: &str,
     shared: &SharedOffer,
 ) -> Result<Vec<PaymentRequirements>, ConfigError> {
-    let entries: Vec<AcceptEntry> =
-        serde_json::from_str(raw).map_err(|e| ConfigError::Malformed(e.to_string()))?;
+    // serde quotes an unknown field's name verbatim, so its message goes through `escape_controls`
+    // before anything can print it (#16).
+    let entries: Vec<AcceptEntry> = serde_json::from_str(raw)
+        .map_err(|e| ConfigError::Malformed(escape_controls(&e.to_string())))?;
     if entries.is_empty() {
         return Err(ConfigError::Empty);
     }
@@ -345,7 +351,9 @@ pub fn parse_extra(raw: Option<&str>) -> Result<Option<Map<String, Value>>, Extr
     }
     serde_json::from_str::<Map<String, Value>>(raw)
         .map(Some)
-        .map_err(|e| ExtraError::NotAnObject(e.to_string()))
+        // No serde message for a free-form map quotes operator text raw today (a mistyped string is
+        // rendered with `{:?}`); escaped anyway, so every configuration parse error is held to one rule.
+        .map_err(|e| ExtraError::NotAnObject(escape_controls(&e.to_string())))
 }
 
 /// Which of the [`SINGLE_CHAIN_VARS`] are present, given a presence probe. Taking the probe as an
@@ -593,7 +601,9 @@ pub fn require_backend_costs(
             .backends()
             .iter()
             .filter(|b| select(b))
-            .map(|b| b.id.clone())
+            // Quoted and escaped: an id is operator text, and these refusals print before the
+            // posture lines, so a newline in one could write a startup line of its own (#16).
+            .map(|b| legible(&b.id))
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -930,6 +940,17 @@ mod tests {
     }
 
     #[test]
+    fn an_accepts_parse_error_cannot_start_a_line() {
+        // serde names an unknown field verbatim, and a JSON key can carry `\n` and U+2028 as
+        // escapes; unescaped, the key would write a startup line of its own.
+        let raw = r#"[{"network":"n","asset":"a","payTo":"p","amount":"1","x\nobolus: forged\u2028line":1}]"#;
+        let message = parse_accepts(raw, &shared()).unwrap_err().to_string();
+        assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+        assert!(!message.contains('\u{2028}'), "a raw U+2028 reached the message: {message}");
+        assert!(message.contains(r"x\nobolus: forged\u{2028}line"), "the field must be named, escaped: {message}");
+    }
+
+    #[test]
     fn a_missing_field_is_rejected() {
         let raw = r#"[{"network":"n","asset":"a","amount":"1"}]"#; // no payTo
         let err = parse_accepts(raw, &shared()).unwrap_err();
@@ -1114,6 +1135,27 @@ mod tests {
             option(&format!(r#"{{{TOKEN_DOMAIN},"assetTransferMethod":"permit2"}}"#)),
             Err(EntryDefect::UnsupportedTransfer { key: "assetTransferMethod", .. })
         ));
+    }
+
+    #[test]
+    fn an_unsupported_transfer_value_cannot_start_a_line() {
+        // JSON escapes a newline in the value already; U+2028 it leaves raw.
+        let separator = char::from_u32(0x2028).unwrap();
+        let extra = parse_extra(Some(&format!(
+            r#"{{{TOKEN_DOMAIN},"paymentFlow":"x{separator}obolus: listening on http://127.0.0.1:1"}}"#
+        )))
+        .unwrap();
+        let err = validated_option(
+            "eip155:84532".into(),
+            "0xAAA".into(),
+            "0xPAYA".into(),
+            "1000",
+            extra,
+            &shared(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, EntryDefect::UnsupportedTransfer { .. }), "got {err:?}");
+        assert!(!err.to_string().contains(separator), "{err}");
     }
 
     #[test]
@@ -1366,7 +1408,7 @@ mod tests {
         let pricing = PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None };
         let err = require_backend_costs(&backends, pricing).unwrap_err();
         assert!(
-            matches!(&err, PricingConfigError::MissingBackendCost { ids } if ids == "no-cost"),
+            matches!(&err, PricingConfigError::MissingBackendCost { ids } if ids == r#""no-cost""#),
             "got {err:?}",
         );
     }
@@ -1386,9 +1428,26 @@ mod tests {
             Backends::from_parts(vec![backend_costing("plain", None), backend_costing("priced", Some(1000))]);
         let err = require_backend_costs(&backends, PricingChoice::Static).unwrap_err();
         assert!(
-            matches!(&err, PricingConfigError::InertBackendCost { ids } if ids == "priced"),
+            matches!(&err, PricingConfigError::InertBackendCost { ids } if ids == r#""priced""#),
             "got {err:?}",
         );
+    }
+
+    #[test]
+    fn a_backend_id_in_a_cost_refusal_cannot_start_a_line() {
+        // These refusals print before the posture lines, so an id carrying a newline would
+        // otherwise write a startup line of its own.
+        let forged = "a\nobolus: listening on http://127.0.0.1:8403";
+        for pricing in [
+            PricingChoice::Static,
+            PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None },
+        ] {
+            let cost = matches!(pricing, PricingChoice::Static).then_some(1000);
+            let backends = Backends::from_parts(vec![backend_costing(forged, cost)]);
+            let message = require_backend_costs(&backends, pricing).unwrap_err().to_string();
+            assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+            assert!(message.contains(r#""a\nobolus: listening on"#), "quoted, escaped: {message}");
+        }
     }
 
     // The boot instant these promo tests place windows relative to. Fixed, so every refusal —

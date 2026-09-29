@@ -154,19 +154,49 @@ fn is_placeholder_variant(network: &str) -> bool {
     trimmed == PLACEHOLDER_NETWORK || trimmed.eq_ignore_ascii_case(PLACEHOLDER_NETWORK)
 }
 
-/// Render a network id the way a refusal has to: quoted, **and** with every non-ASCII character
-/// escaped.
+/// Render an operator-supplied value the way a log line has to: quoted, **and** with every control
+/// and non-ASCII character escaped.
+///
+/// The escaping is also what keeps a value from writing log lines of its own: a newline in it
+/// renders as `\n`, so a value carrying `\nobolus: testnet-by-construction …` cannot print a
+/// posture line the gateway never printed (#16).
 ///
 /// `{:?}` does only half the job. The quotes are load-bearing — they are what makes a trailing space
 /// legible at all — but `Debug for str` escapes via `escape_debug`, which leaves *printable*
 /// non-ASCII alone, rendering U+00A0 as an ordinary space and Cyrillic 'е' (U+0435) as 'e': exactly
 /// the two characters an operator most needs to see. `escape_default` escapes those as `\u{...}`.
 ///
-/// Every offender list in this crate — the refusal here and the MAINNET ARMED banner in `main.rs` —
-/// goes through this one function, so the format cannot be legible in one message and lying in the
-/// next.
-pub fn legible(network: &str) -> String {
-    format!("\"{}\"", network.escape_default())
+/// Every operator-supplied value the startup output prints goes through this one function: the
+/// offender lists in the refusal here and the MAINNET ARMED banner, the per-option and per-backend
+/// lines, the facilitator URL and the bearer-token banner. So the format cannot be legible in one
+/// message and lying in the next.
+pub fn legible(value: &str) -> String {
+    format!("\"{}\"", value.escape_default())
+}
+
+/// Escape the characters in a *message* that can start a log line or rewrite one, and leave the rest
+/// readable. Those are controls (`\n`, `\r`, ESC, C1), the Unicode line and paragraph separators, and
+/// the bidirectional formatting characters.
+///
+/// For prose that quotes operator text rather than for a single value, which is [`legible`]'s job.
+/// A serde error is the case in point: it names an unknown field or an unexpected string verbatim,
+/// so an operator value carrying `\nobolus: listening on …` could otherwise print the gateway's own
+/// lines, whether before the banner or after it (#16). `legible` would also escape serde's quotes and
+/// every non-ASCII letter, which garbles a message no one is trying to read byte for byte.
+pub fn escape_controls(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let bidi = matches!(
+                c,
+                '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            );
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' || bidi {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 /// Not byte-exact, and not a whitespace- or case-variant either — does `network` carry non-ASCII
@@ -312,7 +342,11 @@ fn arming_prescription(unproven: &[String]) -> String {
         [only] => format!("Here that is {}.", legible(only)),
         // The quoted list is for reading — it makes a stray byte visible — but it is not the value:
         // copied with its separators it would arm `" eip155:1"`. So the value is spelled out too,
-        // exactly as it goes into the environment.
+        // exactly as it goes into the environment, but only when every id is visible ASCII: spelled
+        // out raw, an id carrying a newline could print a line of its own (#16).
+        many if many.iter().any(|id| !id.bytes().all(|b| b.is_ascii_graphic())) => {
+            format!("Here that is {}.", ids_or(many, ""))
+        }
         many => format!(
             "Here that is {} (as one value: OBOLUS_ALLOW_MAINNET={}).",
             ids_or(many, ""),
@@ -828,6 +862,18 @@ mod tests {
 
     /// Ethereum mainnet: a second unproven network, for the tests where one is armed and one is not.
     const ETH_MAINNET: &str = "eip155:1";
+
+    #[test]
+    fn escape_controls_escapes_what_can_start_or_rewrite_a_line_and_nothing_else() {
+        let hostile = "a\nb\rc\u{1b}[2Jd\u{85}e\u{2028}f\u{2029}g\u{202E}h\u{2066}i\u{200F}j\u{061C}k";
+        assert_eq!(
+            escape_controls(hostile),
+            r"a\nb\rc\u{1b}[2Jd\u{85}e\u{2028}f\u{2029}g\u{202e}h\u{2066}i\u{200f}j\u{61c}k"
+        );
+        // Quotes and readable non-ASCII are prose, not threats: they pass through untouched.
+        let prose = "unknown field `café`, expected \"payTo\" — Cyrillic е";
+        assert_eq!(escape_controls(prose), prose);
+    }
 
     /// The un-armed refusal every diagnosis test expects. A mismatch here is a test defect — none of
     /// those tests names anything in the arming set — so it panics with the message rather than
@@ -1972,6 +2018,14 @@ mod tests {
             ),
             "got: {msg}"
         );
+
+        // An id that is not visible ASCII is not spelled out raw: a newline in it would start a line.
+        let forged = "solana:x\nobolus: listening on http://127.0.0.1:1";
+        let err =
+            mismatch_of(check_arming(&[req(BASE_MAINNET), req(forged)], &armed(&["eip155:8543"])).unwrap_err());
+        let msg = err.to_string();
+        assert!(!msg.contains('\n'), "got: {msg}");
+        assert!(msg.ends_with(&format!("Here that is {}, {}.", legible(BASE_MAINNET), legible(forged))), "got: {msg}");
     }
 
     #[test]

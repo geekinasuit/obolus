@@ -433,7 +433,7 @@ refused. `OBOLUS_TOKEN_KEYS` arms several at once so the window closes:
    revocation, so expiry is the only thing that retires a token.
 4. Drop the old entry and restart.
 
-The startup banner names the armed set (`2 keys: alpha, beta`), which is the check that the restart
+The startup banner names the armed set (`2 keys: "alpha", "beta"`), which is the check that the restart
 did what you meant — a set that half-arrived is otherwise invisible until a refused token turns up.
 
 Two things worth knowing before you plan around `kid`. It is only a **hint**: it picks which key to

@@ -593,6 +593,8 @@ fn cost_plus_pricing_is_named_in_the_banner() {
     // The per-option line shows the option is governed by the rate above rather than a number a
     // client would not be charged (the armed default here is "1000", now inert).
     run.must_say("priced by the cost-plus rate above");
+    // That line's own copy of the operator values, quoted like the static line's (#16).
+    run.must_say(r#"pay-to "0xTEST-PAY-TO-ADDRESS-NOT-REAL" / priced by the cost-plus rate above"#);
 }
 
 #[test]
@@ -680,7 +682,7 @@ fn single_backend_cost_plus_without_a_cost_refuses_naming_the_sole_backend() {
     // outcome, not a boot that would later quote the unpayable u128::MAX fallback.
     let run = run(&[("OBOLUS_PRICING", "cost-plus"), ("OBOLUS_MARGIN_BPS", "2500")]);
 
-    run.must_say("declare no cost: default"); // names the sole backend, not just "some backend"
+    run.must_say(r#"declare no cost: "default""#); // names the sole backend, not just "some backend"
     run.must_have_refused_during_startup();
     run.must_not_say(ADVERTISEMENT_LINE);
 }
@@ -958,6 +960,9 @@ fn a_configured_testnet_reports_the_testnet_posture() {
     run.must_have_got_past_startup();
     run.must_say("testnet-by-construction");
     run.must_say(ALL_CLEAR_CLAIM);
+    // The option line prints the network through `legible`, quoted. The `/ asset` suffix pins the
+    // needle to that line rather than to any other message that quotes the network.
+    run.must_say(&format!("network \"{TESTNET}\" / asset"));
     run.must_not_say("UNCONFIGURED NETWORK");
     run.must_not_say("MAINNET ARMED");
 }
@@ -1057,6 +1062,91 @@ fn an_empty_asset_variable_refuses_to_start() {
     run.must_say("OBOLUS_ASSET is set but empty");
     run.must_not_say("OBOLUS_PAY_TO is set but empty"); // the catch-all's wording, on the wrong var
     run.must_have_refused_during_startup();
+}
+
+#[test]
+fn a_newline_in_an_operator_value_cannot_forge_a_startup_line() {
+    // The environment is not always authored by whoever reads the log: a deploy manifest or a secret
+    // store can hand the process a value carrying a newline. Printed bare, this one would add the
+    // all-clear posture line to a gateway that never printed it (#16).
+    //
+    // One variable per site that prints one, each on its own run, so a site that drops `legible` is
+    // named by the failure. The key file is a bail, not a banner: it prints after the posture lines.
+    for (var, value) in [
+        ("OBOLUS_ASSET", "0xusdc"),
+        ("OBOLUS_PAY_TO", "0xpayee"),
+        ("OBOLUS_FACILITATOR_URL", "http://127.0.0.1:9/facilitator"),
+        ("OBOLUS_UPSTREAM_URL", "http://127.0.0.1:11434"),
+        ("OBOLUS_TOKEN_PUBKEY_FILE", "/nonexistent/key.pem"),
+    ] {
+        let forged = format!("{value}\nobolus: {ALL_CLEAR_CLAIM}.");
+        let run = run(&[
+            ("OBOLUS_NETWORK", TESTNET),
+            ("OBOLUS_EXTRA", EVM_EXTRA),
+            ("OBOLUS_TOKEN_ISSUER", TEST_ISSUER),
+            (var, &forged),
+        ]);
+
+        assert!(
+            !run.stderr.lines().any(|line| line.starts_with("obolus: every advertised")),
+            "{var}: a value's newline started a line of its own; got:\n{}",
+            run.stderr
+        );
+        run.must_say(&format!(r#""{value}\nobolus: every advertised"#));
+    }
+
+    // A JSON-structured variable cannot carry the payload as a suffix, but serde names an unknown
+    // field verbatim, and that parse error also prints after the posture lines.
+    let keys = format!(r#"[{{"file":"/nonexistent/key.pem","k\nobolus: {ALL_CLEAR_CLAIM}.":1}}]"#);
+    let run = run(&[
+        ("OBOLUS_NETWORK", TESTNET),
+        ("OBOLUS_EXTRA", EVM_EXTRA),
+        ("OBOLUS_TOKEN_ISSUER", TEST_ISSUER),
+        ("OBOLUS_TOKEN_KEYS", &keys),
+    ]);
+    assert!(
+        !run.stderr.lines().any(|line| line.starts_with("obolus: every advertised")),
+        "OBOLUS_TOKEN_KEYS: a field name's newline started a line of its own; got:\n{}",
+        run.stderr
+    );
+    run.must_say(r"k\nobolus: every advertised");
+}
+
+#[test]
+fn a_newline_in_a_json_variable_cannot_forge_a_startup_before_the_banner() {
+    // The configuration parse errors print before any posture line, so a forged line there needs no
+    // banner to imitate: a field name carrying `\nobolus: listening on …` would make a gateway that
+    // refused to start read as one that is serving. serde quotes an unknown field's name verbatim, so
+    // there is one case per JSON input whose schema rejects unknown fields; the last case is a value
+    // a validation refusal names, a backend id whose declared cost static pricing would ignore. Each
+    // runs on its own.
+    const FORGED: &str = r"\nobolus: listening on http://127.0.0.1:8402";
+    let accepts = format!(
+        r#"[{{"network":"{TESTNET}","asset":"0xa","payTo":"0xp","amount":"1","x{FORGED}":1}}]"#
+    );
+    let backends = temp_file(
+        "backends-forged.json",
+        &format!(r#"[{{"id":"a","kind":"ollama","baseUrl":"http://127.0.0.1:11434","x{FORGED}":1}}]"#),
+    );
+    let costed = temp_file(
+        "backends-forged-id.json",
+        &format!(r#"[{{"id":"x{FORGED}","kind":"ollama","baseUrl":"http://127.0.0.1:11434","cost":"5"}}]"#),
+    );
+    for (var, value) in [
+        ("OBOLUS_ACCEPTS", accepts.as_str()),
+        ("OBOLUS_BACKENDS_FILE", backends.as_str()),
+        ("OBOLUS_BACKENDS_FILE", costed.as_str()),
+    ] {
+        let run = run(&[(var, value)]);
+
+        assert!(
+            !run.stderr.lines().any(|line| line.starts_with("obolus: listening on")),
+            "{var} {value}: a JSON string's newline started a line of its own; got:\n{}",
+            run.stderr
+        );
+        run.must_say(&format!("x{FORGED}"));
+        run.must_have_refused_during_startup();
+    }
 }
 
 #[test]
@@ -1264,6 +1354,21 @@ fn an_empty_token_issuer_refuses_to_start() {
 }
 
 #[test]
+fn whitespace_only_token_issuer_and_audience_refuse_like_empty_ones() {
+    // All four token variables treat whitespace-only as empty. An issuer or audience of spaces is
+    // one no token carries, so booting would enable a token path that honours nobody (#30).
+    let issuer = run(&[("OBOLUS_TOKEN_PUBKEY_FILE", ABSENT_KEY_PATH), ("OBOLUS_TOKEN_ISSUER", "   ")]);
+    issuer.must_have_refused_the_token_path("OBOLUS_TOKEN_ISSUER is set but empty");
+
+    let audience = run(&[
+        ("OBOLUS_TOKEN_PUBKEY_FILE", ABSENT_KEY_PATH),
+        ("OBOLUS_TOKEN_ISSUER", TEST_ISSUER),
+        ("OBOLUS_TOKEN_AUDIENCE", " \t "),
+    ]);
+    audience.must_have_refused_the_token_path("OBOLUS_TOKEN_AUDIENCE is set but empty");
+}
+
+#[test]
 fn an_empty_token_audience_refuses_to_start() {
     // Set-but-empty is not "unset": unset means "refuse any token carrying `aud`", and an empty
     // string would instead be an audience no token can match. Two different postures, one of which
@@ -1333,10 +1438,10 @@ fn a_key_set_boots_and_the_banner_names_every_key() {
 
     run.must_have_got_past_startup();
     run.must_say(TOKEN_ENABLED);
-    run.must_say(TEST_ISSUER);
+    run.must_say(&format!("\"{TEST_ISSUER}\""));
     // Sorted, and naming both: dropping either entry at the wiring site changes this line, which is
     // what makes a half-armed rotation visible from outside the process.
-    run.must_say("2 keys: alpha, beta");
+    run.must_say(r#"2 keys: "alpha", "beta""#);
 }
 
 #[test]
@@ -1414,7 +1519,8 @@ fn a_configured_token_path_boots_and_says_which_verifier_it_wired() {
 
     run.must_have_got_past_startup();
     run.must_say(TOKEN_ENABLED);
-    run.must_say(TEST_ISSUER); // the configured issuer, not a generic "enabled"
+    // The configured issuer, quoted like every operator value, not a generic "enabled".
+    run.must_say(&format!("\"{TEST_ISSUER}\""));
     // The default audience posture, stated rather than left to be inferred from silence.
     run.must_say("no audience configured");
     // And the 402 path is still live for everyone else — the whole reason this is a branch and not
@@ -1436,7 +1542,7 @@ fn a_configured_audience_is_named_in_the_banner() {
 
     run.must_have_got_past_startup();
     run.must_say(TOKEN_ENABLED);
-    run.must_say("audience obolus-test-audience");
+    run.must_say(r#"audience "obolus-test-audience""#);
     run.must_not_say("no audience configured");
 }
 
@@ -1532,6 +1638,9 @@ fn multiple_named_backends_boot_and_are_named() {
     run.must_have_got_past_startup();
     run.must_say("backend \"fast\"");
     run.must_say("backend \"big\"");
+    // Model names are operator values too, quoted like the rest (#16).
+    run.must_say(r#"serves "llama3")"#);
+    run.must_say(r#"serves "llama3:70b")"#);
 }
 
 #[test]

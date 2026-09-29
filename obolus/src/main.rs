@@ -479,7 +479,9 @@ async fn main() -> anyhow::Result<()> {
         "obolus: POST /v1/chat/completions is gated; GET /health is not. The gate is payment for \
          every caller unless a bearer-token line below says otherwise."
     );
-    eprintln!("obolus: facilitator (verify/settle) -> {facilitator_url}");
+    // Every operator-supplied value from here down goes through `legible`: quoted so its boundaries
+    // are visible, and escaped so a newline in it cannot print a line of its own (#16).
+    eprintln!("obolus: facilitator (verify/settle) -> {}", legible(&facilitator_url));
     eprintln!(
         "obolus: payment window {max_timeout_seconds} s (advertised as maxTimeoutSeconds): a paid \
          request's upstream must send its response head within {} s of arrival, or the request \
@@ -494,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
         let models = if backend.models.is_empty() {
             "any model".to_string()
         } else {
-            backend.models.join(", ")
+            backend.models.iter().map(|m| legible(m)).collect::<Vec<_>>().join(", ")
         };
         // The declared cost, when there is one. Present exactly on the cost-plus path (the coverage
         // check refuses a cost under any other rate), where it is the number this backend's quote is
@@ -504,10 +506,10 @@ async fn main() -> anyhow::Result<()> {
             None => String::new(),
         };
         eprintln!(
-            "obolus: upstream (inference) -> backend {:?} kind {} at {} ({}, serves {}{})",
-            backend.id,
+            "obolus: upstream (inference) -> backend {} kind {} at {} ({}, serves {}{})",
+            legible(&backend.id),
             backend.kind,
-            backend.base_url,
+            legible(&backend.base_url),
             if backend.has_key { "keyed" } else { "keyless" },
             models,
             cost,
@@ -553,13 +555,18 @@ async fn main() -> anyhow::Result<()> {
             // Static: the armed amount IS the price, so it stays on the option line.
             PricingChoice::Static => eprintln!(
                 "obolus:   - network {} / asset {} / pay-to {} / {} atomic units",
-                r.network, r.asset, r.pay_to, r.amount
+                legible(&r.network),
+                legible(&r.asset),
+                legible(&r.pay_to),
+                r.amount
             ),
             // Cost-plus: the armed amount is inert (the rate above determines it), so print the
             // option without it rather than a number no client would pay.
             PricingChoice::CostPlus { .. } => eprintln!(
                 "obolus:   - network {} / asset {} / pay-to {} / priced by the cost-plus rate above",
-                r.network, r.asset, r.pay_to
+                legible(&r.network),
+                legible(&r.asset),
+                legible(&r.pay_to)
             ),
         }
     }
@@ -667,6 +674,11 @@ async fn main() -> anyhow::Result<()> {
     // everything downstream — issuer, audience, file reading, the verifier — is written once rather
     // than twice and left to drift.
     //
+    // All four OBOLUS_TOKEN_* variables count a whitespace-only value as empty, and refuse it. None
+    // of them has a meaning for one: no key file is named `   `, and an issuer or audience of spaces
+    // is one no token carries, so it would boot a token path that honours nobody while its banner
+    // says it is enabled.
+    //
     // `OBOLUS_TOKEN_KEYS` supersedes the single-key variable exactly as `OBOLUS_ACCEPTS` supersedes
     // the single-chain ones above, and refuses to start when both are set for the same reason. It is
     // worse here, if anything: an ignored payment variable produces a challenge nobody can pay, but
@@ -744,7 +756,7 @@ async fn main() -> anyhow::Result<()> {
             // vars: it means something arrived carrying nothing (an unexpanded `${VAR}`, an
             // `EnvironmentFile` line ending in `=`), and an empty issuer no token can match would
             // boot a token path that silently honours nobody.
-            if issuer.is_empty() {
+            if issuer.trim().is_empty() {
                 anyhow::bail!(
                     "OBOLUS_TOKEN_ISSUER is set but empty. No token can carry an empty `iss`, so \
                      this would start a token path that refuses every caller."
@@ -755,7 +767,7 @@ async fn main() -> anyhow::Result<()> {
             // token was minted for and we cannot tell "for us" from "for something else".
             let audience = match std::env::var("OBOLUS_TOKEN_AUDIENCE") {
                 Err(_) => None,
-                Ok(audience) if audience.is_empty() => anyhow::bail!(
+                Ok(audience) if audience.trim().is_empty() => anyhow::bail!(
                     "OBOLUS_TOKEN_AUDIENCE is set but empty. Unset it to refuse tokens that carry \
                      an `aud` claim, or give it the audience Obolus should answer to."
                 ),
@@ -767,7 +779,9 @@ async fn main() -> anyhow::Result<()> {
             let mut keys = Vec::with_capacity(entries.len());
             for entry in entries {
                 let pem = std::fs::read(&entry.file)
-                    .map_err(|e| anyhow::anyhow!("{source} {}: {e}", entry.file))?;
+                    // Through `legible` although this is a bail: it prints after the posture lines
+                    // above, so a bare path carrying a newline could append one of its own.
+                    .map_err(|e| anyhow::anyhow!("{source} {}: {e}", legible(&entry.file)))?;
                 keys.push((entry.kid, pem));
             }
             let verifier = PublicKeyTokenVerifier::with_keys(&keys, &issuer, audience.as_deref())

@@ -112,7 +112,7 @@ pub enum GatewayError {
     /// means *distinct networks*, and a configuration that says otherwise is refused rather than
     /// served on an assumption.
     #[error(
-        "duplicate payment option: two entries share (scheme, network) = ({scheme}, {network}); \
+        "duplicate payment option: two entries share (scheme, network) = ({scheme:?}, {network:?}); \
          obolus advertises at most one option per exact (scheme, network). Network strings are \
          compared verbatim, not case- or whitespace-normalized (a CAIP-2 reference such as Solana's \
          base58 genesis hash is case-sensitive), so canonicalize your ids before configuring them"
@@ -1648,6 +1648,26 @@ mod tests {
         .err()
         .expect("duplicate (scheme, network) must be rejected");
         assert!(matches!(err, GatewayError::DuplicateOption { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_duplicate_options_network_cannot_start_a_line() {
+        // `main` prints this refusal at startup, and an armed network is operator text verbatim.
+        let mut forged = requirements();
+        forged.network = "solana:x\nobolus: listening on http://127.0.0.1:8403".to_string();
+        let mut dup = forged.clone();
+        dup.asset = "0xDIFFERENT-ASSET-SAME-NETWORK-NOT-REAL".to_string();
+        let message = Gateway::new(
+            FakeFacilitator::accepting(),
+            one_backend(FakeUpstream::streaming()),
+            resource(),
+            armed(vec![forged, dup]),
+        )
+        .err()
+        .expect("duplicate (scheme, network) must be rejected")
+        .to_string();
+        assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+        assert!(message.contains(r#""solana:x\nobolus: listening on"#), "quoted, escaped: {message}");
     }
 
     #[test]

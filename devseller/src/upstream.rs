@@ -15,6 +15,7 @@ use std::pin::Pin;
 
 use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
+use obolus::arming::legible;
 use obolus::upstream::{Upstream, UpstreamError, UpstreamResponse};
 
 /// The canned completion. Shaped like an OpenAI-compatible non-streaming response, because a
@@ -47,10 +48,11 @@ impl Upstream for CannedUpstream {
 ///
 /// Keyed on the configured URL rather than on the upstream value itself: `main` builds the canned
 /// upstream exactly when no `OBOLUS_UPSTREAM_URL` is set, so the presence of a URL *is* the
-/// distinction, and a `dyn Upstream` could not be matched on anyway.
+/// distinction, and a `dyn Upstream` could not be matched on anyway. The URL is rendered through
+/// [`legible`], as the gateway renders its own, so a newline in it cannot start a banner line.
 pub fn describe(url: Option<&str>) -> String {
     match url {
-        Some(url) => format!("real inference proxied to {url}"),
+        Some(url) => format!("real inference proxied to {}", legible(url)),
         None => "a canned response — NO model is contacted and nothing is inferred".to_string(),
     }
 }
@@ -96,5 +98,13 @@ mod tests {
         let real = describe(Some("http://127.0.0.1:11434"));
         assert!(real.contains("11434"), "got: {real}");
         assert!(!real.contains("NO model"), "got: {real}");
+    }
+
+    #[test]
+    fn the_upstream_url_is_quoted_and_escaped() {
+        assert_eq!(
+            describe(Some("http://127.0.0.1:9\nforged")),
+            r#"real inference proxied to "http://127.0.0.1:9\nforged""#
+        );
     }
 }
