@@ -85,7 +85,7 @@ pub const PINNED_ON: &str = "2026-07-29";
 /// only, but the v1 specification's examples use short names, and so does much of the documentation
 /// and client code written against v1 — so an operator can plausibly copy one out of primary
 /// documentation. Hence
-/// [`is_not_caip2`] gives them a clause of their own rather than the generic three-cause text, all
+/// `is_not_caip2` gives them a clause of their own rather than the generic three-cause text, all
 /// three causes of which are false for a short name.
 ///
 /// A **snapshot and nothing but a transcription** of that source, so re-verifying it is a mechanical

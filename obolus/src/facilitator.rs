@@ -1,6 +1,7 @@
 //! The settlement seam — the one interface Phase A and Phase B share.
 //!
-//! Phase A ships [`FakeFacilitator`] (hermetic, per-PR CI) and, at A3, a delegating
+//! Phase A has `FakeFacilitator` (`#[cfg(test)]`-only, for hermetic per-PR CI, and absent from
+//! every shipped build) and, at A3, a delegating
 //! implementation that forwards `verify` / `settle` to a third-party facilitator over HTTP
 //! (exercised only by the post-merge cron e2e). Phase B adds a self-settling implementation
 //! that verifies the authorization and submits on-chain itself. The gateway above this trait

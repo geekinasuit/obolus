@@ -1,9 +1,9 @@
 //! The service behind the toll booth.
 //!
-//! Obolus is a gateway, so the thing it guards is a seam too. Phase A ships
-//! [`FakeUpstream`]; the real HTTP implementation that talks to Ollama lands at A3 alongside
-//! the delegating facilitator, because both need the same HTTP client and both are the parts
-//! that touch the outside world.
+//! Obolus is a gateway, so the thing it guards is a seam too. Phase A has `FakeUpstream`, which
+//! is `#[cfg(test)]`-only and absent from every shipped build; the real HTTP implementation that
+//! talks to Ollama lands at A3 alongside the delegating facilitator, because both need the same
+//! HTTP client and both are the parts that touch the outside world.
 //!
 //! The response is split into a *head* (status + content type) and a streaming body on
 //! purpose — see [`crate::gateway`] for why that split decides when we charge.
@@ -232,7 +232,8 @@ const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The real upstream: a streaming reverse proxy to an OpenAI-compatible `/v1/chat/completions`
 /// endpoint. Ollama's `/v1` speaks that shape, and so does any OpenAI-compatible origin — a local
-/// server, or a hosted API reached through the bearer set by [`with_bearer_token`].
+/// server, or a hosted API reached through the bearer set by
+/// [`with_bearer_token`](OllamaUpstream::with_bearer_token).
 ///
 /// [`forward`](OllamaUpstream::forward) returns the moment the response *head* arrives; the body
 /// then streams lazily as `hyper`'s `Incoming`, so the model's output is never buffered before
@@ -244,9 +245,8 @@ const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// the same way the facilitator is — through a local http→https proxy — because the connector,
 /// not this type, is where TLS would enter, and that is a separate, later concern.
 ///
-/// [`with_bearer_token`](OllamaUpstream::with_bearer_token). The doc type deliberately has no
-/// `Debug` derive: the bearer is a live credential, and a derived `Debug` is the usual way one
-/// leaks into a log line or a panic message.
+/// The type deliberately has no `Debug` derive: the bearer is a live credential, and a derived
+/// `Debug` is the usual way one leaks into a log line or a panic message.
 pub struct OllamaUpstream {
     /// Origin only — scheme + host + port, no trailing slash, no path
     /// (e.g. `http://127.0.0.1:11434`). The endpoint path is appended per request.
@@ -274,8 +274,10 @@ impl OllamaUpstream {
         Self { base_url, client, head_timeout: DEFAULT_HEAD_TIMEOUT, bearer: None }
     }
 
-    /// Override the response-head deadline; see [`DEFAULT_HEAD_TIMEOUT`] for what it bounds and
-    /// why it stays generous. Tests use it to force the timeout without waiting the default.
+    /// Override the response-head deadline. The default is generous on purpose: a streaming
+    /// completion's head arrives at its first token, but a non-streaming one's arrives only when
+    /// generation ends, so the deadline guards against a hang rather than setting a latency target.
+    /// Tests use it to force the timeout without waiting the default.
     pub fn with_head_timeout(mut self, head_timeout: Duration) -> Self {
         self.head_timeout = head_timeout;
         self
