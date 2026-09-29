@@ -37,8 +37,14 @@ pub enum VerifyMode {
 /// the one field. The rest withhold the work and answer 402 or 502, which is the harder case: the
 /// client has signed an authorization and sent it, a nonce is spent as far as it knows, and it now
 /// has to decide whether to retry, whether to re-sign, and which of those two statuses means it may.
+/// The two 402 modes, [`Unsuccessful`] and [`Rejected`], also carry a `PAYMENT-RESPONSE` receipt
+/// with `success: false` and the reason, beside the fresh challenge; the 502s carry neither.
+/// [`Unsuccessful`]'s receipt names the synthetic transaction, as a reverted settlement's does;
+/// [`Rejected`]'s names none, as a refusal before anything was broadcast does.
 ///
 /// [`Succeed`]: SettleMode::Succeed
+/// [`Unsuccessful`]: SettleMode::Unsuccessful
+/// [`Rejected`]: SettleMode::Rejected
 /// [`EmptyReceipt`]: SettleMode::EmptyReceipt
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettleMode {
@@ -46,9 +52,9 @@ pub enum SettleMode {
     Succeed,
     /// `Ok`, carrying `success: false`. A receipt reporting its own failure is a refusal, so the
     /// client gets a 402 reading `settlement did not complete` — a reason the gateway supplies
-    /// rather than one this binary chooses, which is all that separates it from [`Rejected`] on the
-    /// wire. Worth having anyway: a real facilitator can refuse either way, and a client that
-    /// handles only the error shape will meet this one.
+    /// rather than one this binary chooses. That reason and the receipt's synthetic transaction are
+    /// what separate it from [`Rejected`] on the wire. Worth having anyway: a real facilitator can
+    /// refuse either way, and a client that handles only the error shape will meet this one.
     ///
     /// [`Rejected`]: SettleMode::Rejected
     Unsuccessful,

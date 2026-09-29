@@ -54,6 +54,16 @@ pub trait Facilitator: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), FacilitatorError>> + Send;
 
     /// Collect the payment, returning the receipt we hand back in `PAYMENT-RESPONSE`.
+    ///
+    /// A receipt with `success: false` is a definite refusal, the same verdict as
+    /// [`Rejected`](FacilitatorError::Rejected), and carries its reason as `error_reason`. It is the
+    /// form to use when there is a transaction to name — one broadcast and reverted — because the
+    /// receipt is what reaches the client.
+    ///
+    /// The gateway echoes a refusal's `error_reason` and `transaction` to an unauthenticated client
+    /// as given, so an implementation that relays another party's strings must bound them first, as
+    /// [`DelegatedFacilitator`] does. Its `network` is not echoed: the client's receipt names the
+    /// option that was paid.
     fn settle(
         &self,
         payment: &PaymentPayload,
@@ -81,7 +91,16 @@ pub enum FakeOutcome {
     /// Verify succeeds and settlement returns `Ok` — carrying `success: false`. The shape that
     /// catches a gateway which trusts the `Result` and never reads the receipt.
     AcceptThenUnsuccessfulReceipt,
+    /// Verify succeeds and settlement comes back as a revert: `success: false`, this reason, and the
+    /// fake's transaction — the facilitator broadcast it and it failed on chain. Its receipt
+    /// names [`FAKE_FOREIGN_NETWORK`] rather than the network paid, so a gateway that copies the
+    /// facilitator's network into the client's receipt shows up as the wrong network.
+    AcceptThenRevertedSettlement(String),
 }
+
+/// A network no fixture advertises, reported by [`FakeOutcome::AcceptThenRevertedSettlement`].
+#[cfg(test)]
+pub const FAKE_FOREIGN_NETWORK: &str = "eip155:0";
 
 /// An in-process facilitator for hermetic tests and local development.
 ///
@@ -193,6 +212,15 @@ impl FakeFacilitator {
     pub fn returning_unsuccessful_receipt() -> Self {
         Self::new(FakeOutcome::AcceptThenUnsuccessfulReceipt)
     }
+
+    pub fn reverting_settlement(reason: impl Into<String>) -> Self {
+        Self::new(FakeOutcome::AcceptThenRevertedSettlement(reason.into()))
+    }
+
+    /// The transaction hash this facilitator names on a settlement it reports.
+    pub fn transaction(&self) -> &str {
+        &self.transaction
+    }
 }
 
 #[cfg(test)]
@@ -208,7 +236,8 @@ impl Facilitator for FakeFacilitator {
             FakeOutcome::Accept
             | FakeOutcome::AcceptThenFailSettlement(_)
             | FakeOutcome::AcceptThenRejectSettlement(_)
-            | FakeOutcome::AcceptThenUnsuccessfulReceipt => Ok(()),
+            | FakeOutcome::AcceptThenUnsuccessfulReceipt
+            | FakeOutcome::AcceptThenRevertedSettlement(_) => Ok(()),
             FakeOutcome::Reject(reason) => Err(FacilitatorError::Rejected(reason.clone())),
             FakeOutcome::Unavailable(reason) => Err(FacilitatorError::Unavailable(reason.clone())),
         }
@@ -244,6 +273,14 @@ impl Facilitator for FakeFacilitator {
                 payer: None,
                 amount: None,
             }),
+            FakeOutcome::AcceptThenRevertedSettlement(reason) => Ok(SettlementReceipt {
+                success: false,
+                error_reason: Some(reason.clone()),
+                transaction: self.transaction.clone(),
+                network: FAKE_FOREIGN_NETWORK.to_string(),
+                payer: None,
+                amount: None,
+            }),
             FakeOutcome::Reject(reason) => Err(FacilitatorError::Rejected(reason.clone())),
             FakeOutcome::Unavailable(reason) => Err(FacilitatorError::Unavailable(reason.clone())),
         }
@@ -263,6 +300,14 @@ const DEFAULT_FACILITATOR_TIMEOUT: Duration = Duration::from_secs(30);
 /// untrustworthy and replaced with the generic, so a hostile or MITM'd facilitator on the
 /// (currently un-TLS'd) channel cannot reflect bulk content into our response body.
 const MAX_REJECT_REASON_LEN: usize = 128;
+
+/// The longest facilitator-supplied transaction hash we echo into a refusal's receipt. An EVM hash
+/// is 66 characters and a Solana signature at most 88; the headroom is for chains we have not met.
+const MAX_TX_HASH_LEN: usize = 128;
+
+/// The punctuation a transaction id may carry besides ASCII alphanumerics: base64 and base64url
+/// (`+/=`, `-_`) and Hedera's `account@seconds.nanos`. No space, quote, markup or control.
+const TX_ID_PUNCTUATION: &[u8] = b".@-_+/=";
 
 /// Why a [`DelegatedFacilitator`] could not be constructed. Both variants are base-URL problems
 /// caught at construction, where the cause is legible, rather than surfaced later as a connect-time
@@ -351,10 +396,11 @@ const SETTLEMENT_PENDING: &str = "settlement_pending";
 ///   returns a full `{"success":false,"errorReason":…}` document even on `HTTP 400`; a client that
 ///   bailed on the status first would discard the reason and could retry a settlement that had
 ///   already broadcast.
-/// * **Only an explicit, parsed refusal becomes [`Rejected`](FacilitatorError::Rejected).** A
-///   timeout, a dropped connection, an unreadable body, or a body carrying no verdict is
-///   [`Unavailable`](FacilitatorError::Unavailable) — a payment we never managed to evaluate must
-///   not reach the client as "your payment was bad".
+/// * **Only an explicit, parsed refusal is a refusal.** From `verify` it becomes
+///   [`Rejected`](FacilitatorError::Rejected); from `settle` it becomes a `success: false` receipt,
+///   so a reverted transaction can be named. A timeout, a dropped connection, an unreadable body,
+///   or a body carrying no verdict is [`Unavailable`](FacilitatorError::Unavailable) — a payment we
+///   never managed to evaluate must not reach the client as "your payment was bad".
 ///
 /// It speaks plain HTTP only; see [`DelegatedFacilitatorError::TlsNotWired`].
 #[derive(Debug)]
@@ -559,19 +605,30 @@ impl Facilitator for DelegatedFacilitator {
                 )))
             }
             // A definite non-settlement: a pre-broadcast refusal (`transaction: ""`) or an on-chain
-            // revert (a real hash, but reverted — no funds moved). Either way the payer was not
-            // charged, so it is the client's 402 to retry, carrying the facilitator's own reason
-            // (bounded by `reject_reason`).
+            // revert (a real hash, but reverted). Neither moved funds on this call, so it is the
+            // client's 402 to retry. It comes back as the failure receipt rather than `Rejected`,
+            // so that a revert's hash reaches the client: the receipt format keeps `transaction`
+            // empty only when nothing was broadcast. The facilitator's strings that go into it are
+            // bounded — the reason by `reject_reason`, the hash by `broadcast_hash` — and its payer
+            // is left out.
             //
             // KNOWN GAP — `errorReason == "duplicate_settlement"` means this authorization already
             // settled on a prior call, so money *did* move; neither 402 nor 502 is right for it. Its
             // real handling is the A3 payment-keyed idempotency cache short-circuiting it to the
             // cached receipt, and the fail-open-vs-terminal policy is Christian's call (#17).
             // Until that lands it folds into this default; it is deliberately not special-cased.
-            Some(false) => Err(FacilitatorError::Rejected(reject_reason(
-                parsed.error_reason.as_deref(),
-                "settlement did not complete",
-            ))),
+            Some(false) => Ok(SettlementReceipt {
+                success: false,
+                error_reason: Some(reject_reason(
+                    parsed.error_reason.as_deref(),
+                    "settlement did not complete",
+                )),
+                transaction: broadcast_hash(parsed.transaction),
+                network: non_empty(parsed.network)
+                    .unwrap_or_else(|| payment.accepted().network.clone()),
+                payer: None,
+                amount: None,
+            }),
             // Parsed, but no verdict — we cannot tell whether funds moved, so it is our problem, not
             // a rejection the client should retry as a fresh payment.
             None => Err(FacilitatorError::Unavailable(format!(
@@ -598,6 +655,30 @@ fn reject_reason(reason: Option<&str>, fallback: &str) -> String {
         }
         _ => fallback.to_string(),
     }
+}
+
+/// The transaction a refused settlement names, as echoed to the unauthenticated caller in the
+/// receipt. The facilitator's string is unvalidated, so it passes only if it looks like a
+/// transaction id, within [`MAX_TX_HASH_LEN`]: ASCII alphanumerics (`0x…` hex, base58, Algorand's
+/// base32) and [`TX_ID_PUNCTUATION`] (base64 hashes, Hedera's `0.0.1235@1700000000.000000000`).
+/// Anything else becomes the receipt's "none" and is logged instead, cut to that length and quoted
+/// with `{:?}`, so a value the receipt drops is still on record. A hash that passes is not logged
+/// here: recording refused settlements is #75.
+fn broadcast_hash(transaction: Option<String>) -> String {
+    let Some(hash) = non_empty(transaction) else {
+        return String::new();
+    };
+    if hash.len() <= MAX_TX_HASH_LEN
+        && hash.bytes().all(|b| b.is_ascii_alphanumeric() || TX_ID_PUNCTUATION.contains(&b))
+    {
+        return hash;
+    }
+    let shown: String = hash.chars().take(MAX_TX_HASH_LEN).collect();
+    eprintln!(
+        "obolus: facilitator /settle refused and named a transaction that is not a plausible hash; \
+         left out of the receipt: {shown:?}"
+    );
+    String::new()
 }
 
 #[cfg(test)]
@@ -914,61 +995,95 @@ mod delegated_tests {
         assert!(detail.contains("settlement_pending"), "{detail}");
     }
 
-    #[tokio::test]
-    async fn settle_rejects_on_success_false_with_the_facilitators_reason() {
-        let (base, _c) = serve(unused(), Canned::ok(SPEC_SETTLE_ERROR)).await;
-        let err = DelegatedFacilitator::new(base)
-            .unwrap()
-            .settle(&payment(), &requirements())
-            .await
-            .unwrap_err();
-        assert_eq!(err, FacilitatorError::Rejected("insufficient_funds".to_string()));
+    /// The failure receipt a definite settle refusal comes back as, on the fixtures' network.
+    fn refusal(reason: &str, transaction: &str) -> SettlementReceipt {
+        SettlementReceipt {
+            success: false,
+            error_reason: Some(reason.to_string()),
+            transaction: transaction.to_string(),
+            network: "eip155:84532".to_string(),
+            payer: None,
+            amount: None,
+        }
+    }
+
+    async fn settle_against(body: &str) -> Result<SettlementReceipt, FacilitatorError> {
+        let (base, _c) = serve(unused(), Canned::ok(body)).await;
+        DelegatedFacilitator::new(base).unwrap().settle(&payment(), &requirements()).await
     }
 
     #[tokio::test]
-    async fn a_reverted_settlement_is_rejected_not_treated_as_settled() {
+    async fn settle_refuses_on_success_false_with_the_facilitators_reason() {
+        // The spec's own error example names a payer; the refusal leaves it out, since nothing was
+        // collected from them and it is one more facilitator string a caller would read.
+        assert_eq!(settle_against(SPEC_SETTLE_ERROR).await, Ok(refusal("insufficient_funds", "")));
+    }
+
+    #[tokio::test]
+    async fn a_reverted_settlement_is_refused_and_names_its_transaction() {
         // The dangerous shape: success:false but a real, non-empty transaction hash (an on-chain
-        // revert). `success` is the sole authority, so this must be a rejection — a client keying on
-        // the transaction's presence would wrongly believe it settled.
-        let body = r#"{"success":false,"errorReason":"invalid_transaction_state","transaction":"0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef","network":"eip155:84532"}"#;
-        let (base, _c) = serve(unused(), Canned::ok(body)).await;
-        let err = DelegatedFacilitator::new(base)
-            .unwrap()
-            .settle(&payment(), &requirements())
-            .await
-            .unwrap_err();
-        assert_eq!(err, FacilitatorError::Rejected("invalid_transaction_state".to_string()));
+        // revert). `success` is the sole authority, so this must be a refusal — a client keying on
+        // the transaction's presence would wrongly believe it settled. The hash still reaches the
+        // receipt: the format's empty `transaction` means nothing was broadcast, which is false here.
+        let hash = "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let body = format!(
+            r#"{{"success":false,"errorReason":"invalid_transaction_state","transaction":"{hash}","network":"eip155:84532"}}"#
+        );
+        assert_eq!(settle_against(&body).await, Ok(refusal("invalid_transaction_state", hash)));
+    }
+
+    #[tokio::test]
+    async fn a_refusals_transaction_is_echoed_only_if_it_looks_like_a_hash() {
+        // The hash goes to an unauthenticated caller, so a facilitator's (or a MITM's) arbitrary
+        // string must not ride along. The id shapes of the allowlisted chains pass; anything else, or
+        // anything too long, is dropped.
+        let base58 = "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW";
+        let hedera = "0.0.1235@1700000000.000000000";
+        let base64 = "k7Xq/9+Lr2Wm0zT4cV1bN8yH6uE3sA5dJ0fG2hI4jK8=";
+        let base64url = "k7Xq_9-Lr2Wm0zT4cV1bN8yH6uE3sA5dJ0fG2hI4jK8";
+        for (sent, kept) in [
+            (base58.to_string(), base58.to_string()),
+            (hedera.to_string(), hedera.to_string()),
+            (base64.to_string(), base64.to_string()),
+            (base64url.to_string(), base64url.to_string()),
+            ("0xdead\"beef".to_string(), String::new()),
+            ("0xdead beef".to_string(), String::new()),
+            ("0xdead\nobolus: forged".to_string(), String::new()),
+            ("<script>".to_string(), String::new()),
+            ("a".repeat(MAX_TX_HASH_LEN), "a".repeat(MAX_TX_HASH_LEN)),
+            ("a".repeat(MAX_TX_HASH_LEN + 1), String::new()),
+        ] {
+            let body = serde_json::json!({
+                "success": false,
+                "errorReason": "invalid_transaction_state",
+                "transaction": sent,
+                "network": "eip155:84532",
+            })
+            .to_string();
+            let receipt = settle_against(&body).await.unwrap();
+            assert_eq!(receipt.transaction, kept, "sent {sent:?}");
+        }
     }
 
     #[tokio::test]
     async fn settle_parses_the_body_before_trusting_the_status() {
         // Discriminating twin of verify_parses_the_body_before_trusting_the_status: a 400 carrying a
-        // structured settle verdict must be Rejected, not Unavailable. Paired with the no-verdict /
+        // structured settle verdict must be a refusal, not Unavailable. Paired with the no-verdict /
         // unparseable-body settle tests (Unavailable even at 200), this pins that we key on the parsed
         // `success`, not the HTTP status.
         let (base, _c) =
             serve(unused(), Canned::status(StatusCode::BAD_REQUEST, SPEC_SETTLE_ERROR)).await;
-        let err = DelegatedFacilitator::new(base)
-            .unwrap()
-            .settle(&payment(), &requirements())
-            .await
-            .unwrap_err();
-        assert_eq!(err, FacilitatorError::Rejected("insufficient_funds".to_string()));
+        let receipt = DelegatedFacilitator::new(base).unwrap().settle(&payment(), &requirements()).await;
+        assert_eq!(receipt, Ok(refusal("insufficient_funds", "")));
     }
 
     #[tokio::test]
-    async fn settle_duplicate_settlement_folds_into_rejected_for_now() {
+    async fn settle_duplicate_settlement_folds_into_the_refusal_for_now() {
         // Pins the CURRENT behavior and its comment: `duplicate_settlement` is not special-cased in
         // Phase A — its real handling (serve the cached receipt) is the A3 idempotency cache, and
         // the fail-open-vs-terminal policy is Christian's call (#17).
         let body = r#"{"success":false,"errorReason":"duplicate_settlement","transaction":"","network":"eip155:84532"}"#;
-        let (base, _c) = serve(unused(), Canned::ok(body)).await;
-        let err = DelegatedFacilitator::new(base)
-            .unwrap()
-            .settle(&payment(), &requirements())
-            .await
-            .unwrap_err();
-        assert_eq!(err, FacilitatorError::Rejected("duplicate_settlement".to_string()));
+        assert_eq!(settle_against(body).await, Ok(refusal("duplicate_settlement", "")));
     }
 
     #[tokio::test]
@@ -1039,7 +1154,7 @@ mod delegated_tests {
     #[tokio::test]
     async fn a_5xx_error_body_is_unavailable_not_a_client_rejection() {
         // A 502 with `success:false`: the facilitator failed, it did not rule the payment bad. A
-        // status-blind client returns Rejected — a 402 telling the client to mint a fresh
+        // status-blind client reports a refusal — a 402 telling the client to mint a fresh
         // authorization for *our* outage. It must be Unavailable.
         let (base, _c) =
             serve(unused(), Canned::status(StatusCode::BAD_GATEWAY, SPEC_SETTLE_ERROR)).await;
@@ -1142,17 +1257,11 @@ mod delegated_tests {
         // is an unvalidated String on a no-TLS channel. An over-long reason (200 chars) is treated as
         // untrustworthy and replaced with the fixed generic, so a hostile/MITM'd facilitator cannot
         // reflect bulk content into our response body. A short reason is still surfaced (see
-        // settle_rejects_on_success_false_with_the_facilitators_reason).
+        // settle_refuses_on_success_false_with_the_facilitators_reason).
         let huge = "x".repeat(200);
         let body = format!(
             r#"{{"success":false,"errorReason":"{huge}","transaction":"","network":"eip155:84532"}}"#
         );
-        let (base, _c) = serve(unused(), Canned::ok(&body)).await;
-        let err = DelegatedFacilitator::new(base)
-            .unwrap()
-            .settle(&payment(), &requirements())
-            .await
-            .unwrap_err();
-        assert_eq!(err, FacilitatorError::Rejected("settlement did not complete".to_string()));
+        assert_eq!(settle_against(&body).await, Ok(refusal("settlement did not complete", "")));
     }
 }

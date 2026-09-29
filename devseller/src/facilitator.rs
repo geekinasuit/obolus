@@ -27,7 +27,8 @@ use obolus::x402::{PaymentPayload, PaymentRequirements, SettlementReceipt};
 use crate::config::{SettleMode, VerifyMode};
 use crate::verify::{check_terms, check_window, domain_for, parse_exact_payload, VerifyError};
 
-/// The synthetic transaction id a successful settlement reports.
+/// The synthetic transaction id a settlement reports: a successful one, and an
+/// [`Unsuccessful`](SettleMode::Unsuccessful) one standing in for a reverted broadcast.
 ///
 /// Obviously not a real hash: a plausible-looking one in a development seller's receipt is the
 /// kind of value that ends up pasted into a block explorer, or worse, into a bug report as
@@ -498,6 +499,18 @@ mod tests {
                 "{mode:?} is on the wrong side of the split; settle returned {outcome:?}"
             );
         }
+    }
+
+    /// `unsuccessful` stands in for a reverted broadcast, so its refusal names a transaction, and
+    /// the synthetic one: a client can then tell it from a `rejected` refusal, which names none.
+    #[tokio::test]
+    async fn an_unsuccessful_settlement_names_the_synthetic_transaction() {
+        let facilitator = DevFacilitator::new(VerifyMode::Verify, SettleMode::Unsuccessful)
+            .with_clock(|| WITHIN_WINDOW);
+        let receipt =
+            Facilitator::settle(&facilitator, &payment(), &requirements()).await.expect("a receipt");
+        assert!(!receipt.success);
+        assert_eq!(receipt.transaction, SYNTHETIC_TRANSACTION);
     }
 
     /// Under `accept`, the receipt names no payer.
