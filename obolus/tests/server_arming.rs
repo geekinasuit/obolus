@@ -960,6 +960,16 @@ fn a_configured_testnet_reports_the_testnet_posture() {
     run.must_have_got_past_startup();
     run.must_say("testnet-by-construction");
     run.must_say(ALL_CLEAR_CLAIM);
+    // The whole line, head to terminal period, so its wording cannot drift unobserved (#39). Written
+    // out here rather than by extending `ALL_CLEAR_CLAIM`: that needle is shared with negative
+    // assertions, and lengthening a negative needle weakens it.
+    assert!(
+        run.stderr.lines().any(|line| line
+            == "obolus: testnet-by-construction — every advertised network is on the pinned \
+                testnet allowlist."),
+        "expected the whole all-clear line; got:\n{}",
+        run.stderr
+    );
     // The option line prints the network through `legible`, quoted. The `/ asset` suffix pins the
     // needle to that line rather than to any other message that quotes the network.
     run.must_say(&format!("network \"{TESTNET}\" / asset"));
