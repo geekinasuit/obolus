@@ -15,6 +15,8 @@
 
 use std::fmt;
 
+use obolus::arming::legible;
+
 /// What `verify` should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyMode {
@@ -207,19 +209,20 @@ fn settle_mode(
     }
 }
 
-/// One line naming both knobs, for the startup banner.
+/// One line naming both knobs, for the startup banner. The reasons are operator text, so they are
+/// rendered through [`legible`]: a newline in one cannot start a banner line of its own (#16).
 impl fmt::Display for DevConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let verify = match &self.verify {
             VerifyMode::Verify => "verify (signature and terms checked offline)".to_string(),
             VerifyMode::Accept => "accept (payments are NOT inspected)".to_string(),
-            VerifyMode::Reject(reason) => format!("reject ({reason})"),
+            VerifyMode::Reject(reason) => format!("reject ({})", legible(reason)),
         };
         let settle = match &self.settle {
             SettleMode::Succeed => "succeed".to_string(),
             SettleMode::Unsuccessful => "unsuccessful (receipt says success: false)".to_string(),
-            SettleMode::Unavailable(reason) => format!("unavailable ({reason})"),
-            SettleMode::Rejected(reason) => format!("rejected ({reason})"),
+            SettleMode::Unavailable(reason) => format!("unavailable ({})", legible(reason)),
+            SettleMode::Rejected(reason) => format!("rejected ({})", legible(reason)),
             SettleMode::EmptyReceipt => "empty-receipt (success: true, nothing identified)".to_string(),
             SettleMode::Timeout(secs) => format!("timeout (blocks {secs}s)"),
         };

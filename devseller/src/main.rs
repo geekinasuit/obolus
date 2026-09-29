@@ -45,7 +45,7 @@ mod verify;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use obolus::arming::{check_arming, PLACEHOLDER_NETWORK};
+use obolus::arming::{check_arming, legible, PLACEHOLDER_NETWORK};
 use obolus::backends::{Backends, Kind};
 use obolus::config::{
     parse_accepts, parse_extra, superseded_single_chain_vars, validated_option, EntryDefect,
@@ -482,10 +482,14 @@ async fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
 
     eprintln!("obolus-devseller: advertising {} payment option(s):", requirements.len());
+    // Operator values quoted and escaped, as the gateway prints them (#16).
     for r in &requirements {
         eprintln!(
             "obolus-devseller:   - network {} / asset {} / pay-to {} / {} atomic units",
-            r.network, r.asset, r.pay_to, r.amount
+            legible(&r.network),
+            legible(&r.asset),
+            legible(&r.pay_to),
+            r.amount
         );
     }
 

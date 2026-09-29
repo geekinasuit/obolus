@@ -13,6 +13,8 @@ use axum::http::HeaderMap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use std::sync::Arc;
 
+use crate::arming::{escape_controls, legible};
+
 /// Why a token did not grant access.
 ///
 /// Both variants take the same branch — 402 — and the split exists so a log can tell the caller's
@@ -168,10 +170,13 @@ pub const SINGLE_KEY_VAR: &str = "OBOLUS_TOKEN_PUBKEY_FILE";
 /// usable key — is [`PublicKeyTokenVerifier::with_keys`]'s job, so those rules have one home rather
 /// than being half-checked in two.
 pub fn parse_token_keys(raw: &str) -> Result<Vec<TokenKeyEntry>, KeyError> {
+    // serde's message quotes operator text verbatim, such as an unknown field's name, so it goes
+    // through `escape_controls` (#16).
     let entries: Vec<TokenKeyEntry> = serde_json::from_str(raw).map_err(|err| {
         KeyError(format!(
             "OBOLUS_TOKEN_KEYS must be a JSON array of {{\"kid\",\"file\"}} objects (\"kid\" \
-             optional): {err}"
+             optional): {}",
+            escape_controls(&err.to_string())
         ))
     })?;
     if entries.is_empty() {
@@ -429,7 +434,7 @@ impl TokenVerifier for PublicKeyTokenVerifier {
         issuers.sort_unstable();
         let issuer = match (issuers.is_empty(), self.validation.required_spec_claims.contains("iss"))
         {
-            (false, true) => format!("issuer {}", issuers.join(", ")),
+            (false, true) => format!("issuer {}", legible_list(&issuers)),
             // `set_issuer` alone checks `iss` only on tokens that carry one, so an unrequired
             // issuer is not an enforced one however populated the set looks.
             _ => "NO ENFORCED ISSUER — this is a bug, not a setting".to_string(),
@@ -439,7 +444,7 @@ impl TokenVerifier for PublicKeyTokenVerifier {
             self.validation.aud.iter().flatten().map(String::as_str).collect();
         expected.sort_unstable();
         let audience = if self.audience_enforced() {
-            format!("audience {}", expected.join(", "))
+            format!("audience {}", legible_list(&expected))
         } else if self.validation.aud.is_none() && self.validation.validate_aud {
             "no audience configured, so a token carrying `aud` is refused".to_string()
         } else {
@@ -456,14 +461,20 @@ impl TokenVerifier for PublicKeyTokenVerifier {
         let keys = match (named.is_empty(), total - named.len()) {
             (true, 0) => "NO VERIFYING KEYS — this is a bug, not a setting".to_string(),
             (true, _) => format!("{total} {noun}, unnamed"),
-            (false, 0) => format!("{total} {noun}: {}", named.join(", ")),
+            (false, 0) => format!("{total} {noun}: {}", legible_list(&named)),
             (false, unnamed) => {
-                format!("{total} {noun}: {}, plus {unnamed} unnamed", named.join(", "))
+                format!("{total} {noun}: {}, plus {unnamed} unnamed", legible_list(&named))
             }
         };
 
         format!("{issuer}, {audience}, {keys}")
     }
+}
+
+/// Operator-supplied values for the token banner, each through [`legible`] like every other value
+/// the startup output prints (#16).
+fn legible_list(values: &[&str]) -> String {
+    values.iter().map(|v| legible(v)).collect::<Vec<_>>().join(", ")
 }
 
 /// Render a verification failure for the operator reading the log.
@@ -898,14 +909,14 @@ mod signature_tests {
         // nothing holds. Asserted through the wrapper for that reason, not through the verifier.
         let configured = TokenPath::new(Arc::new(key.verifier_for_audience("obolus")));
         assert!(
-            configured.description().contains("audience obolus"),
+            configured.description().contains("audience \"obolus\""),
             "a configured audience must reach the banner, got: {}",
             configured.description()
         );
 
         let unset = TokenPath::new(Arc::new(key.verifier()));
         assert!(
-            !unset.description().contains("audience obolus"),
+            !unset.description().contains("audience \""),
             "an unconfigured verifier must not describe an audience, got: {}",
             unset.description()
         );
@@ -1282,6 +1293,18 @@ mod signature_tests {
     }
 
     #[test]
+    fn a_token_keys_parse_error_cannot_start_a_line() {
+        // serde names an unknown field verbatim, and a JSON key can carry `\n` (and U+2028) as an
+        // escape. This error prints after the posture lines, so a raw newline would let the key
+        // write one of its own.
+        let raw = r#"[{"file":"a.pem","k\nobolus: forged\u2028line":1}]"#;
+        let message = parse_token_keys(raw).unwrap_err().to_string();
+        assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+        assert!(!message.contains('\u{2028}'), "a raw U+2028 reached the message: {message}");
+        assert!(message.contains(r"k\nobolus: forged\u{2028}line"), "the field must be named, escaped: {message}");
+    }
+
+    #[test]
     fn the_banner_names_the_key_set() {
         let alpha = TestKey::generate();
         let beta = TestKey::generate();
@@ -1289,11 +1312,22 @@ mod signature_tests {
         assert!(verifier_over(&[(Some("beta"), &beta), (Some("alpha"), &alpha)])
             .description()
             // Sorted, not in configuration order — an exec test matches this line.
-            .contains("2 keys: alpha, beta"));
+            .contains(r#"2 keys: "alpha", "beta""#));
         assert!(verifier_over(&[(None, &alpha)]).description().contains("1 key, unnamed"));
         assert!(verifier_over(&[(Some("alpha"), &alpha), (None, &beta)])
             .description()
-            .contains("2 keys: alpha, plus 1 unnamed"));
+            .contains(r#"2 keys: "alpha", plus 1 unnamed"#));
+    }
+
+    #[test]
+    fn the_banner_escapes_what_the_operator_configured() {
+        // A kid is operator-chosen text, and the banner prints it at startup. A newline in one must
+        // not be able to start a line of its own (#16).
+        let key = TestKey::generate();
+        let description =
+            verifier_over(&[(Some("k1\nobolus: forged"), &key)]).description();
+        assert!(!description.contains('\n'), "got: {description}");
+        assert!(description.contains(r#""k1\nobolus: forged""#), "got: {description}");
     }
 
     #[test]

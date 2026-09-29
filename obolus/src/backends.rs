@@ -43,6 +43,7 @@ use std::time::Duration;
 use axum::http::HeaderValue;
 use serde::Deserialize;
 
+use crate::arming::escape_controls;
 use crate::upstream::{OllamaUpstream, Upstream};
 
 /// The wire protocol a backend speaks. A closed set on purpose: an operator's `kind` string is
@@ -456,8 +457,10 @@ pub fn load_backends<R>(
 where
     R: Fn(&str) -> std::io::Result<Vec<u8>>,
 {
-    let entries: Vec<BackendEntry> =
-        serde_json::from_str(raw).map_err(|e| BackendError::Malformed(e.to_string()))?;
+    // serde quotes an unknown field's or `kind`'s name verbatim, so its message goes through
+    // `escape_controls` before anything can print it (#16).
+    let entries: Vec<BackendEntry> = serde_json::from_str(raw)
+        .map_err(|e| BackendError::Malformed(escape_controls(&e.to_string())))?;
 
     if entries.is_empty() {
         return Err(BackendError::Empty);
@@ -670,6 +673,22 @@ mod tests {
         let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","keyfile":"/k"}]"#;
         let err = load_backends(raw, T, no_key).unwrap_err();
         assert!(matches!(err, BackendError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_backends_parse_error_cannot_start_a_line() {
+        // serde names an unknown field verbatim, and a JSON key can carry `\n` and U+2028 as
+        // escapes; unescaped, the key would write a startup line of its own.
+        // An unknown `kind` is named verbatim the same way.
+        for raw in [
+            r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","x\nobolus: forged\u2028line":1}]"#,
+            r#"[{"id":"x","kind":"x\nobolus: forged\u2028line","baseUrl":"http://h"}]"#,
+        ] {
+            let message = load_backends(raw, T, no_key).unwrap_err().to_string();
+            assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+            assert!(!message.contains('\u{2028}'), "a raw U+2028 reached the message: {message}");
+            assert!(message.contains(r"x\nobolus: forged\u{2028}line"), "the name must be quoted, escaped: {message}");
+        }
     }
 
     #[test]

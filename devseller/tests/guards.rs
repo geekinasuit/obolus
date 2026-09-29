@@ -404,10 +404,38 @@ fn a_testnet_configuration_gets_past_startup() {
 
     run.must_have_got_past_startup();
     run.must_say(ADVERTISEMENT_LINE);
-    run.must_say(TESTNET);
+    // Operator values on the option line are quoted and escaped, as the gateway prints them.
+    run.must_say(&format!(
+        r#"network "{TESTNET}" / asset "{SYNTHETIC_ASSET}" / pay-to "{SYNTHETIC_PAY_TO}""#
+    ));
     // The one thing this binary must never be mistaken for.
     run.must_say("NOT A GATEWAY");
     run.must_not_say(BEYOND_LOOPBACK);
+}
+
+/// A newline in an operator value the banner prints cannot start a banner line of its own (#16).
+///
+/// Every run here fails `bind`, so a line reading `listening on` can only have come from a value.
+#[test]
+fn a_newline_in_an_operator_value_cannot_forge_a_banner_line() {
+    const FORGED: &str = "obolus-devseller: listening on http://127.0.0.1:1";
+    let forged = format!("x\n{FORGED}");
+    let url = format!("http://127.0.0.1:9\n{FORGED}");
+    let cases: [&[(&str, &str)]; 4] = [
+        &[("OBOLUS_DEV_VERIFY", "reject"), ("OBOLUS_DEV_REJECT_REASON", &forged)],
+        &[("OBOLUS_DEV_SETTLE", "rejected"), ("OBOLUS_DEV_SETTLE_REASON", &forged)],
+        &[("OBOLUS_DEV_SETTLE", "unavailable"), ("OBOLUS_DEV_SETTLE_REASON", &forged)],
+        &[("OBOLUS_UPSTREAM_URL", &url)],
+    ];
+    for vars in cases {
+        let run = run(vars);
+        run.must_have_got_past_startup();
+        assert!(
+            !run.stderr.lines().any(|line| line.starts_with(FORGED)),
+            "{vars:?} printed a line of its own; got:\n{}",
+            run.stderr
+        );
+    }
 }
 
 #[cfg(unix)]
