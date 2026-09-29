@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: bazel-contrib/setup-bazel@0.15.0
+      - uses: bazel-contrib/setup-bazel@0.19.0
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
@@ -113,12 +113,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: bazel-contrib/setup-bazel@0.15.0
+      - uses: bazel-contrib/setup-bazel@0.19.0
         with:
-          # The action's cache key carries the platform, so this shares the `CI` cache name with the
-          # job above without sharing its contents. At the version pinned above the key carries
-          # platform only, not architecture — which costs nothing here, where the two jobs differ by
-          # platform. Later versions key on both, so re-read this when the pin moves.
+          # The action's cache key carries platform and architecture (`setup-bazel-<cache-version>-
+          # <platform>-<arch>` at the version pinned above), so this shares the `CI` cache name with
+          # the job above without sharing its contents. Re-read this when the pin moves.
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
           repository-cache: true
