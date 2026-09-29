@@ -1,6 +1,6 @@
 name: Release
 
-# Publishes the binaries. Two entry points, deliberately:
+# Publishes the binaries, and the `eip3009` test vectors beside them. Two entry points, deliberately:
 #
 #   - a push to `main` cuts an immutable pre-release tagged `main-<sha>`, so every merged change has
 #     downloadable bytes without anyone copying a file by hand. Pre-release, so the repository's
@@ -123,9 +123,35 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # The `eip3009` known-answer vectors, published beside the binaries (#37). They are the contract an
+  # x402 client signer and this verifier are each gated against, so a second implementer should be
+  # able to fetch them without building this repository. A job of their own because `release` does
+  # not check out the tree, and they are the same bytes on every target. `build` runs
+  # `//eip3009:eip3009_test` against these files at this commit, and `release` waits for it.
+  fixtures:
+    name: eip3009 fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Staged by `cp` rather than listed in the upload's `path:`, because `if-no-files-found`
+      # fires only when NO path matches: a renamed fixture would otherwise ship a release with
+      # two vectors and no failure. `cp` fails on any one missing source. The list is a second
+      # copy of `compile_data` in eip3009/BUILD.bazel and has to move with it.
+      - name: Stage fixtures
+        run: |
+          mkdir -p fixtures
+          cp eip3009/fixtures/x402-authorization.json eip3009/fixtures/typehashes.json eip3009/fixtures/eip712-mail.json fixtures/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eip3009-fixtures
+          path: fixtures/
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, fixtures]
     runs-on: ubuntu-latest
     # The only elevated job in this file, and it builds nothing — it just attaches what the matrix
     # produced. Keeping the write token out of the jobs that compile code means a dependency's build
@@ -216,6 +242,24 @@ jobs:
 
           A downloaded asset does not carry an executable bit — GitHub release downloads never do —
           so `chmod +x` is expected, not a sign anything is wrong.
+
+          ## Test vectors for x402 client signers
+
+          `x402-authorization.json`, `typehashes.json` and `eip712-mail.json` are the known-answer
+          vectors this repository's EIP-3009 / EIP-712 verifier is tested against. They are published
+          so that an x402 *client* implementation can gate its signer against the same vectors
+          without building or running anything from here. Each records where its values come from.
+          `x402-authorization.json` also carries the EIP-712 token domain, which the x402
+          specification's example omits. Its contract address is Circle's published one; its name
+          and version were established by recovering the example signature under it. That the
+          deployed contract uses the same domain is expected but not checked.
+
+          Their `.sha256` sidecars are an integrity check, not an oracle. They come from the same
+          place over the same channel as the files, so they show a file arrived intact, not that it
+          is correct. The vectors are both the input and the expected answer: if a published domain
+          field were ever wrong, a signer gated against it would pass while producing
+          authorizations the deployed contract rejects. If that matters to you, pin the values on
+          your own side, reviewed field by field rather than as a hash.
 
           ## Build
 
