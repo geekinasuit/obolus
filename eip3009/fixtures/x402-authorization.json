@@ -3,8 +3,9 @@
   "what_this_pins": "The complete EIP-3009 path on a real x402 payload: authorization struct hashing, the Base Sepolia USDC domain separator, the 0x1901 composition, and recovery to the authorizing party. This is the on-point vector — the same shape Obolus's facilitator sees on /verify.",
   "source": {
     "document": "x402 specification, `exact` scheme (EVM)",
+    "url": "https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_evm.md",
     "retrieved": "2026-08-05",
-    "note": "The `from` address also appears in obolus/src/facilitator.rs's SPEC_VERIFY_* / SPEC_SETTLE_* fixtures, transcribed from the same specification."
+    "note": "The `from` address also appears in the SPEC_VERIFY_* / SPEC_SETTLE_* fixtures of https://github.com/geekinasuit/obolus/blob/main/obolus/src/facilitator.rs, transcribed from the same specification."
   },
   "domain_provenance": {
     "problem": "The x402 specification publishes this signature and every authorization field but NO EIP-712 domain — not the name, version, chainId or verifyingContract. As published, the payload is unverifiable: no domain means no separator, no digest, and nothing to check the signature against. That gap is https://github.com/geekinasuit/obolus/issues/13.",
