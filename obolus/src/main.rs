@@ -103,7 +103,7 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
 /// nothing. The usual causes are an unexpanded `${VAR}` in a compose file, an `EnvironmentFile`
 /// line ending in `=`, or an empty ConfigMap key.
 ///
-/// The match is exhaustive on [`EntryField`](obolus::config::EntryField); see that type for why it
+/// The match is exhaustive on [`EntryField`]; see that type for why it
 /// carries no wildcard arm.
 fn single_chain_defect(defect: EntryDefect) -> anyhow::Error {
     match &defect {

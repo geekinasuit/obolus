@@ -12,7 +12,7 @@
 //! specification's worked example was signed in February 2025, so any check against a wall clock
 //! rejects it — a combined `verify` could not be pointed at the one piece of evidence in this
 //! repository that comes from outside our own authorship. Splitting them keeps
-//! [`verify_signature`] under the known-answer test in [`kat_tests`] and leaves the policy checks,
+//! [`verify_signature`] under the known-answer test in `kat_tests` and leaves the policy checks,
 //! which are ours, plainly labelled as ours.
 //!
 //! # Where the EIP-712 domain comes from
@@ -257,7 +257,7 @@ pub fn chain_id_of(network: &str) -> Result<u64, VerifyError> {
 
 /// Does `signature` over this authorization, under this domain, recover to `authorization.from`?
 ///
-/// The one function here held to a published vector — see [`kat_tests`]. Nothing about the
+/// The one function here held to a published vector — see `kat_tests`. Nothing about the
 /// gateway's policy enters into it.
 pub fn verify_signature(
     payload: &ExactPayload,

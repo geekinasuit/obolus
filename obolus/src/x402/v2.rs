@@ -155,7 +155,7 @@ impl PaymentRequirements {
     /// know is precisely one this option does not contain.
     ///
     /// Like the reference, it first drops the scheme's `dynamicExtraFields` — `extra` keys the client
-    /// is allowed to fill in differently — from both sides; see [`dynamic_extra_fields`] for the
+    /// is allowed to fill in differently — from both sides; see `dynamic_extra_fields` for the
     /// lists it knows. A scheme whose list it lacks would have such payments refused here.
     pub fn is_accepted_by(&self, payment: &PaymentPayload) -> bool {
         let Some(accepted) = payment.received.get("accepted").and_then(Value::as_object) else {

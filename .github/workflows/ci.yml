@@ -173,3 +173,21 @@ jobs:
       # `--locked` holds the dependency graph fixed and says nothing about the compiler.
       - name: Test
         run: cargo test --workspace --locked
+
+      # A broken intra-doc link renders as plain text and nothing else notices, so rustdoc warnings
+      # accumulate silently unless the build fails on them. Every lint rustdoc warns on by default
+      # is denied by name rather than with `-D warnings`: this job takes whatever stable the runner
+      # ships, and a lint that stable newly turns on would otherwise fail main on docs nobody changed.
+      #
+      # Two invocations because the library and the binary are both named `obolus`: cargo documents
+      # only the library under `--workspace` and skips the binary, so `main.rs` is checked only by
+      # the second.
+      - name: Docs build without rustdoc warnings
+        env:
+          RUSTDOCFLAGS: >-
+            -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links
+            -D rustdoc::redundant_explicit_links -D rustdoc::bare_urls -D rustdoc::invalid_html_tags
+            -D rustdoc::invalid_codeblock_attributes -D rustdoc::invalid_rust_codeblocks
+        run: |
+          cargo doc --workspace --no-deps --locked
+          cargo doc -p obolus --bin obolus --no-deps --locked
