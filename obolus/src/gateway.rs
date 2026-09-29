@@ -361,6 +361,44 @@ fn challenge(resource: &ResourceInfo, offered: &[PaymentRequirements], error: Op
     response
 }
 
+/// A 402 for a settlement the facilitator definitely refused.
+///
+/// It carries two things. The first is a `PAYMENT-RESPONSE` receipt with `success: false` and the
+/// reason; that is how the x402 v2 HTTP transport reports a failed settlement, and a client that
+/// finds one reads it in preference to the challenge (#78). The second is the fresh challenge
+/// [`challenge`] builds, with the same reason as its `error`. The reference server sends only the
+/// receipt, but a client that knows nothing of receipts still needs a challenge to pay again.
+///
+/// The receipt names the transaction the facilitator broadcast, if any — a revert has one, and the
+/// format keeps `transaction` empty only when nothing was broadcast — and no payer. The network is
+/// the option the payment matched, not whatever the facilitator reported, so the only facilitator
+/// strings a caller can read here are the reason and the hash, which the facilitator bounds.
+fn settle_refusal(
+    resource: &ResourceInfo,
+    offered: &[PaymentRequirements],
+    network: &str,
+    reason: String,
+    transaction: String,
+) -> Response {
+    let receipt = SettlementReceipt {
+        success: false,
+        error_reason: Some(reason.clone()),
+        transaction,
+        network: network.to_string(),
+        payer: None,
+        amount: None,
+    };
+    let mut response = challenge(resource, offered, Some(reason));
+    // Base64, so always header-safe. Were it ever not, the challenge alone still says why.
+    match HeaderValue::from_str(&x402::encode_receipt(&receipt)) {
+        Ok(value) => {
+            response.headers_mut().insert(x402::HEADER_PAYMENT_RESPONSE, value);
+        }
+        Err(err) => eprintln!("obolus: could not attach {}: {err}", x402::HEADER_PAYMENT_RESPONSE),
+    }
+    response
+}
+
 /// Our fault or the facilitator's — never dressed up as the client's.
 ///
 /// `detail` can name internal infrastructure — at A3 the facilitator or Ollama URL, a host, a
@@ -554,15 +592,22 @@ async fn paid_completion<F: Facilitator>(
         Ok(receipt) if receipt.success => receipt,
         // A receipt that reports its own failure is a refusal, not a success. Serving the
         // response on the strength of `Ok(_)` alone would give the work away for free.
-        Ok(_) => {
-            let error = "settlement did not complete".to_string();
-            return (challenge(resource, &priced, Some(error)), Outcome::SettleRejected);
+        Ok(refused) => {
+            let reason =
+                refused.error_reason.unwrap_or_else(|| "settlement did not complete".to_string());
+            return (
+                settle_refusal(resource, &priced, &requirements.network, reason, refused.transaction),
+                Outcome::SettleRejected,
+            );
         }
         // The same split as verify. Returning 502 for a payment the facilitator actually
         // evaluated and refused would be both a lie and the more dangerous lie: 502 reads as
         // transient, so clients retry it harder than they retry a 402.
         Err(FacilitatorError::Rejected(reason)) => {
-            return (challenge(resource, &priced, Some(reason)), Outcome::SettleRejected)
+            return (
+                settle_refusal(resource, &priced, &requirements.network, reason, String::new()),
+                Outcome::SettleRejected,
+            )
         }
         Err(err @ FacilitatorError::Unavailable(_)) => {
             return (upstream_failure(err.to_string()), Outcome::SettleUnavailable)
@@ -1260,8 +1305,43 @@ mod tests {
             send(app, completion_request(Some(&x402::encode_payment(&payment())))).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert!(challenge_error(&body).unwrap().contains("already spent"));
-        assert!(headers.get(x402::HEADER_PAYMENT_RESPONSE).is_none());
+        assert_refusal_receipt(&headers, "authorization already spent", FIXTURE_NETWORK, "");
         assert!(!body.contains("[DONE]"), "the answer must not be served for a refused payment");
+        assert_eq!(calls.settles(), 1);
+    }
+
+    /// A settle refusal's 402 carries the transport's failure receipt (#78) — `success: false`,
+    /// the reason, the matched option's network, the broadcast transaction if any, no payer — and
+    /// still carries a challenge to pay again.
+    fn assert_refusal_receipt(headers: &HeaderMap, reason: &str, network: &str, transaction: &str) {
+        let raw = headers.get(x402::HEADER_PAYMENT_RESPONSE).expect("a failure receipt");
+        assert_eq!(
+            x402::decode_receipt(raw.to_str().unwrap()).unwrap(),
+            SettlementReceipt {
+                success: false,
+                error_reason: Some(reason.to_string()),
+                transaction: transaction.to_string(),
+                network: network.to_string(),
+                payer: None,
+                amount: None,
+            }
+        );
+        assert!(headers.contains_key(x402::HEADER_PAYMENT_REQUIRED), "and a challenge to pay again");
+    }
+
+    #[tokio::test]
+    async fn a_reverted_settlement_names_its_transaction_in_the_refusal() {
+        // A revert was broadcast, so its receipt must say which transaction: the format's empty
+        // `transaction` means nothing was broadcast, and the payer needs the hash to look it up.
+        let facilitator = FakeFacilitator::reverting_settlement("invalid_transaction_state");
+        let hash = facilitator.transaction().to_string();
+        let (app, calls) = app_with(facilitator, FakeUpstream::streaming());
+        let (status, headers, body) =
+            send(app, completion_request(Some(&x402::encode_payment(&payment())))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(challenge_error(&body).as_deref(), Some("invalid_transaction_state"));
+        assert_refusal_receipt(&headers, "invalid_transaction_state", FIXTURE_NETWORK, &hash);
+        assert!(!body.contains("[DONE]"), "a reverted settlement must not buy the answer");
         assert_eq!(calls.settles(), 1);
     }
 
@@ -1274,7 +1354,7 @@ mod tests {
         let (status, headers, body) =
             send(app, completion_request(Some(&x402::encode_payment(&payment())))).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-        assert!(headers.get(x402::HEADER_PAYMENT_RESPONSE).is_none());
+        assert_refusal_receipt(&headers, "settlement did not complete", FIXTURE_NETWORK, "");
         assert!(!body.contains("[DONE]"), "an unsuccessful receipt must not buy the answer");
     }
 
@@ -1411,6 +1491,34 @@ mod tests {
         assert_eq!(settled[0].amount, "2000", "and its price");
         // And verify saw the same matched option.
         assert_eq!(calls.verified_requirements().last().unwrap().asset, FIXTURE_ASSET_B);
+    }
+
+    #[tokio::test]
+    async fn a_refused_settlement_on_the_second_option_names_that_options_network() {
+        // The receipt's network is the matched option's, which only a payment for an option other
+        // than the first can tell apart from "the first one advertised".
+        let (app, _) = multichain_app_with(
+            FakeFacilitator::rejecting_settlement("insufficient_funds"),
+            FakeUpstream::streaming(),
+        );
+        let (status, headers, _) =
+            send(app, completion_request(Some(&x402::encode_payment(&payment_b())))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_refusal_receipt(&headers, "insufficient_funds", FIXTURE_NETWORK_B, "");
+    }
+
+    #[tokio::test]
+    async fn a_refused_receipt_on_the_second_option_names_that_options_network() {
+        // The same for a refusal that arrives as a `success: false` receipt, which carries a network
+        // of the facilitator's own. The client's receipt names the option it paid, not the
+        // facilitator's string: this fake reports a network no option advertises.
+        let facilitator = FakeFacilitator::reverting_settlement("invalid_transaction_state");
+        let hash = facilitator.transaction().to_string();
+        let (app, _) = multichain_app_with(facilitator, FakeUpstream::streaming());
+        let (status, headers, _) =
+            send(app, completion_request(Some(&x402::encode_payment(&payment_b())))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_refusal_receipt(&headers, "invalid_transaction_state", FIXTURE_NETWORK_B, &hash);
     }
 
     #[tokio::test]
