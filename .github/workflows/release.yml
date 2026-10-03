@@ -230,10 +230,12 @@ jobs:
           - It settles nothing. Its receipts are synthetic, so no money moves whatever you configure.
           - It refuses to start on any network that is not a testnet, and the arming override that
             exists elsewhere is refused here rather than honoured.
-          - It binds to `127.0.0.1` by default, and the genuinely dangerous combination — a
-            reachable address, plus accept-everything mode, plus a real upstream — is refused
-            outright, because that is an unauthenticated open proxy to somebody's inference
-            endpoint. Reach it from a device with a port forward rather than a wider bind.
+          - It binds to `127.0.0.1` by default, and the genuinely dangerous combination —
+            accept-everything mode plus a real upstream — is refused outright on any bind, loopback
+            included, because that is an unauthenticated open proxy to somebody's inference
+            endpoint and the process cannot see a proxy forwarding to it. Reach it from a device
+            with a port forward rather than a wider bind. In that one combination the forward
+            still needs `OBOLUS_DEV_ALLOW_OPEN_PROXY=1`.
 
           ## Verifying a download
 

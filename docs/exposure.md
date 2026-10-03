@@ -113,19 +113,24 @@ Anything it fronts is given away to whoever can reach it, so its rules are tight
   (`adb reverse tcp:8404 tcp:8404` for Android) rather than widening the bind. That is safe because
   the forward reaches one device you chose; a proxy or `tailscale serve` also forwards, but to
   whoever can reach it (see below).
-- Any non-loopback bind prints `*** BOUND BEYOND LOOPBACK ***` at startup.
-- One combination is refused outright: a non-loopback bind, plus `OBOLUS_DEV_VERIFY=accept`, plus
-  an `OBOLUS_UPSTREAM_URL` pointing at a real model. That is an unauthenticated open proxy to
-  somebody's inference endpoint, billed to whoever runs it. `OBOLUS_DEV_ALLOW_OPEN_PROXY=1` (exactly
-  `1`) acknowledges it and starts anyway.
-- **Both checks read only the bind address.** A reverse proxy or `tailscale serve` / `funnel` in
-  front of a loopback dev seller exposes it just as a wider bind would, with no warning and no
-  refusal, because the process cannot see what forwards to it. The options above are for the
-  gateway. In front of the dev seller, forwarding `accept` mode to a real model is the open proxy
-  just described, and a funnel makes it public.
+- Any non-loopback bind prints `*** BOUND BEYOND LOOPBACK ***` at startup. **This warning reads
+  only the bind address.** A reverse proxy or `tailscale serve` / `funnel` in front of a loopback
+  dev seller exposes it just as a wider bind would, and prints no warning, because the process
+  cannot see what forwards to it.
+- One combination is refused outright, **on any bind, loopback included**: `OBOLUS_DEV_VERIFY=accept`
+  plus an `OBOLUS_UPSTREAM_URL` pointing at a real model. That is an unauthenticated open proxy to
+  somebody's inference endpoint for whoever can reach the port, billed to whoever runs it, and a
+  funnel makes it public. Loopback is not exempt for the reason above: the process cannot see a
+  proxy in front of it, so it cannot tell a loopback bind nobody else reaches from one that is
+  published ([#104](https://github.com/geekinasuit/obolus/issues/104)). Leave
+  `OBOLUS_UPSTREAM_URL` unset to test payments against the canned response.
+  `OBOLUS_DEV_ALLOW_OPEN_PROXY=1` (exactly `1`) acknowledges it and starts anyway. The cost falls on
+  the port-forward workflow above: `adb reverse` in front of a real model in `accept` mode now
+  needs the acknowledgement too.
 - **`OBOLUS_DEV_VERIFY=verify` is not an access control.** It checks a signature over a payer address
   the caller chooses, against no balance and no record of spent nonces, and nothing settles, so a
-  throwaway keypair passes it as easily as a funded one. That is why a wider bind in `verify` mode is
-  allowed with the warning above rather than refused (behind a front end there is no warning either): a client on another device has to be able to
-  reach a verifying seller at all. It is not a sign the configuration is safe in front of a real
-  model.
+  throwaway keypair passes it as easily as a funded one. That is why `verify` mode in front of a real
+  model is allowed rather than refused, on any bind: a client on another device has to be able to
+  reach a verifying seller at all. A wider bind gets the warning above; a proxy or funnel in front
+  of a loopback bind gets nothing. Neither is a sign the configuration is safe in front of a real
+  model. The options above are for the gateway, not for exposing the dev seller.

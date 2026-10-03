@@ -518,15 +518,20 @@ Startup refuses:
 
 - any network it cannot prove is a testnet, and the built-in placeholder network. Setting
   `OBOLUS_ALLOW_MAINNET` is itself a refusal here;
-- a non-loopback bind, plus `accept`, plus a real upstream, which is an unauthenticated open proxy
-  to somebody's model, unless `OBOLUS_DEV_ALLOW_OPEN_PROXY=1` acknowledges it. To test from a phone,
-  forward the port (`adb reverse tcp:8404 tcp:8404`) instead of widening the bind.
+- `accept` plus a real upstream, on any bind including loopback, which is an unauthenticated open
+  proxy to somebody's model, unless `OBOLUS_DEV_ALLOW_OPEN_PROXY=1` acknowledges it. Loopback is not
+  exempt because a reverse proxy, `tailscale serve` or `tailscale funnel` in front of it exposes it
+  just as a wider bind would, and the process cannot see one
+  ([#104](https://github.com/geekinasuit/obolus/issues/104)). To test from a phone, forward the port
+  (`adb reverse tcp:8404 tcp:8404`) instead of widening the bind; in front of a real model in
+  `accept` mode, that still needs the acknowledgement.
 
 The first guards the money path, the second what it exposes. Other refusals, such as a set-but-empty
 variable or an option `verify` cannot check, each print their own remedy at startup. A non-loopback
-bind also prints `*** BOUND BEYOND LOOPBACK ***`. That warning and the open-proxy refusal read only
-the bind address, so a reverse proxy or `tailscale serve` in front of a loopback dev seller bypasses
-both. See [`docs/exposure.md`](docs/exposure.md#the-development-seller-is-stricter-on-purpose).
+bind also prints `*** BOUND BEYOND LOOPBACK ***`. That warning reads only the bind address, so a
+reverse proxy or `tailscale serve` in front of a loopback dev seller gets no warning — and in
+`verify` mode, no refusal either. See
+[`docs/exposure.md`](docs/exposure.md#the-development-seller-is-stricter-on-purpose).
 
 ## The fake is never a gate
 

@@ -883,8 +883,8 @@ fn an_upstream_url_that_is_not_plain_http_refuses_to_start() {
     run.must_have_refused_during_startup();
 }
 
-/// The hazard publishing this binary creates: accept-mode, plus a real upstream, plus an address
-/// anyone can reach is an unauthenticated open proxy to somebody's inference endpoint.
+/// The hazard publishing this binary creates: accept-mode plus a real upstream is an
+/// unauthenticated open proxy to somebody's inference endpoint, on whatever address reaches it.
 #[test]
 fn an_open_proxy_configuration_refuses_to_start() {
     let run = run(&[
@@ -894,10 +894,49 @@ fn an_open_proxy_configuration_refuses_to_start() {
     ]);
 
     run.must_say(OPEN_PROXY);
-    // The refusal must offer the way to do what the operator wanted, or they reach for the
-    // acknowledgement variable instead of the port forward.
+    // The refusal must name the one forward it considers worth acknowledging, so the operator can
+    // tell that case apart from a proxy or a funnel before reaching for the acknowledgement.
     run.must_say("adb reverse");
     run.must_have_refused_during_startup();
+}
+
+/// The same refusal on a loopback bind (#104).
+///
+/// Loopback is not an exemption, because this process cannot see what forwards to it: a reverse
+/// proxy, `tailscale serve` or `tailscale funnel` in front of a loopback bind exposes it exactly as a
+/// wider bind would. The bind under test is the harness's occupied loopback port.
+#[test]
+fn an_open_proxy_configuration_refuses_on_loopback_too() {
+    let run = run(&[
+        ("OBOLUS_DEV_VERIFY", "accept"),
+        ("OBOLUS_UPSTREAM_URL", "http://127.0.0.1:9"),
+    ]);
+
+    run.must_say(OPEN_PROXY);
+    // Why loopback did not save it, or the operator concludes the check is broken.
+    run.must_say("cannot see");
+    run.must_say("tailscale funnel");
+    // The remedies have to be ones that work from where the operator already is. "Bind loopback" is
+    // a closed loop here: they already did, and this is the refusal they got.
+    run.must_not_say("Bind loopback");
+    run.must_say("Unset OBOLUS_UPSTREAM_URL");
+    run.must_say("OBOLUS_DEV_ALLOW_OPEN_PROXY=1");
+    run.must_have_refused_during_startup();
+}
+
+/// ...and the acknowledgement admits it on loopback, without the beyond-loopback warning, which
+/// stays keyed on the bind address: the refusal moved, the warning did not.
+#[test]
+fn the_open_proxy_refusal_can_be_acknowledged_on_loopback() {
+    let run = run(&[
+        ("OBOLUS_DEV_VERIFY", "accept"),
+        ("OBOLUS_UPSTREAM_URL", "http://127.0.0.1:9"),
+        ("OBOLUS_DEV_ALLOW_OPEN_PROXY", "1"),
+    ]);
+
+    run.must_have_got_past_startup();
+    run.must_not_say(OPEN_PROXY);
+    run.must_not_say(BEYOND_LOOPBACK);
 }
 
 /// The refusal must not offer `verify` as the way out.
@@ -920,17 +959,18 @@ fn the_open_proxy_refusal_does_not_offer_verification_as_the_fix() {
     run.must_say("throwaway keypair");
 }
 
-/// Each leg of the triple, dropped one at a time. Every one of these is a configuration that is
-/// *not* an open proxy, and all three must boot — otherwise the guard above is some blanket
-/// non-loopback refusal wearing the open-proxy message, and its wording is a lie.
+/// Each leg of the refused pair — `accept` mode and a real upstream — dropped one at a time, on both
+/// kinds of bind. None of these is refused, so the guard is not some blanket refusal wearing the
+/// open-proxy message. The bind is not a leg (#104): see
+/// [`an_open_proxy_configuration_refuses_on_loopback_too`].
 #[test]
-fn dropping_any_leg_of_the_open_proxy_triple_is_not_refused() {
+fn dropping_either_leg_of_the_open_proxy_pair_is_not_refused() {
     // Not loopback, accept-mode — but the canned upstream, so there is no inference to steal.
     let canned = run(&[("OBOLUS_ADDR", UNBINDABLE), ("OBOLUS_DEV_VERIFY", "accept")]);
     canned.must_have_got_past_startup();
     canned.must_not_say(OPEN_PROXY);
 
-    // Not loopback, real upstream, under `verify`. Outside the refused triple deliberately — a
+    // Not loopback, real upstream, under `verify`. Outside the refused pair deliberately — a
     // client running on another device has to be able to reach a verifying seller at all — but NOT
     // therefore safe: `verify` checks a signature over a payer address the caller chooses, against
     // no balance and no record of spent nonces, and nothing here settles, so a throwaway keypair
@@ -943,15 +983,16 @@ fn dropping_any_leg_of_the_open_proxy_triple_is_not_refused() {
     verifying.must_not_say(OPEN_PROXY);
     verifying.must_say(BEYOND_LOOPBACK);
 
-    // Accept-mode, real upstream — but only reachable from this machine. The default bind, and the
-    // configuration the guard's own error message recommends.
-    let loopback = run(&[
-        ("OBOLUS_DEV_VERIFY", "accept"),
+    // The same `verify` case on loopback: still no acknowledgement needed, and no warning, since
+    // the warning reads the bind. Not safe either, for the reason above — a proxy in front of it
+    // is as unguarded as the wider bind, and without even the warning.
+    let verifying_loopback = run(&[
+        ("OBOLUS_DEV_VERIFY", "verify"),
         ("OBOLUS_UPSTREAM_URL", "http://127.0.0.1:9"),
     ]);
-    loopback.must_have_got_past_startup();
-    loopback.must_not_say(OPEN_PROXY);
-    loopback.must_not_say(BEYOND_LOOPBACK);
+    verifying_loopback.must_have_got_past_startup();
+    verifying_loopback.must_not_say(OPEN_PROXY);
+    verifying_loopback.must_not_say(BEYOND_LOOPBACK);
 
     // The third mode, on the two legs that would otherwise compose. `reject` serves nobody, so this
     // is not an open proxy and must boot — and it is what tells the accept-leg apart from
