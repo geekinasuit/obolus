@@ -387,9 +387,11 @@ const SETTLEMENT_PENDING: &str = "settlement_pending";
 
 /// The refusal reasons that blame our side rather than the client's payment: something we sent
 /// (requirements, version, envelope) or the facilitator's own failure. Facilitators disagree on the
-/// HTTP status they put on the same refusal — 200, 400, 403 and 500 all occur — so the verdict is
-/// read from the reason, and these become [`Unavailable`](FacilitatorError::Unavailable), a 502,
-/// rather than a 402 that would have the client re-sign a payment that was never the problem (#31).
+/// HTTP status they put on the same refusal, so on a verdict-bearing 2xx or 4xx the verdict is read
+/// from the reason, and these become [`Unavailable`](FacilitatorError::Unavailable), a 502, rather
+/// than a 402 that would have the client re-sign a payment that was never the problem (#31). A 5xx
+/// is `Unavailable` whatever its reason, so a facilitator that puts a client's refusal on a 500 is
+/// still answered with a 502.
 ///
 /// The first five are x402 v2 §9 codes; the rest are not in §9 but are emitted by reference
 /// facilitators. A reason not listed here — including one no spec names — stays the client's
@@ -1348,9 +1350,10 @@ mod delegated_tests {
         ("some_reason_no_spec_names", Blame::Client),
     ];
 
-    /// The two statuses facilitators disagree on for the same refusal. The verdict must come out
-    /// the same on both, because it is read from the reason, not the status.
-    const VERDICT_STATUSES: [StatusCode; 2] = [StatusCode::OK, StatusCode::BAD_REQUEST];
+    /// The verdict-bearing statuses facilitators put on the same refusal. The verdict must come out
+    /// the same on each, because it is read from the reason, not the status.
+    const VERDICT_STATUSES: [StatusCode; 3] =
+        [StatusCode::OK, StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN];
 
     #[tokio::test]
     async fn a_verify_refusal_is_classified_by_its_reason_not_its_status() {
