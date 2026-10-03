@@ -121,7 +121,7 @@ jobs:
           file "dist/obolus-${{ matrix.target }}" | grep -qE '${{ matrix.arch_pattern }}'
           file "dist/obolus-devseller-${{ matrix.target }}" | grep -qE '${{ matrix.arch_pattern }}'
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: obolus-${{ matrix.target }}
           path: dist/
@@ -147,7 +147,7 @@ jobs:
           mkdir -p fixtures
           cp eip3009/fixtures/x402-authorization.json eip3009/fixtures/typehashes.json eip3009/fixtures/eip712-mail.json fixtures/
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: eip3009-fixtures
           path: fixtures/
