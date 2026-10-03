@@ -393,23 +393,51 @@ const SETTLEMENT_PENDING: &str = "settlement_pending";
 /// is `Unavailable` whatever its reason, so a facilitator that puts a client's refusal on a 500 is
 /// still answered with a 502.
 ///
-/// The first five are x402 v2 §9 codes; the rest are not in §9 but are emitted by reference
-/// facilitators. A reason not listed here — including one no spec names — stays the client's
-/// refusal, as does each of §9's ambiguous `invalid_scheme`, `invalid_network` and
-/// `invalid_payload`. Matched exactly, before the reason is bounded for echoing.
+/// A transcription, pinned 2026-10-02 at x402-foundation/x402 commit `751590a2`, of every reason in
+/// these sources whose trigger is our requirements, our request, or the facilitator's own state,
+/// never the client's payload:
+///
+/// * x402 v2 §9 (`specs/x402-specification-v2.md`). `invalid_scheme` and `invalid_network` are
+///   here because the gateway pins the scheme and network a payment names to an option it
+///   advertised before verify, so "not supported" can only be about ours. `invalid_payload` is not.
+/// * The x402.org facilitator's handlers (`typescript/site/app/facilitator/{verify,settle}/route.ts`):
+///   an unparseable request body, a missing `paymentPayload` or `paymentRequirements`, and an
+///   exception. We always send both as JSON, so the first two can only be ours.
+/// * The exact-EVM facilitators (`typescript/packages/mechanisms/evm/src/exact/facilitator/` with
+///   `assetCache.ts`, and `go/mechanisms/evm/exact/facilitator/`): checks of the requirements'
+///   scheme, network, asset and EIP-712 domain against the chain, and the facilitator's own
+///   failures. `…_failed_to_verify_signature` and `…_failed_to_execute_transfer` are left out
+///   because a client's malformed authorization or a revert the facilitator does not recognise can
+///   produce them. Go's `…_failed_to_check_nonce` and `…_failed_to_get_balance` are declared but
+///   emitted nowhere, and `…_failed_to_check_deployment` and `…_failed_to_get_receipt` only by its
+///   v1 facilitator, so they are left out too.
+///
+/// Re-verifying it is a diff against those files; a reason added upstream is a 402 here until it
+/// is transcribed. A reason not listed — including one no source names — stays the client's
+/// refusal. Matched exactly, before the reason is bounded for echoing.
 const OUR_FAULT_REASONS: &[&str] = &[
+    // x402 v2 §9.
+    "invalid_scheme",
+    "invalid_network",
     "invalid_payment_requirements",
     "unsupported_scheme",
     "invalid_x402_version",
     "unexpected_verify_error",
     "unexpected_settle_error",
+    // The x402.org facilitator's request handling.
     "invalid_json",
     "missing_parameters",
     "unexpected_error",
-    "unknown_error",
-    "invalid_exact_evm_missing_eip712_domain",
+    // The exact-EVM facilitators.
+    "invalid_exact_evm_scheme",
     "invalid_exact_evm_network_mismatch",
-    "invalid_bazaar_extension",
+    "invalid_exact_evm_missing_eip712_domain",
+    "invalid_exact_evm_token_name_mismatch",
+    "invalid_exact_evm_token_version_mismatch",
+    "invalid_exact_evm_eip3009_not_supported",
+    "asset_not_deployed_contract",
+    "invalid_exact_evm_failed_to_get_network_config",
+    "invalid_exact_evm_failed_to_parse_signature",
 ];
 
 /// The [`OUR_FAULT_REASONS`] entry `reason` names, if any. Returns our constant rather than the
@@ -640,24 +668,26 @@ impl Facilitator for DelegatedFacilitator {
             // already run, so a 402 here would invite a second payment for one answer; this is a
             // 502 instead, and the answer is withheld. The hash goes to the log (via the gateway),
             // which is all the reconciliation there is today — #75. It is the facilitator's own
-            // string, so it is logged with `{:?}`, never interpreted.
+            // string, so it is bounded by `broadcast_hash` and logged with `{:?}`, never interpreted.
             Some(false) if parsed.error_reason.as_deref() == Some(SETTLEMENT_PENDING) => {
                 Err(FacilitatorError::Unavailable(format!(
                     "facilitator /settle reported {SETTLEMENT_PENDING}: transaction {:?} on network \
                      {:?} was broadcast but not confirmed, and may still settle",
-                    parsed.transaction.unwrap_or_default(),
+                    broadcast_hash(parsed.transaction),
                     non_empty(parsed.network).unwrap_or_else(|| payment.accepted().network.clone()),
                 )))
             }
             // A refusal whose reason blames our side, not the payment (#31): a 502, so the receipt
-            // that would have named a transaction never reaches the client. The hash goes to the log
-            // instead, quoted like the pending case's.
+            // that would have named a transaction never reaches the client. A hash it names goes to
+            // the log instead, bounded and quoted like the pending case's; none is not logged.
             Some(false) if blames_us.is_some() => {
+                let named = match broadcast_hash(parsed.transaction) {
+                    hash if hash.is_empty() => String::new(),
+                    hash => format!("; transaction {hash:?}"),
+                };
                 Err(FacilitatorError::Unavailable(format!(
-                    "facilitator /settle refused for a reason on our side: {} (status {status}); \
-                     transaction {:?}",
+                    "facilitator /settle refused for a reason on our side: {} (status {status}){named}",
                     blames_us.unwrap_or_default(),
-                    parsed.transaction.unwrap_or_default(),
                 )))
             }
             // Any other definite non-settlement: a pre-broadcast refusal (`transaction: ""`) or an on-chain
@@ -719,7 +749,8 @@ fn reject_reason(reason: Option<&str>, fallback: &str) -> String {
 /// base32) and [`TX_ID_PUNCTUATION`] (base64 hashes, Hedera's `0.0.1235@1700000000.000000000`).
 /// Anything else becomes the receipt's "none" and is logged instead, cut to that length and quoted
 /// with `{:?}`, so a value the receipt drops is still on record. A hash that passes is not logged
-/// here: recording refused settlements is #75.
+/// here: recording refused settlements is #75. A settlement that ends in a 502 instead names its
+/// transaction only in the log, and bounds it here the same way.
 fn broadcast_hash(transaction: Option<String>) -> String {
     let Some(hash) = non_empty(transaction) else {
         return String::new();
@@ -731,8 +762,8 @@ fn broadcast_hash(transaction: Option<String>) -> String {
     }
     let shown: String = hash.chars().take(MAX_TX_HASH_LEN).collect();
     eprintln!(
-        "obolus: facilitator /settle refused and named a transaction that is not a plausible hash; \
-         left out of the receipt: {shown:?}"
+        "obolus: facilitator /settle named a transaction that is not a plausible hash; left out of \
+         the receipt and the settle log: {shown:?}"
     );
     String::new()
 }
@@ -1316,8 +1347,11 @@ mod delegated_tests {
     }
 
     /// Every reason x402 v2 §9 names (bar `settlement_pending`, pinned on its own above), the
-    /// non-spec reasons reference facilitators emit that #31 classified, and two the gateway has
-    /// never heard of, which default to the client's 402.
+    /// reference facilitators' reasons that were weighed for #31 item 5 whichever way they went,
+    /// and reasons the gateway has never heard of, which default to the client's 402.
+    ///
+    /// This mirrors `OUR_FAULT_REASONS`, so it cannot catch a reason missing from both; that list's
+    /// own comment records where it was transcribed from.
     const REASON_TABLE: &[(&str, Blame)] = &[
         // x402 v2 §9: the client's payment.
         ("insufficient_funds", Blame::Client),
@@ -1327,25 +1361,37 @@ mod delegated_tests {
         ("invalid_exact_evm_payload_signature", Blame::Client),
         ("invalid_exact_evm_payload_recipient_mismatch", Blame::Client),
         ("invalid_transaction_state", Blame::Client),
-        // x402 v2 §9: ambiguous, left with the client by #31.
-        ("invalid_network", Blame::Client),
         ("invalid_payload", Blame::Client),
-        ("invalid_scheme", Blame::Client),
-        // x402 v2 §9: ours.
+        // x402 v2 §9: ours. The scheme and network a payment names are pinned to ours before
+        // verify, so "not supported" can only mean what we advertised.
+        ("invalid_scheme", Blame::Ours),
+        ("invalid_network", Blame::Ours),
         ("invalid_payment_requirements", Blame::Ours),
         ("unsupported_scheme", Blame::Ours),
         ("invalid_x402_version", Blame::Ours),
         ("unexpected_verify_error", Blame::Ours),
         ("unexpected_settle_error", Blame::Ours),
-        // Not in §9; emitted by reference facilitators, classified ours by #31.
+        // Not in §9: the x402.org facilitator's request handling.
         ("invalid_json", Blame::Ours),
         ("missing_parameters", Blame::Ours),
         ("unexpected_error", Blame::Ours),
-        ("unknown_error", Blame::Ours),
-        ("invalid_exact_evm_missing_eip712_domain", Blame::Ours),
+        // Not in §9: the reference exact-EVM facilitators, ours.
+        ("invalid_exact_evm_scheme", Blame::Ours),
         ("invalid_exact_evm_network_mismatch", Blame::Ours),
-        ("invalid_bazaar_extension", Blame::Ours),
-        // Unknown: the default.
+        ("invalid_exact_evm_missing_eip712_domain", Blame::Ours),
+        ("invalid_exact_evm_token_name_mismatch", Blame::Ours),
+        ("invalid_exact_evm_token_version_mismatch", Blame::Ours),
+        ("invalid_exact_evm_eip3009_not_supported", Blame::Ours),
+        ("asset_not_deployed_contract", Blame::Ours),
+        ("invalid_exact_evm_failed_to_get_network_config", Blame::Ours),
+        ("invalid_exact_evm_failed_to_parse_signature", Blame::Ours),
+        // Not in §9: the reference exact-EVM facilitators, which a client's own authorization can
+        // trigger, so left at the default.
+        ("invalid_exact_evm_failed_to_verify_signature", Blame::Client),
+        ("invalid_exact_evm_failed_to_execute_transfer", Blame::Client),
+        // Unknown, including two no reference facilitator was found to emit: the default.
+        ("unknown_error", Blame::Client),
+        ("invalid_bazaar_extension", Blame::Client),
         ("duplicate_settlement", Blame::Client),
         ("some_reason_no_spec_names", Blame::Client),
     ];
@@ -1418,6 +1464,38 @@ mod delegated_tests {
         let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
         assert!(detail.contains("unexpected_settle_error"), "{detail}");
         assert!(detail.contains("0xfeedbeef"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn an_our_fault_settle_refusal_logs_only_a_plausible_transaction() {
+        // The same bounding the receipt applies: no transaction is not logged as `""`, and a string
+        // that is not a plausible hash stays out of this line (`broadcast_hash` records it apart).
+        for transaction in ["".to_string(), "x".repeat(MAX_TX_HASH_LEN + 1), "0xdead beef".to_string()] {
+            let body = json!({
+                "success": false,
+                "errorReason": "unexpected_settle_error",
+                "transaction": transaction,
+                "network": "eip155:84532",
+            })
+            .to_string();
+            let err = settle_against(&body).await.unwrap_err();
+            let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
+            assert!(!detail.contains("transaction"), "sent {transaction:?}: {detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pending_settlements_logged_transaction_is_bounded() {
+        let body = json!({
+            "success": false,
+            "errorReason": "settlement_pending",
+            "transaction": "x".repeat(MAX_TX_HASH_LEN + 1),
+            "network": "eip155:84532",
+        })
+        .to_string();
+        let err = settle_against(&body).await.unwrap_err();
+        let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
+        assert!(!detail.contains(&"x".repeat(MAX_TX_HASH_LEN + 1)), "{detail}");
     }
 
     // --- client-facing reason hygiene ------------------------------------------------------------
