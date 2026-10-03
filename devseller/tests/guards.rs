@@ -687,21 +687,112 @@ fn the_unpayable_recipient_refusal_does_not_blame_the_asset() {
     run.must_not_say("advertised asset");
 }
 
-/// Set-but-empty is refused rather than silently taking the default — for the variables `main` reads
-/// directly, not only the ones `config.rs` parses.
-///
-/// `OBOLUS_RESOURCE` is one `main` reads through its own helper rather than through `config.rs`,
-/// and an empty one would advertise a challenge whose resource names nothing.
+/// Every variable refused with the set-but-empty refusal, each with the configuration under which
+/// it is read. A mode-specific variable is read only in its mode, as `OBOLUS_DEV_SETTLE_DELAY_SECS`
+/// is, so its empty value is refused only there (#22).
+const REFUSED_WHEN_EMPTY: &[(&str, &[(&str, &str)])] = &[
+    ("OBOLUS_ADDR", &[]),
+    ("OBOLUS_RESOURCE", &[]),
+    ("OBOLUS_DESCRIPTION", &[]),
+    ("OBOLUS_ACCEPTS", &[]),
+    ("OBOLUS_NETWORK", &[]),
+    ("OBOLUS_PRICE", &[]),
+    ("OBOLUS_PAY_TO", &[]),
+    ("OBOLUS_ASSET", &[]),
+    ("OBOLUS_EXTRA", &[]),
+    ("OBOLUS_DEV_VERIFY", &[]),
+    ("OBOLUS_DEV_REJECT_REASON", &[("OBOLUS_DEV_VERIFY", "reject")]),
+    ("OBOLUS_DEV_SETTLE", &[]),
+    ("OBOLUS_DEV_SETTLE_REASON", &[("OBOLUS_DEV_SETTLE", "rejected")]),
+];
+
+/// The variables that do not get the set-but-empty refusal. Each still refuses an empty value, for a
+/// reason of its own: the configuration under which it is read, and what the refusal says instead.
+/// [`an_exempt_variable_still_refuses_an_empty_value_for_its_own_reason`] runs every row, so an
+/// exemption cannot quietly become a default.
+const EXEMPT_FROM_EMPTY_REFUSAL: &[(&str, &[(&str, &str)], &str)] = &[
+    // Not an http:// origin.
+    ("OBOLUS_UPSTREAM_URL", &[], "must be an http:// origin"),
+    // Not a whole number, and read only under `timeout`.
+    (
+        "OBOLUS_DEV_SETTLE_DELAY_SECS",
+        &[("OBOLUS_DEV_SETTLE", "timeout")],
+        "must be a whole number of seconds",
+    ),
+    // Set at all.
+    ("OBOLUS_ALLOW_MAINNET", &[], "this binary has no arming override"),
+    // Retired, so set at all.
+    ("OBOLUS_DEV_TOKEN_NAME", &[], "OBOLUS_DEV_TOKEN_NAME is no longer read"),
+    ("OBOLUS_DEV_TOKEN_VERSION", &[], "OBOLUS_DEV_TOKEN_VERSION is no longer read"),
+    // Only exactly `1` acknowledges, so empty fails safe: the open-proxy refusal still fires.
+    (
+        "OBOLUS_DEV_ALLOW_OPEN_PROXY",
+        &[
+            ("OBOLUS_ADDR", UNBINDABLE),
+            ("OBOLUS_DEV_VERIFY", "accept"),
+            ("OBOLUS_UPSTREAM_URL", "http://127.0.0.1:9"),
+        ],
+        OPEN_PROXY,
+    ),
+];
+
+/// The two lists above partition [`OBOLUS_VARS`], so a new variable has to join one of them or
+/// this goes red.
+#[test]
+fn every_variable_is_either_refused_when_empty_or_exempt_by_name() {
+    let mut named: Vec<&str> = REFUSED_WHEN_EMPTY
+        .iter()
+        .map(|(var, _)| *var)
+        .chain(EXEMPT_FROM_EMPTY_REFUSAL.iter().map(|(var, _, _)| *var))
+        .collect();
+    let total = named.len();
+    named.sort_unstable();
+    named.dedup();
+    assert_eq!(named.len(), total, "a variable is listed twice, or in both lists");
+
+    let mut documented = OBOLUS_VARS.to_vec();
+    documented.sort_unstable();
+    assert_eq!(
+        named, documented,
+        "REFUSED_WHEN_EMPTY and EXEMPT_FROM_EMPTY_REFUSAL together must name exactly OBOLUS_VARS"
+    );
+}
+
+/// Set-but-empty is refused rather than silently taking the default, for every variable in
+/// [`REFUSED_WHEN_EMPTY`] — whether `main` reads it through its own helper, through `obolus`'s
+/// shared parsing, or through `config.rs`.
 #[test]
 fn a_set_but_empty_variable_is_refused_rather_than_defaulted() {
-    let empty = run(&[("OBOLUS_RESOURCE", "")]);
-    empty.must_say("is set but empty");
-    empty.must_have_refused_during_startup();
+    for (var, context) in REFUSED_WHEN_EMPTY {
+        let mut vars = context.to_vec();
+        vars.push((var, ""));
+        let empty = run(&vars);
+        empty.must_say(var);
+        empty.must_say("set but empty");
+        empty.must_have_refused_during_startup();
+    }
 
-    // The discriminating half: unset still takes the default. Without it this passes on a binary
-    // that refuses the variable outright, which is a different thing entirely.
-    let defaulted = run(&[]);
-    defaulted.must_have_got_past_startup();
+    // The discriminating half: unset still takes the default, including in each mode that reads a
+    // variable of its own. Without it this passes on a binary that refuses the variable outright,
+    // which is a different thing entirely.
+    run(&[]).must_have_got_past_startup();
+    for (_, context) in REFUSED_WHEN_EMPTY.iter().filter(|(_, context)| !context.is_empty()) {
+        run(context).must_have_got_past_startup();
+    }
+}
+
+/// The other half of the partition: an exempt variable is exempt from the set-but-empty wording,
+/// not from refusing. Without this, the partition test above checks names only, and weakening an
+/// exempt guard into a silent default would turn nothing red.
+#[test]
+fn an_exempt_variable_still_refuses_an_empty_value_for_its_own_reason() {
+    for (var, context, refusal) in EXEMPT_FROM_EMPTY_REFUSAL {
+        let mut vars = context.to_vec();
+        vars.push((var, ""));
+        let empty = run(&vars);
+        empty.must_say(refusal);
+        empty.must_have_refused_during_startup();
+    }
 }
 
 /// The remedy names the door the operator actually used, and the refusal names which option failed.

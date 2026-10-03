@@ -143,11 +143,11 @@ fn verify_mode(
     match raw.trim() {
         "verify" => Ok(VerifyMode::Verify),
         "accept" => Ok(VerifyMode::Accept),
-        "reject" => Ok(VerifyMode::Reject(
-            lookup(REJECT_REASON_VAR)
-                .filter(|reason| !reason.trim().is_empty())
-                .unwrap_or_else(|| "rejected by the development seller".to_string()),
-        )),
+        "reject" => Ok(VerifyMode::Reject(reason(
+            lookup,
+            REJECT_REASON_VAR,
+            "rejected by the development seller",
+        )?)),
         other => Err(ConfigError::new(
             VERIFY_VAR,
             format!("{other:?} is not a verification mode. Choose one of: {VERIFY_CHOICES}"),
@@ -158,12 +158,6 @@ fn verify_mode(
 fn settle_mode(
     lookup: &impl Fn(&str) -> Option<String>,
 ) -> Result<SettleMode, ConfigError> {
-    let reason = |default: &str| {
-        lookup(SETTLE_REASON_VAR)
-            .filter(|r| !r.trim().is_empty())
-            .unwrap_or_else(|| default.to_string())
-    };
-
     let raw = match lookup(SETTLE_VAR) {
         None => return Ok(SettleMode::Succeed),
         Some(raw) if raw.trim().is_empty() => {
@@ -180,8 +174,16 @@ fn settle_mode(
     match raw.trim() {
         "succeed" => Ok(SettleMode::Succeed),
         "unsuccessful" => Ok(SettleMode::Unsuccessful),
-        "unavailable" => Ok(SettleMode::Unavailable(reason("settlement is unreachable"))),
-        "rejected" => Ok(SettleMode::Rejected(reason("settlement was refused"))),
+        "unavailable" => Ok(SettleMode::Unavailable(reason(
+            lookup,
+            SETTLE_REASON_VAR,
+            "settlement is unreachable",
+        )?)),
+        "rejected" => Ok(SettleMode::Rejected(reason(
+            lookup,
+            SETTLE_REASON_VAR,
+            "settlement was refused",
+        )?)),
         "empty-receipt" => Ok(SettleMode::EmptyReceipt),
         "timeout" => {
             let secs = match lookup(SETTLE_DELAY_VAR) {
@@ -206,6 +208,27 @@ fn settle_mode(
             SETTLE_VAR,
             format!("{other:?} is not a settlement outcome. Choose one of: {SETTLE_CHOICES}"),
         )),
+    }
+}
+
+/// The reason text a failing mode reports, or `default` when the variable is not set at all.
+///
+/// Read only by a mode that reports a reason, so only that mode refuses an empty one — as
+/// `OBOLUS_DEV_SETTLE_DELAY_SECS` is read only under `timeout`. Set-but-empty is refused like every
+/// other variable here rather than defaulted (#22): an operator who set a reason and sees the
+/// default has lost the value without being told.
+fn reason(
+    lookup: &impl Fn(&str) -> Option<String>,
+    variable: &'static str,
+    default: &str,
+) -> Result<String, ConfigError> {
+    match lookup(variable) {
+        None => Ok(default.to_string()),
+        Some(raw) if raw.trim().is_empty() => Err(ConfigError::new(
+            variable,
+            format!("set but empty. Unset it to take the default ({default:?}), or give it a value."),
+        )),
+        Some(raw) => Ok(raw),
     }
 }
 
@@ -340,15 +363,31 @@ mod tests {
             .expect("a configured reason parses");
         assert_eq!(config.verify, VerifyMode::Reject("insufficient funds".to_string()));
 
-        // Unset, and set-but-empty, both fall back — a reason is cosmetic, so an empty one is not
-        // worth refusing to start over, unlike a mode that changes behaviour.
-        for pairs in [vec![(VERIFY_VAR, "reject")], vec![(VERIFY_VAR, "reject"), (REJECT_REASON_VAR, "")]] {
-            let config = from_env(env(&pairs)).expect("reject with no reason parses");
-            assert_eq!(
-                config.verify,
-                VerifyMode::Reject("rejected by the development seller".to_string())
-            );
+        // Unset falls back to a default.
+        let config = from_env(env(&[(VERIFY_VAR, "reject")])).expect("reject with no reason parses");
+        assert_eq!(config.verify, VerifyMode::Reject("rejected by the development seller".to_string()));
+    }
+
+    /// Set-but-empty is refused for a reason too, as for every other variable (#22) — but only in
+    /// a mode that reads it, as `OBOLUS_DEV_SETTLE_DELAY_SECS` is read only under `timeout`.
+    #[test]
+    fn a_set_but_empty_reason_is_refused_in_the_modes_that_read_it() {
+        for (mode, reason) in [
+            ((VERIFY_VAR, "reject"), REJECT_REASON_VAR),
+            ((SETTLE_VAR, "rejected"), SETTLE_REASON_VAR),
+            ((SETTLE_VAR, "unavailable"), SETTLE_REASON_VAR),
+        ] {
+            for empty in ["", "  "] {
+                let error = from_env(env(&[mode, (reason, empty)]))
+                    .expect_err("set-but-empty is a configuration error");
+                assert_eq!(error.variable, reason);
+                assert!(error.detail.contains("set but empty"), "got: {error}");
+            }
         }
+
+        // A mode that never reads the reason does not judge it.
+        from_env(env(&[(REJECT_REASON_VAR, "")])).expect("verify does not read a reject reason");
+        from_env(env(&[(SETTLE_REASON_VAR, "")])).expect("succeed does not read a settle reason");
     }
 
     #[test]
