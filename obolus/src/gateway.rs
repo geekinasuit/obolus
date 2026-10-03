@@ -1367,6 +1367,10 @@ mod tests {
         // client has paid and holds a truncated answer, and the receipt header has already gone
         // out, so nothing downstream can retract it. Closing this needs a refund path, an
         // escrow, or settlement in trailers — see the module docs.
+        //
+        // Settling at the head also departs from x402 v2 §6.1's `authorization` ordering (verify →
+        // resource → settle → respond). #101 holds this as stream-through, documented, while the
+        // alternatives are evaluated.
         let (app, calls) = app_with(FakeFacilitator::accepting(), FakeUpstream::failing_midstream());
         let (status, headers, body, errored) =
             send_partial(app, completion_request(Some(&x402::encode_payment(&payment())))).await;

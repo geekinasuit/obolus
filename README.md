@@ -343,7 +343,8 @@ The Solana entry above is not payable as written: x402's Solana `exact` client a
 Two `extra` keys are reserved by the x402 spec rather than passed through as scheme data:
 `assetTransferMethod` (how value moves) and `paymentFlow` (when settlement happens). Obolus advertises
 only `exact`'s default method on the network — `eip3009` on `eip155:`, `default` on `solana:` — and only the
-`authorization` flow (verify, serve, then settle). That governs what is offered, not how a payment
+`authorization` flow (verify, serve, then settle — with one departure, described in
+[When a paid request is charged](#when-a-paid-request-is-charged)). That governs what is offered, not how a payment
 settles: on EVM, x402's facilitator picks the method from the shape of the payload, which Obolus does
 not open. What Obolus checks is the option a client says it accepted. An `OBOLUS_ACCEPTS` entry or `OBOLUS_EXTRA` may
 leave either out or name exactly that; anything else is refused at startup, and a payment that names
@@ -389,6 +390,26 @@ its operator configured is exactly the surprise to fail loudly on. It stays
 can advertise a challenge but never move funds itself. (A startup guard that refuses to *advertise* a
 non-testnet network unless explicitly armed is a separate protection — see
 [Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network).)
+
+## When a paid request is charged
+
+x402 v2 defines the `authorization` flow, the only one Obolus runs, as verify → resource → settle →
+respond ([§6.1](https://github.com/x402-foundation/x402/blob/main/specs/x402-specification-v2.md#61-asset-transfer-methods-and-payment-flow-models)).
+Obolus departs from that ordering. It settles when the upstream's response **head** arrives and only
+then relays the body, because the receipt travels in the `PAYMENT-RESPONSE` header and a header has to
+be sent before the body. An upstream that cannot be reached, answers with an error status, or misses
+the payment window is never charged for. But a stream that fails after the head leaves the client
+charged for a partial answer: the response already carries a `200` and the receipt, and the body
+simply ends early. Under the `exact` scheme a settlement cannot be undone, and Obolus has no refund
+path.
+
+A `stream: false` request takes the same path and also settles at the head, but Ollama withholds that
+head until generation has finished, so there it is much closer to the spec's ordering. This is a
+known deviation, tracked in [#101](https://github.com/geekinasuit/obolus/issues/101), where the
+alternatives are being evaluated. The
+[x402 explainer](https://github.com/geekinasuit/obolus/blob/main/docs/x402-ecosystem.html) covers it
+under "Why the ordering is the interesting part", and the test
+`a_midstream_failure_after_settlement_is_a_known_gap` pins the current behaviour.
 
 ## Serving without payment
 

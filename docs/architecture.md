@@ -212,7 +212,10 @@ charges nothing. The open gap runs the other way: once settlement succeeds the b
 stream that then fails partway leaves a client charged for a response they did not fully receive.
 The gateway has no refund or retry path for that today; it is the refund / failure question named
 under [planned work](#what-is-planned-and-where-it-goes) and in [`pricing.md`](pricing.md), and a
-real gap to weigh before running this in production.
+real gap to weigh before running this in production. Settling at the head rather than after the
+body is also a departure from the x402 v2 `authorization` flow's verify → resource → settle →
+respond ordering; [#101](https://github.com/geekinasuit/obolus/issues/101) tracks it and the
+alternatives.
 
 The payment also expires on its own clock, so the wait for the upstream's `200` is bounded by the
 payment window (`maxTimeoutSeconds`, counted from the request's arrival) less a reserve kept for
