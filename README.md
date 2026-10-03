@@ -400,9 +400,12 @@ then relays the body, because the receipt travels in the `PAYMENT-RESPONSE` head
 be sent before the body. An upstream that cannot be reached, answers with an error status, or misses
 the payment window is never charged for. But a stream that fails after the head leaves the client
 charged for a partial answer: the response already carries a `200` and the receipt, and the body
-simply ends early. The `exact` scheme defines no refund, leaving any remedy to the seller's own
-arrangement, and Obolus has none. A client can recognise this case: a `200` with a receipt whose
-stream ends without the terminating `data: [DONE]` (or a `finish_reason`).
+breaks off before its end, which an HTTP client may report as an error or as an early end of the
+body. The `exact` scheme defines no refund, leaving any remedy to the seller's own arrangement, and
+Obolus has none. A client can recognise this case: a `200` with a receipt whose stream stops before
+the terminating `data: [DONE]` that an OpenAI-compatible stream (Ollama's included) sends last. A
+`finish_reason` is not that signal: it arrives in the chunk just before `[DONE]`, and `"length"`
+there is a normal stop at the token limit.
 
 A `stream: false` request takes the same path and also settles at the head, but Ollama withholds that
 head until generation has finished, so there it is much closer to the spec's ordering: a generation
