@@ -405,8 +405,8 @@ const SETTLEMENT_PENDING: &str = "settlement_pending";
 ///   exception. We always send both as JSON, so the first two can only be ours.
 /// * The exact-EVM facilitators (`typescript/packages/mechanisms/evm/src/exact/facilitator/` with
 ///   `assetCache.ts`, and `go/mechanisms/evm/exact/facilitator/`): checks of the requirements'
-///   scheme, network, asset and EIP-712 domain against the chain, and the facilitator's own
-///   failures. `…_failed_to_verify_signature` and `…_failed_to_execute_transfer` are left out
+///   scheme, network, amount, asset and EIP-712 domain against the chain, and the facilitator's
+///   own failures. `…_failed_to_verify_signature` and `…_failed_to_execute_transfer` are left out
 ///   because a client's malformed authorization or a revert the facilitator does not recognise can
 ///   produce them. Go's `…_failed_to_check_nonce` and `…_failed_to_get_balance` are declared but
 ///   emitted nowhere, and `…_failed_to_check_deployment` and `…_failed_to_get_receipt` only by its
@@ -438,6 +438,7 @@ const OUR_FAULT_REASONS: &[&str] = &[
     "asset_not_deployed_contract",
     "invalid_exact_evm_failed_to_get_network_config",
     "invalid_exact_evm_failed_to_parse_signature",
+    "invalid_exact_evm_required_amount",
 ];
 
 /// The [`OUR_FAULT_REASONS`] entry `reason` names, if any. Returns our constant rather than the
@@ -668,22 +669,25 @@ impl Facilitator for DelegatedFacilitator {
             // already run, so a 402 here would invite a second payment for one answer; this is a
             // 502 instead, and the answer is withheld. The hash goes to the log (via the gateway),
             // which is all the reconciliation there is today — #75. It is the facilitator's own
-            // string, so it is bounded by `broadcast_hash` and logged with `{:?}`, never interpreted.
+            // string, so it is cut by `logged_hash` and quoted with `{:?}`, never interpreted.
             Some(false) if parsed.error_reason.as_deref() == Some(SETTLEMENT_PENDING) => {
+                let named = match logged_hash(parsed.transaction) {
+                    Some(hash) => format!("transaction {hash:?}"),
+                    None => "a transaction it did not name".to_string(),
+                };
                 Err(FacilitatorError::Unavailable(format!(
-                    "facilitator /settle reported {SETTLEMENT_PENDING}: transaction {:?} on network \
-                     {:?} was broadcast but not confirmed, and may still settle",
-                    broadcast_hash(parsed.transaction),
+                    "facilitator /settle reported {SETTLEMENT_PENDING}: {named} on network {:?} was \
+                     broadcast but not confirmed, and may still settle",
                     non_empty(parsed.network).unwrap_or_else(|| payment.accepted().network.clone()),
                 )))
             }
             // A refusal whose reason blames our side, not the payment (#31): a 502, so the receipt
-            // that would have named a transaction never reaches the client. A hash it names goes to
-            // the log instead, bounded and quoted like the pending case's; none is not logged.
+            // that would have named a transaction never reaches the client. A transaction it names
+            // goes to the log instead, cut and quoted like the pending case's; none is not logged.
             Some(false) if blames_us.is_some() => {
-                let named = match broadcast_hash(parsed.transaction) {
-                    hash if hash.is_empty() => String::new(),
-                    hash => format!("; transaction {hash:?}"),
+                let named = match logged_hash(parsed.transaction) {
+                    Some(hash) => format!("; transaction {hash:?}"),
+                    None => String::new(),
                 };
                 Err(FacilitatorError::Unavailable(format!(
                     "facilitator /settle refused for a reason on our side: {} (status {status}){named}",
@@ -749,8 +753,7 @@ fn reject_reason(reason: Option<&str>, fallback: &str) -> String {
 /// base32) and [`TX_ID_PUNCTUATION`] (base64 hashes, Hedera's `0.0.1235@1700000000.000000000`).
 /// Anything else becomes the receipt's "none" and is logged instead, cut to that length and quoted
 /// with `{:?}`, so a value the receipt drops is still on record. A hash that passes is not logged
-/// here: recording refused settlements is #75. A settlement that ends in a 502 instead names its
-/// transaction only in the log, and bounds it here the same way.
+/// here: recording refused settlements is #75.
 fn broadcast_hash(transaction: Option<String>) -> String {
     let Some(hash) = non_empty(transaction) else {
         return String::new();
@@ -760,12 +763,19 @@ fn broadcast_hash(transaction: Option<String>) -> String {
     {
         return hash;
     }
-    let shown: String = hash.chars().take(MAX_TX_HASH_LEN).collect();
     eprintln!(
         "obolus: facilitator /settle named a transaction that is not a plausible hash; left out of \
-         the receipt and the settle log: {shown:?}"
+         the receipt: {:?}",
+        logged_hash(Some(hash)).unwrap_or_default()
     );
     String::new()
+}
+
+/// The transaction a settlement that ends in a 502 names, for its log line only: no receipt
+/// carries it, so the line is the one record of it and keeps whatever the facilitator sent, cut to
+/// [`MAX_TX_HASH_LEN`] characters. `None` when nothing was named. The caller quotes it with `{:?}`.
+fn logged_hash(transaction: Option<String>) -> Option<String> {
+    non_empty(transaction).map(|hash| hash.chars().take(MAX_TX_HASH_LEN).collect())
 }
 
 #[cfg(test)]
@@ -1385,6 +1395,7 @@ mod delegated_tests {
         ("asset_not_deployed_contract", Blame::Ours),
         ("invalid_exact_evm_failed_to_get_network_config", Blame::Ours),
         ("invalid_exact_evm_failed_to_parse_signature", Blame::Ours),
+        ("invalid_exact_evm_required_amount", Blame::Ours),
         // Not in §9: the reference exact-EVM facilitators, which a client's own authorization can
         // trigger, so left at the default.
         ("invalid_exact_evm_failed_to_verify_signature", Blame::Client),
@@ -1466,36 +1477,44 @@ mod delegated_tests {
         assert!(detail.contains("0xfeedbeef"), "{detail}");
     }
 
-    #[tokio::test]
-    async fn an_our_fault_settle_refusal_logs_only_a_plausible_transaction() {
-        // The same bounding the receipt applies: no transaction is not logged as `""`, and a string
-        // that is not a plausible hash stays out of this line (`broadcast_hash` records it apart).
-        for transaction in ["".to_string(), "x".repeat(MAX_TX_HASH_LEN + 1), "0xdead beef".to_string()] {
-            let body = json!({
-                "success": false,
-                "errorReason": "unexpected_settle_error",
-                "transaction": transaction,
-                "network": "eip155:84532",
-            })
-            .to_string();
-            let err = settle_against(&body).await.unwrap_err();
-            let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
-            assert!(!detail.contains("transaction"), "sent {transaction:?}: {detail}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_pending_settlements_logged_transaction_is_bounded() {
+    /// The `Unavailable` detail a settle answering `reason` with `transaction` produces.
+    async fn settle_detail(reason: &str, transaction: &str) -> String {
         let body = json!({
             "success": false,
-            "errorReason": "settlement_pending",
-            "transaction": "x".repeat(MAX_TX_HASH_LEN + 1),
+            "errorReason": reason,
+            "transaction": transaction,
             "network": "eip155:84532",
         })
         .to_string();
         let err = settle_against(&body).await.unwrap_err();
         let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
-        assert!(!detail.contains(&"x".repeat(MAX_TX_HASH_LEN + 1)), "{detail}");
+        detail
+    }
+
+    #[tokio::test]
+    async fn an_our_fault_settle_refusal_logs_its_transaction_cut_and_quoted() {
+        // The log line is this transaction's only record, so whatever was named stays on it, cut to
+        // the hash length and quoted; nothing named is left out rather than logged as `""`.
+        let reason = "unexpected_settle_error";
+        let none = settle_detail(reason, "").await;
+        assert!(!none.contains("transaction"), "{none}");
+        let long = settle_detail(reason, &"x".repeat(MAX_TX_HASH_LEN + 1)).await;
+        assert!(long.contains(&format!("transaction {:?}", "x".repeat(MAX_TX_HASH_LEN))), "{long}");
+        assert!(!long.contains(&"x".repeat(MAX_TX_HASH_LEN + 1)), "{long}");
+        let odd = settle_detail(reason, "0xdead beef").await;
+        assert!(odd.contains(r#"transaction "0xdead beef""#), "{odd}");
+    }
+
+    #[tokio::test]
+    async fn a_pending_settlements_logged_transaction_is_cut_but_still_named() {
+        // The line #75 reconciliation reads: it must identify the transaction, and never say a
+        // transaction `""` was broadcast.
+        let long = settle_detail("settlement_pending", &"x".repeat(MAX_TX_HASH_LEN + 1)).await;
+        assert!(long.contains(&format!("transaction {:?}", "x".repeat(MAX_TX_HASH_LEN))), "{long}");
+        assert!(!long.contains(&"x".repeat(MAX_TX_HASH_LEN + 1)), "{long}");
+        let none = settle_detail("settlement_pending", "").await;
+        assert!(none.contains("a transaction it did not name"), "{none}");
+        assert!(!none.contains(r#""""#), "{none}");
     }
 
     // --- client-facing reason hygiene ------------------------------------------------------------
