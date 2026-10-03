@@ -39,7 +39,8 @@ pub enum FacilitatorError {
     /// authorization, wrong recipient.
     #[error("payment rejected: {0}")]
     Rejected(String),
-    /// We could not reach or understand the facilitator.
+    /// We could not reach or understand the facilitator, or it refused for a reason that blames
+    /// our side or its own failure rather than the payment.
     #[error("facilitator unavailable: {0}")]
     Unavailable(String),
 }
@@ -384,6 +385,38 @@ struct SettleResponse {
 /// makes it non-terminal, since the transaction may still land.
 const SETTLEMENT_PENDING: &str = "settlement_pending";
 
+/// The refusal reasons that blame our side rather than the client's payment: something we sent
+/// (requirements, version, envelope) or the facilitator's own failure. Facilitators disagree on the
+/// HTTP status they put on the same refusal — 200, 400, 403 and 500 all occur — so the verdict is
+/// read from the reason, and these become [`Unavailable`](FacilitatorError::Unavailable), a 502,
+/// rather than a 402 that would have the client re-sign a payment that was never the problem (#31).
+///
+/// The first five are x402 v2 §9 codes; the rest are not in §9 but are emitted by reference
+/// facilitators. A reason not listed here — including one no spec names — stays the client's
+/// refusal, as does each of §9's ambiguous `invalid_scheme`, `invalid_network` and
+/// `invalid_payload`. Matched exactly, before the reason is bounded for echoing.
+const OUR_FAULT_REASONS: &[&str] = &[
+    "invalid_payment_requirements",
+    "unsupported_scheme",
+    "invalid_x402_version",
+    "unexpected_verify_error",
+    "unexpected_settle_error",
+    "invalid_json",
+    "missing_parameters",
+    "unexpected_error",
+    "unknown_error",
+    "invalid_exact_evm_missing_eip712_domain",
+    "invalid_exact_evm_network_mismatch",
+    "invalid_bazaar_extension",
+];
+
+/// The [`OUR_FAULT_REASONS`] entry `reason` names, if any. Returns our constant rather than the
+/// facilitator's string, so what reaches the log is a value we wrote.
+fn our_fault(reason: Option<&str>) -> Option<&'static str> {
+    let reason = reason?;
+    OUR_FAULT_REASONS.iter().copied().find(|&known| known == reason)
+}
+
 /// A [`Facilitator`] that delegates `verify` and `settle` to a third-party x402 facilitator over
 /// HTTP.
 ///
@@ -401,6 +434,9 @@ const SETTLEMENT_PENDING: &str = "settlement_pending";
 ///   so a reverted transaction can be named. A timeout, a dropped connection, an unreadable body,
 ///   or a body carrying no verdict is [`Unavailable`](FacilitatorError::Unavailable) — a payment we
 ///   never managed to evaluate must not reach the client as "your payment was bad".
+/// * **A refusal is classified by its reason, not its status.** One whose reason blames our side
+///   (`unsupported_scheme`, `unexpected_settle_error`, …) is [`Unavailable`](FacilitatorError::Unavailable) too, whatever 2xx
+///   or 4xx it arrived on.
 ///
 /// It speaks plain HTTP only; see [`DelegatedFacilitatorError::TlsNotWired`].
 #[derive(Debug)]
@@ -524,7 +560,7 @@ impl Facilitator for DelegatedFacilitator {
         let (status, bytes) =
             self.round_trip(&self.verify_url, "verify", payment, requirements).await?;
         // Only a 2xx or 4xx is an authoritative verdict: the facilitator evaluated the payment
-        // (accepted it, or refused it for a client-side reason). A 5xx — or a 1xx/3xx — means it
+        // (accepted it, or refused it — whose fault the refusal is comes from its reason). A 5xx — or a 1xx/3xx — means it
         // failed before reaching a verdict, so we do not read a verdict out of its body: trusting one
         // would let a 5xx `isValid:true` wave a payment through (free inference) and a 5xx
         // `isValid:false` blame the client for the facilitator's outage.
@@ -538,9 +574,15 @@ impl Facilitator for DelegatedFacilitator {
                 "facilitator /verify returned an unparseable body (status {status}): {e}"
             ))
         })?;
+        let blames_us = our_fault(parsed.invalid_reason.as_deref());
         match parsed.is_valid {
             Some(true) => Ok(()),
-            // A parsed "no" on a verdict-bearing status: the client's authorization is bad. Surface
+            // A parsed "no" whose reason blames our side, not the payment (#31): a 502.
+            Some(false) if blames_us.is_some() => Err(FacilitatorError::Unavailable(format!(
+                "facilitator /verify refused for a reason on our side: {} (status {status})",
+                blames_us.unwrap_or_default()
+            ))),
+            // Any other parsed "no" on a verdict-bearing status: the client's authorization is bad. Surface
             // the facilitator's own reason (bounded by `reject_reason` — an unvalidated string, not a
             // guaranteed closed enum); never our status/URL/body detail.
             Some(false) => Err(FacilitatorError::Rejected(reject_reason(
@@ -577,6 +619,7 @@ impl Facilitator for DelegatedFacilitator {
                 "facilitator /settle returned an unparseable body (status {status}): {e}"
             ))
         })?;
+        let blames_us = our_fault(parsed.error_reason.as_deref());
         match parsed.success {
             // `success` is the sole authority — build the receipt ourselves rather than deserialize
             // the domain type, filling the network from the payment when the facilitator omits it.
@@ -604,7 +647,18 @@ impl Facilitator for DelegatedFacilitator {
                     non_empty(parsed.network).unwrap_or_else(|| payment.accepted().network.clone()),
                 )))
             }
-            // A definite non-settlement: a pre-broadcast refusal (`transaction: ""`) or an on-chain
+            // A refusal whose reason blames our side, not the payment (#31): a 502, so the receipt
+            // that would have named a transaction never reaches the client. The hash goes to the log
+            // instead, quoted like the pending case's.
+            Some(false) if blames_us.is_some() => {
+                Err(FacilitatorError::Unavailable(format!(
+                    "facilitator /settle refused for a reason on our side: {} (status {status}); \
+                     transaction {:?}",
+                    blames_us.unwrap_or_default(),
+                    parsed.transaction.unwrap_or_default(),
+                )))
+            }
+            // Any other definite non-settlement: a pre-broadcast refusal (`transaction: ""`) or an on-chain
             // revert (a real hash, but reverted). Neither moved funds on this call, so it is the
             // client's 402 to retry. It comes back as the failure receipt rather than `Rejected`,
             // so that a revert's hash reaches the client: the receipt format keeps `transaction`
@@ -1247,6 +1301,120 @@ mod delegated_tests {
         // A schemeless base would silently produce a bad request URL; caught at construction.
         let err = DelegatedFacilitator::new("facilitator.example/facilitator").unwrap_err();
         assert!(matches!(err, DelegatedFacilitatorError::NotAnHttpBase(_)), "got {err:?}");
+    }
+
+    // --- verdict classification by reason (#31 item 5) ------------------------------------------
+
+    /// Who a refusal's reason blames: the client's payment (a 402) or our side — our
+    /// misconfiguration or the facilitator's own failure (a 502).
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Blame {
+        Client,
+        Ours,
+    }
+
+    /// Every reason x402 v2 §9 names (bar `settlement_pending`, pinned on its own above), the
+    /// non-spec reasons reference facilitators emit that #31 classified, and two the gateway has
+    /// never heard of, which default to the client's 402.
+    const REASON_TABLE: &[(&str, Blame)] = &[
+        // x402 v2 §9: the client's payment.
+        ("insufficient_funds", Blame::Client),
+        ("invalid_exact_evm_payload_authorization_valid_after", Blame::Client),
+        ("invalid_exact_evm_payload_authorization_valid_before", Blame::Client),
+        ("invalid_exact_evm_payload_authorization_value_mismatch", Blame::Client),
+        ("invalid_exact_evm_payload_signature", Blame::Client),
+        ("invalid_exact_evm_payload_recipient_mismatch", Blame::Client),
+        ("invalid_transaction_state", Blame::Client),
+        // x402 v2 §9: ambiguous, left with the client by #31.
+        ("invalid_network", Blame::Client),
+        ("invalid_payload", Blame::Client),
+        ("invalid_scheme", Blame::Client),
+        // x402 v2 §9: ours.
+        ("invalid_payment_requirements", Blame::Ours),
+        ("unsupported_scheme", Blame::Ours),
+        ("invalid_x402_version", Blame::Ours),
+        ("unexpected_verify_error", Blame::Ours),
+        ("unexpected_settle_error", Blame::Ours),
+        // Not in §9; emitted by reference facilitators, classified ours by #31.
+        ("invalid_json", Blame::Ours),
+        ("missing_parameters", Blame::Ours),
+        ("unexpected_error", Blame::Ours),
+        ("unknown_error", Blame::Ours),
+        ("invalid_exact_evm_missing_eip712_domain", Blame::Ours),
+        ("invalid_exact_evm_network_mismatch", Blame::Ours),
+        ("invalid_bazaar_extension", Blame::Ours),
+        // Unknown: the default.
+        ("duplicate_settlement", Blame::Client),
+        ("some_reason_no_spec_names", Blame::Client),
+    ];
+
+    /// The two statuses facilitators disagree on for the same refusal. The verdict must come out
+    /// the same on both, because it is read from the reason, not the status.
+    const VERDICT_STATUSES: [StatusCode; 2] = [StatusCode::OK, StatusCode::BAD_REQUEST];
+
+    #[tokio::test]
+    async fn a_verify_refusal_is_classified_by_its_reason_not_its_status() {
+        for &(reason, blame) in REASON_TABLE {
+            for status in VERDICT_STATUSES {
+                let body = json!({ "isValid": false, "invalidReason": reason }).to_string();
+                let (base, _c) = serve(Canned::status(status, &body), unused()).await;
+                let got = DelegatedFacilitator::new(base)
+                    .unwrap()
+                    .verify(&payment(), &requirements())
+                    .await;
+                match blame {
+                    Blame::Client => assert_eq!(
+                        got,
+                        Err(FacilitatorError::Rejected(reason.to_string())),
+                        "{reason} at {status}"
+                    ),
+                    Blame::Ours => assert!(
+                        matches!(got, Err(FacilitatorError::Unavailable(_))),
+                        "{reason} at {status}: got {got:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_settle_refusal_is_classified_by_its_reason_not_its_status() {
+        for &(reason, blame) in REASON_TABLE {
+            for status in VERDICT_STATUSES {
+                let body = json!({
+                    "success": false,
+                    "errorReason": reason,
+                    "transaction": "",
+                    "network": "eip155:84532",
+                })
+                .to_string();
+                let (base, _c) = serve(unused(), Canned::status(status, &body)).await;
+                let got = DelegatedFacilitator::new(base)
+                    .unwrap()
+                    .settle(&payment(), &requirements())
+                    .await;
+                match blame {
+                    Blame::Client => {
+                        assert_eq!(got, Ok(refusal(reason, "")), "{reason} at {status}")
+                    }
+                    Blame::Ours => assert!(
+                        matches!(got, Err(FacilitatorError::Unavailable(_))),
+                        "{reason} at {status}: got {got:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_our_fault_settle_refusal_logs_its_transaction() {
+        // The client no longer sees the refusal's receipt, so a hash the facilitator named has to
+        // reach the log instead. It is the facilitator's string, quoted rather than interpreted.
+        let body = r#"{"success":false,"errorReason":"unexpected_settle_error","transaction":"0xfeedbeef","network":"eip155:84532"}"#;
+        let err = settle_against(body).await.unwrap_err();
+        let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
+        assert!(detail.contains("unexpected_settle_error"), "{detail}");
+        assert!(detail.contains("0xfeedbeef"), "{detail}");
     }
 
     // --- client-facing reason hygiene ------------------------------------------------------------
