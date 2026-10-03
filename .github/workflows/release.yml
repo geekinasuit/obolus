@@ -49,6 +49,10 @@ concurrency:
   cancel-in-progress: false
   queue: max
 
+# Every action below is pinned to a full commit SHA, with its tag as a trailing comment, because this
+# is the only workflow that holds a write token: a tag can be moved under us, a commit cannot.
+# The read-only workflows (`ci.yml`, `x402-staleness.yml`) stay on tags. Dependabot
+# (`.github/dependabot.yml`) moves all of them, #18.
 jobs:
   build:
     name: ${{ matrix.target }}
@@ -73,9 +77,9 @@ jobs:
             arch_pattern: 'ELF.*aarch64'
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: bazel-contrib/setup-bazel@0.19.0
+      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
         with:
           bazelisk-cache: true
           disk-cache: ${{ github.workflow }}
@@ -117,7 +121,7 @@ jobs:
           file "dist/obolus-${{ matrix.target }}" | grep -qE '${{ matrix.arch_pattern }}'
           file "dist/obolus-devseller-${{ matrix.target }}" | grep -qE '${{ matrix.arch_pattern }}'
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: obolus-${{ matrix.target }}
           path: dist/
@@ -132,7 +136,7 @@ jobs:
     name: eip3009 fixtures
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Staged by `cp` rather than listed in the upload's `path:`, because `if-no-files-found`
       # fires only when NO path matches: a renamed fixture would otherwise ship a release with
@@ -143,7 +147,7 @@ jobs:
           mkdir -p fixtures
           cp eip3009/fixtures/x402-authorization.json eip3009/fixtures/typehashes.json eip3009/fixtures/eip712-mail.json fixtures/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: eip3009-fixtures
           path: fixtures/
@@ -166,7 +170,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: staging
 
