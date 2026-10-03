@@ -28,14 +28,17 @@
 //!
 //! # And it binds loopback
 //!
-//! Accept-every-payment, plus a real upstream, plus a routable interface is an unauthenticated
-//! open proxy to somebody's inference endpoint — and the cost lands on whoever runs it. The
+//! Accept-every-payment, plus a real upstream, is an unauthenticated open proxy to somebody's
+//! inference endpoint for whoever can reach the port — and the cost lands on whoever runs it. The
 //! testnet refusal above does nothing about that; it guards the money path, not the exposure one.
 //! So the default bind is `127.0.0.1`, a wider one is explicit, and the one genuinely dangerous
-//! combination refuses without a second explicit acknowledgement.
+//! combination refuses without a second explicit acknowledgement — on every bind, loopback
+//! included, because a reverse proxy or `tailscale serve`/`funnel` in front of loopback exposes it
+//! just as well and this process cannot see one (#104).
 //!
 //! Testing a client on an Android device or another host does not need a wider bind: forward a
-//! port to it (`adb reverse tcp:8404 tcp:8404`) and loopback is still loopback.
+//! port to it (`adb reverse tcp:8404 tcp:8404`) and loopback is still loopback. In front of a real
+//! model in `accept` mode, that forward still needs the acknowledgement.
 
 mod config;
 mod facilitator;
@@ -137,14 +140,20 @@ REFUSALS, none of which are overridable except the last
     because a seller that gives inference away for a payment it never collects has no business
     advertising a chain where that payment could have been real.
 
-    Binding beyond loopback, while accepting every payment uninspected, in front of a real model:
-    that combination is an unauthenticated open proxy to somebody's inference endpoint, billed to
-    whoever ran it. Forward a port instead (`adb reverse tcp:8404 tcp:8404`) and loopback stays
-    loopback. Switching to OBOLUS_DEV_VERIFY=verify is NOT a fix: it checks a signature over a
-    payer address the caller chooses, against no balance and no record of spent nonces, and
-    nothing here settles, so a throwaway keypair satisfies it. Nothing this binary checks makes a
-    routable bind safe in front of a model somebody pays for. To run it anyway:
+    Accepting every payment uninspected in front of a real model (OBOLUS_DEV_VERIFY=accept plus
+    OBOLUS_UPSTREAM_URL), on ANY bind: that combination is an unauthenticated open proxy to
+    somebody's inference endpoint, billed to whoever ran it. Loopback is no exemption, because a
+    reverse proxy, `tailscale serve` or `tailscale funnel` forwarding to a loopback bind exposes it
+    exactly as a wider bind would, and this process cannot see one. Leave OBOLUS_UPSTREAM_URL unset
+    to test payments against the canned response. Switching to OBOLUS_DEV_VERIFY=verify is NOT a
+    fix: it checks a signature over a payer address the caller chooses, against no balance and no
+    record of spent nonces, and nothing here settles, so a throwaway keypair satisfies it. Nothing
+    this binary checks makes this safe in front of a model somebody pays for. When the only way in
+    is a forward you set up to one device (`adb reverse tcp:8404 tcp:8404`), acknowledge it:
     OBOLUS_DEV_ALLOW_OPEN_PROXY=1 acknowledge the open-proxy refusal
+
+    A bind beyond loopback also prints *** BOUND BEYOND LOOPBACK *** at startup. That warning reads
+    only the bind address, so nothing forwarding to a loopback bind triggers it.
 ";
 
 /// A configured value, or `default` when the variable is not set at all.
@@ -431,25 +440,30 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // The hazard publishing this binary creates, and the one the testnet refusal does nothing
-    // about: it guards the money path, not the exposure one. Accept-mode plus a real upstream
-    // plus a routable bind is an unauthenticated open proxy to somebody's inference endpoint, and
-    // the bill lands on whoever ran it.
+    // about: it guards the money path, not the exposure one. Accept-mode plus a real upstream is
+    // an unauthenticated open proxy to somebody's inference endpoint for whoever can reach the
+    // port, and the bill lands on whoever ran it. On any bind, loopback included (#104): a reverse
+    // proxy or a `tailscale serve`/`funnel` in front of a loopback bind exposes it as a wider bind
+    // would, and nothing in this process can see one.
     let loopback = addr.ip().is_loopback();
     let real_upstream = upstream_url.is_some();
     let open_proxy_ack = std::env::var(ALLOW_OPEN_PROXY_VAR).as_deref() == Ok("1");
-    if !loopback && real_upstream && dev.verify == VerifyMode::Accept && !open_proxy_ack {
+    if real_upstream && dev.verify == VerifyMode::Accept && !open_proxy_ack {
         anyhow::bail!(
-            "refusing to start: this configuration is an open proxy. The bind address {addr} is \
-             not loopback, OBOLUS_DEV_VERIFY=accept serves every caller without inspecting their \
-             payment, and OBOLUS_UPSTREAM_URL points at a real model — so anyone who can reach \
-             this port gets unlimited inference at your expense. Bind loopback (the default) and \
-             forward a port to reach it from another device — `adb reverse tcp:{port} \
-             tcp:{port}` for Android. Note that OBOLUS_DEV_VERIFY=verify is NOT a fix for this: it \
+            "refusing to start: this configuration is an open proxy. OBOLUS_DEV_VERIFY=accept \
+             serves every caller without inspecting their payment, and OBOLUS_UPSTREAM_URL points \
+             at a real model — so anyone who can reach this port gets unlimited inference at your \
+             expense. That holds on a loopback bind too ({addr} here): a reverse proxy, `tailscale \
+             serve` or `tailscale funnel` forwarding to the port exposes it exactly as a wider \
+             bind would, and this process cannot see one, so loopback is no exemption. Unset \
+             OBOLUS_UPSTREAM_URL to serve a canned response if it is payments you are testing \
+             rather than the model. Note that OBOLUS_DEV_VERIFY=verify is NOT a fix for this: it \
              checks a signature over a payer address the caller chooses, against no balance and no \
              record of spent nonces, and nothing here ever settles — so a throwaway keypair \
-             satisfies it as easily as a funded one. No check this binary can perform makes a \
-             routable bind safe in front of a model somebody pays for. To run it anyway, set \
-             {ALLOW_OPEN_PROXY_VAR}=1.",
+             satisfies it as easily as a funded one. No check this binary can perform makes this \
+             safe in front of a model somebody pays for. If the only way to this port is a forward \
+             you set up to one device — `adb reverse tcp:{port} tcp:{port}` for Android — \
+             acknowledge that by setting {ALLOW_OPEN_PROXY_VAR}=1.",
             port = addr.port()
         );
     }
