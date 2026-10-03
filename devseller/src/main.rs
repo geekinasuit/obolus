@@ -94,7 +94,12 @@ that takes real payment, run `obolus` instead.
 USAGE
     obolus-devseller [--help]
 
-There are no other arguments: this binary is configured entirely by environment variable.
+There are no other arguments: this binary is configured entirely by environment variable. A variable
+set but empty (or only whitespace) is refused at startup, never read as its default: unset it to take
+the default. A mode-specific variable is read, and so refused, only in its mode: a reason only
+where a reason is reported, OBOLUS_DEV_SETTLE_DELAY_SECS only under `timeout`.
+OBOLUS_DEV_ALLOW_OPEN_PROXY is the exception: anything but exactly 1, empty included, acknowledges
+nothing.
 
 WHERE IT LISTENS, AND WHAT IS BEHIND IT
     OBOLUS_ADDR                   bind address (default 127.0.0.1:8404 — see REFUSALS)
