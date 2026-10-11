@@ -28,7 +28,7 @@ jobs:
     name: x402 allowlist vs live source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `-f` fails the step on an HTTP error, `-S` surfaces the curl error, `-L` follows the docs
       # host's redirect to the rendered `.md`. A fetch failure fails the lane HERE, labelled as a

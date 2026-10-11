@@ -16,7 +16,7 @@ jobs:
     name: No working notes in the tree
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Content that cannot be a public issue — session handoffs and the like — is kept outside this
       # repository. .gitignore keeps it out by default; this job is what makes that load-bearing,
@@ -52,7 +52,7 @@ jobs:
     name: bazel test //...
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: bazel-contrib/setup-bazel@0.19.0
         with:
@@ -111,7 +111,7 @@ jobs:
     name: bazel test //... (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: bazel-contrib/setup-bazel@0.19.0
         with:
@@ -129,7 +129,7 @@ jobs:
     name: cargo test --workspace --locked
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The cargo half of the `eip3009` invariant the bazel job checks above, and the half that
       # matters more: cargo declares dependencies per package, so an `eip3009` entry in
