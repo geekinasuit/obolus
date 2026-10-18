@@ -69,6 +69,7 @@
 //! an x402 v2 client reads, and as the JSON body, for a person with curl. Both are the same object,
 //! and both are marked `Cache-Control: no-store`, since a challenge quotes a price for one request.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,10 +83,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::access::{bearer_token, TokenPath};
-use crate::backends::{Backend, Backends, RouteError};
+use crate::backends::{Backend, Backends, Kind, RouteError};
 use crate::facilitator::{Facilitator, FacilitatorError};
 use crate::pricing::{PriceContext, PriceDeterminer, StaticPrice};
-use crate::request::RequestShape;
+use crate::request::{MaxTokens, RequestShape};
 use crate::telemetry::{bounded_model, AccessPath, NoTelemetry, Offer, Outcome, Recorder, Telemetry, Trace};
 use crate::upstream::{Upstream, UpstreamResponse};
 use crate::arming::{legible, ArmedRequirements};
@@ -171,6 +172,14 @@ pub enum GatewayError {
 /// Solana payments expire with their blockhash, not the window. This bound does not model that.
 pub const SETTLE_RESERVE_SECS: u64 = 15;
 
+/// The most output tokens a paid request may ask for when no cap is configured (#31). Every paid
+/// request must carry a `max_tokens` no greater than the cap, so the most output any one price has
+/// to cover is bounded.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: NonZeroU64 = match NonZeroU64::new(4096) {
+    Some(cap) => cap,
+    None => panic!("the default output cap is not zero"),
+};
+
 /// A payment-gated route in front of a registry of upstream backends.
 ///
 /// It can advertise several ways to pay at once — one entry per `(scheme, network)`, e.g. Base and
@@ -194,6 +203,9 @@ pub struct Gateway<F: Facilitator> {
     /// Where each request's [`crate::telemetry::RequestEvent`] goes. Defaults to [`NoTelemetry`];
     /// [`Gateway::with_telemetry`] installs a sink.
     telemetry: Arc<dyn Telemetry>,
+    /// The largest `max_tokens` a paid request may carry. Defaults to
+    /// [`DEFAULT_MAX_OUTPUT_TOKENS`]; [`Gateway::with_max_output_tokens`] sets another.
+    max_output_tokens: NonZeroU64,
 }
 
 impl<F: Facilitator> Gateway<F> {
@@ -261,7 +273,20 @@ impl<F: Facilitator> Gateway<F> {
             requirements,
             price: Arc::new(StaticPrice),
             telemetry: Arc::new(NoTelemetry),
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
         })
+    }
+
+    /// Set the output cap: the largest `max_tokens` a paid request may carry. The token path is not
+    /// capped.
+    pub fn with_max_output_tokens(mut self, cap: NonZeroU64) -> Self {
+        self.max_output_tokens = cap;
+        self
+    }
+
+    /// The output cap this gateway enforces, for `main`'s banner.
+    pub fn max_output_tokens(&self) -> NonZeroU64 {
+        self.max_output_tokens
     }
 
     /// Install a telemetry sink in place of the default [`NoTelemetry`]. Every request that reaches
@@ -487,6 +512,60 @@ fn case_variant_refusal(key: &str, of: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// Why a paid request was refused by the output cap, as the message the client is told. `None`
+/// when the request bounds its output within `cap` and may go on to be priced.
+///
+/// Refused, never rewritten: the gateway does not inject or clamp a `max_tokens`, because the bytes
+/// forwarded upstream are always the client's own.
+///
+/// `max_completion_tokens` is judged per backend kind, by a match with no wildcard arm, so a new
+/// kind cannot compile without deciding what the field means to it.
+fn output_cap_refusal(request: &RequestShape, kind: Kind, cap: NonZeroU64) -> Option<String> {
+    if request.has_max_completion_tokens() {
+        match kind {
+            // Ollama 0.34.4 was measured to ignore the field, so `max_tokens` alone limits output.
+            Kind::Ollama => {}
+            // An OpenAI-compatible server may let it override `max_tokens` (vLLM does), so a small
+            // `max_tokens` beside a large one would get past the cap.
+            Kind::OpenaiCompat => {
+                return Some(format!(
+                    "max_completion_tokens is not accepted on a paid request to this model: its \
+                     backend may honour it in place of max_tokens. Limit output with max_tokens \
+                     alone, at most {cap}, and remove max_completion_tokens"
+                ))
+            }
+            // No upstream of this kind exists yet (`load_backends` refuses it), but a registry can
+            // still be built around one. The Messages API has no such field, so refuse rather than
+            // guess at what a server would do with it.
+            Kind::AnthropicCompat => {
+                return Some(format!(
+                    "max_completion_tokens is not accepted on a paid request to this model; limit \
+                     output with max_tokens alone, at most {cap}"
+                ))
+            }
+        }
+    }
+    match request.max_tokens() {
+        MaxTokens::Limit(n) if n <= cap.get() => None,
+        MaxTokens::Limit(n) => Some(format!(
+            "max_tokens is {n}, but a paid request may ask for at most {cap} output tokens; set \
+             max_tokens to {cap} or less"
+        )),
+        MaxTokens::Absent => Some(format!(
+            "max_tokens is required on a paid request: set it to the most output tokens you want, \
+             at most {cap}"
+        )),
+        MaxTokens::Invalid => Some(format!(
+            "max_tokens must be a non-negative integer, at most {cap}"
+        )),
+    }
+}
+
+/// A paid request refused by the output cap, as the client's 400. Nothing in it is client text.
+fn output_cap_response(message: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
 /// The paying path. Not an axum handler — [`completion`] is the route, and reaches this when the
 /// caller presented no token we honour.
 ///
@@ -690,6 +769,12 @@ impl<F: Facilitator> Access<F> {
     pub fn telemetry(&self) -> &str {
         self.gateway.telemetry()
     }
+
+    /// The output cap this instance will actually enforce, for the banner, read off the routed
+    /// gateway for the same reason as [`Access::token_path`].
+    pub fn max_output_tokens(&self) -> NonZeroU64 {
+        self.gateway.max_output_tokens()
+    }
 }
 
 /// Serve a caller we recognise; charge one we do not — and record what happened.
@@ -770,6 +855,11 @@ async fn serve<F: Facilitator>(
     // fault can never turn a free, honoured request into a 500. The determined prices are quoted in
     // the challenge and charged at settlement (see [`paid_completion`]).
     trace.access = Some(AccessPath::Payment);
+    // The output cap (#31), before the price, the challenge, or any facilitator call: a request
+    // whose output is unbounded is never quoted, so no price has to cover more than the cap.
+    if let Some(message) = output_cap_refusal(&request, backend.kind, access.gateway.max_output_tokens) {
+        return (output_cap_response(message), Outcome::OutputCapRefused);
+    }
     let priced = access.gateway.priced(&request, backend);
     paid_completion(access.gateway.clone(), upstream, priced, headers, body, arrival, trace).await
 }
@@ -794,7 +884,6 @@ mod tests {
     use crate::backends::Backend;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
     use crate::pricing::{CostPlus, FlatPrice, Promotional, StaticPrice};
-    use crate::request::MaxTokens;
     use crate::telemetry::{FakeTelemetry, RequestEvent};
     use std::sync::Mutex;
     use crate::upstream::{FakeUpstream, OllamaUpstream, UpstreamCalls};
@@ -1008,7 +1097,7 @@ mod tests {
         if let Some(header) = payment_header {
             builder = builder.header(x402::HEADER_PAYMENT_SIGNATURE, header);
         }
-        builder.body(Body::from(r#"{"model":"test","messages":[]}"#)).unwrap()
+        builder.body(Body::from(r#"{"model":"test","max_tokens":256,"messages":[]}"#)).unwrap()
     }
 
     /// A completion request carrying a bearer token and no payment.
@@ -1017,7 +1106,7 @@ mod tests {
             .method("POST")
             .uri("/v1/chat/completions")
             .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(Body::from(r#"{"model":"test","messages":[]}"#))
+            .body(Body::from(r#"{"model":"test","max_tokens":256,"messages":[]}"#))
             .unwrap()
     }
 
@@ -1953,7 +2042,7 @@ mod tests {
 
     /// A paid completion request naming `model`.
     fn paid_request_for_model(model: &str) -> Request<Body> {
-        let body = format!(r#"{{"model":{model:?},"messages":[]}}"#);
+        let body = format!(r#"{{"model":{model:?},"max_tokens":256,"messages":[]}}"#);
         Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -2010,19 +2099,22 @@ mod tests {
     async fn a_malformed_max_tokens_still_routes_by_its_model() {
         // Only `model` decides routing. A `max_tokens` the gateway cannot use must not be able to
         // fail the read `model` comes out of — were it to, this request would lose its model and be
-        // refused as naming none, a routing change made by a field routing never looks at.
-        let (app, _calls, a_calls, b_calls) = app_two_backends();
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header(x402::HEADER_PAYMENT_SIGNATURE, x402::encode_payment(&payment()))
-            .body(Body::from(r#"{"model":"mistral","max_tokens":"abc","messages":[]}"#))
-            .unwrap();
-        let (status, _headers, _body) = send(app, request).await;
+        // refused as naming none, a routing change made by a field routing never looks at. The
+        // output cap then refuses it, after routing, so the routed backend is read off the event.
+        let sink = FakeTelemetry::default();
+        let backends = Arc::new(Backends::from_parts(vec![
+            Backend::for_test("a", vec!["llama3"], None, Arc::new(FakeUpstream::streaming())),
+            Backend::for_test("b", vec!["mistral"], None, Arc::new(FakeUpstream::streaming())),
+        ]));
+        let gateway = Gateway::new(FakeFacilitator::accepting(), backends, resource(), armed(vec![requirements()]))
+            .unwrap()
+            .with_telemetry(Arc::new(sink.clone()));
+        let body = r#"{"model":"mistral","max_tokens":"abc","messages":[]}"#.to_string();
+        let (status, _, response) = send(router(Access::new(gateway, None)), post(body, true, None)).await;
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(b_calls.count(), 1, "the backend that lists mistral was reached");
-        assert_eq!(a_calls.count(), 0, "the backend that lists only llama3 was not");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response.contains("non-negative integer"), "refused for its max_tokens: {response}");
+        assert_eq!(sink.only().backend.as_deref(), Some("b"), "routed to the backend that lists mistral");
     }
 
     /// A determiner that quotes the armed amount, as [`StaticPrice`] does, and keeps the
@@ -2162,10 +2254,11 @@ mod tests {
             // Exact keys only.
             object(&[("model", r#""llama3""#), ("max_tokens", "5"), ("messages", "[]")]),
             // A capital I where `model` has an l: no reader folds that to `model`.
-            object(&[("model", r#""llama3""#), ("modeI", r#""mistral""#)]),
+            object(&[("model", r#""llama3""#), ("modeI", r#""mistral""#), ("max_tokens", "5")]),
             // Variants nested in `messages` and `options` are content, not fields of the request.
             object(&[
                 ("model", r#""llama3""#),
+                ("max_tokens", "5"),
                 ("messages", r#"[{"role":"user","content":"hi","MODEL":"mistral"}]"#),
                 ("options", r#"{"MAX_TOKENS":3,"Model":"mistral"}"#),
             ]),
@@ -2218,6 +2311,212 @@ mod tests {
         assert!(rendered.is_ascii(), "{rendered}");
         assert!(!rendered.chars().any(|c| c.is_control()), "{rendered}");
         assert!(rendered.contains("a\\nobolus: forged line\\u{202e}y"), "{rendered}");
+    }
+
+    // ---- the output cap (#31) ----
+
+    /// A gateway over one costed catch-all backend of `kind`, with the output cap set to `cap` when
+    /// one is given, the token path on when `verifier` is, and handles on the facilitator, the
+    /// upstream and the telemetry sink.
+    fn app_capped(
+        kind: Kind,
+        cap: Option<u64>,
+        verifier: Option<FakeTokenVerifier>,
+    ) -> (Router, FakeCalls, UpstreamCalls, FakeTelemetry) {
+        let facilitator = FakeFacilitator::accepting();
+        let calls = facilitator.calls();
+        let upstream = FakeUpstream::streaming();
+        let forwards = upstream.calls();
+        let sink = FakeTelemetry::default();
+        let backend = Backend::for_test("default", vec![], None, Arc::new(upstream))
+            .with_cost(TEST_COST)
+            .with_kind(kind);
+        let mut gateway = Gateway::new(
+            facilitator,
+            Arc::new(Backends::from_parts(vec![backend])),
+            resource(),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
+        .with_telemetry(Arc::new(sink.clone()));
+        if let Some(cap) = cap {
+            gateway = gateway.with_max_output_tokens(NonZeroU64::new(cap).unwrap());
+        }
+        let token = verifier.map(|verifier| TokenPath::new(Arc::new(verifier)));
+        (router(Access::new(gateway, token)), calls, forwards, sink)
+    }
+
+    /// Send a paid request with `body` to a gateway over a backend of `kind`, and check it was
+    /// refused as the client's 400 before payment: no facilitator call, no upstream call, nothing
+    /// quoted or charged, recorded as an output-cap refusal on the paying path. Returns the
+    /// refusal's `error`.
+    async fn refused_by_the_cap(kind: Kind, cap: Option<u64>, body: &str) -> String {
+        let (app, calls, forwards, sink) = app_capped(kind, cap, None);
+        let (status, _, response) = send(app, post(body.to_string(), true, None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        assert_eq!((calls.verifies(), calls.settles()), (0, 0), "no facilitator call for {body}");
+        assert_eq!(forwards.count(), 0, "the upstream was never called for {body}");
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::OutputCapRefused, "{body}");
+        assert_eq!(event.access, Some(AccessPath::Payment), "{body}");
+        assert_eq!(event.backend.as_deref(), Some("default"), "{body}");
+        assert!(event.offers.is_empty(), "nothing was quoted for {body}");
+        assert!(!event.upstream_invoked, "{body}");
+        assert_eq!((event.cost.as_deref(), event.revenue.as_deref()), (Some("0"), Some("0")), "{body}");
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        json["error"].as_str().unwrap().to_string()
+    }
+
+    /// Send a paid request with `body` and check it was served and settled once.
+    async fn served_under_the_cap(kind: Kind, cap: Option<u64>, body: &str) {
+        let (app, calls, forwards, sink) = app_capped(kind, cap, None);
+        let (status, _, response) = send(app, post(body.to_string(), true, None)).await;
+        assert_eq!(status, StatusCode::OK, "{body}: {response}");
+        assert_eq!(forwards.count(), 1, "{body}");
+        assert_eq!(calls.settles(), 1, "{body}");
+        assert_eq!(sink.only().outcome, Outcome::Settled, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_paid_request_without_max_tokens_is_refused_naming_the_cap() {
+        let error = refused_by_the_cap(Kind::Ollama, None, r#"{"model":"test","messages":[]}"#).await;
+        assert!(error.contains("max_tokens is required"), "{error}");
+        assert!(error.contains("4096"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_paid_request_with_an_unusable_max_tokens_is_refused_naming_the_cap() {
+        for value in [r#""256""#, "1.5", "-1", "null", "18446744073709551616"] {
+            let body = format!(r#"{{"model":"test","max_tokens":{value},"messages":[]}}"#);
+            let error = refused_by_the_cap(Kind::Ollama, None, &body).await;
+            assert!(error.contains("non-negative integer"), "{value}: {error}");
+            assert!(error.contains("4096"), "{value}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paid_request_over_the_cap_is_refused_naming_both_numbers() {
+        let body = r#"{"model":"test","max_tokens":4097,"messages":[]}"#;
+        let error = refused_by_the_cap(Kind::Ollama, None, body).await;
+        assert!(error.contains("max_tokens is 4097") && error.contains("at most 4096"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_paid_request_at_or_under_the_cap_is_served() {
+        for limit in [4096, 256, 0] {
+            let body = format!(r#"{{"model":"test","max_tokens":{limit},"messages":[]}}"#);
+            served_under_the_cap(Kind::Ollama, None, &body).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unpaid_request_under_the_cap_is_still_challenged() {
+        let (app, _, forwards, sink) = app_capped(Kind::Ollama, None, None);
+        let (status, _, _) = send(app, completion_request(None)).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(forwards.count(), 0);
+        assert_eq!(sink.only().outcome, Outcome::PaymentRequired);
+    }
+
+    #[tokio::test]
+    async fn an_unpaid_request_over_the_cap_is_refused_rather_than_quoted() {
+        // Refused before the challenge, so a client is never quoted a price for a request it could
+        // not then be served.
+        let (app, calls, forwards, sink) = app_capped(Kind::Ollama, None, None);
+        let body = r#"{"model":"test","max_tokens":5000,"messages":[]}"#.to_string();
+        let (status, headers, _) = send(app, post(body, false, None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(headers.get(x402::HEADER_PAYMENT_REQUIRED).is_none(), "no challenge");
+        assert_eq!((calls.verifies(), forwards.count()), (0, 0));
+        assert_eq!(sink.only().outcome, Outcome::OutputCapRefused);
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_is_ignored_on_an_ollama_backend() {
+        // Ollama 0.34.4 was measured to ignore the field, so `max_tokens` is what limits the output.
+        let body = r#"{"model":"test","max_tokens":256,"max_completion_tokens":100000,"messages":[]}"#;
+        served_under_the_cap(Kind::Ollama, None, body).await;
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_is_refused_on_an_openai_compat_backend() {
+        // An OpenAI-compatible server may let `max_completion_tokens` override `max_tokens`, so a
+        // small `max_tokens` beside a large one would get past the cap.
+        for body in [
+            r#"{"model":"test","max_tokens":10,"max_completion_tokens":100000,"messages":[]}"#,
+            r#"{"model":"test","max_completion_tokens":10,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":10,"max_completion_tokens":null,"messages":[]}"#,
+        ] {
+            let error = refused_by_the_cap(Kind::OpenaiCompat, None, body).await;
+            assert!(error.contains("max_completion_tokens"), "{body}: {error}");
+            assert!(error.contains("4096"), "{body}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn max_completion_tokens_is_refused_on_an_anthropic_compat_backend() {
+        // Boot refuses this kind, but a registry can be built around one; it fails closed.
+        let body = r#"{"model":"test","max_tokens":10,"max_completion_tokens":100000}"#;
+        let error = refused_by_the_cap(Kind::AnthropicCompat, None, body).await;
+        assert!(error.contains("max_completion_tokens"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_openai_compat_backend_is_capped_by_max_tokens_like_any_other() {
+        served_under_the_cap(Kind::OpenaiCompat, None, r#"{"model":"test","max_tokens":4096,"messages":[]}"#).await;
+        let error = refused_by_the_cap(Kind::OpenaiCompat, None, r#"{"model":"test","max_tokens":4097}"#).await;
+        assert!(error.contains("4097"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_token_path_is_not_capped() {
+        for body in [
+            r#"{"model":"test","messages":[]}"#,
+            r#"{"model":"test","max_tokens":100000,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":"abc","max_completion_tokens":100000}"#,
+        ] {
+            let (app, calls, forwards, sink) =
+                app_capped(Kind::OpenaiCompat, None, Some(FakeTokenVerifier::honouring(HONOURED)));
+            let (status, _, _) = send(app, post(body.to_string(), false, Some(HONOURED))).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(forwards.count(), 1, "{body}");
+            assert_eq!(calls.verifies() + calls.settles(), 0, "{body}");
+            assert_eq!(sink.only().outcome, Outcome::Served, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_without_max_tokens_meets_the_cap_on_the_paying_path() {
+        let (app, _, forwards, sink) =
+            app_capped(Kind::Ollama, None, Some(FakeTokenVerifier::honouring(HONOURED)));
+        let body = r#"{"model":"test","messages":[]}"#.to_string();
+        let (status, _, _) = send(app, post(body, false, Some("not-the-honoured-token"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(forwards.count(), 0);
+        assert_eq!(sink.only().outcome, Outcome::OutputCapRefused);
+    }
+
+    #[tokio::test]
+    async fn a_configured_cap_is_the_one_enforced() {
+        let error = refused_by_the_cap(Kind::Ollama, Some(8), r#"{"model":"test","max_tokens":9}"#).await;
+        assert!(error.contains("max_tokens is 9") && error.contains("at most 8"), "{error}");
+        served_under_the_cap(Kind::Ollama, Some(8), r#"{"model":"test","max_tokens":8}"#).await;
+        // A cap above the default lets through what the default would refuse.
+        served_under_the_cap(Kind::Ollama, Some(10_000), r#"{"model":"test","max_tokens":5000}"#).await;
+    }
+
+    #[test]
+    fn the_gateway_reports_the_cap_it_enforces() {
+        let gateway = Gateway::new(
+            FakeFacilitator::accepting(),
+            one_backend(FakeUpstream::streaming()),
+            resource(),
+            armed(vec![requirements()]),
+        )
+        .unwrap();
+        assert_eq!(gateway.max_output_tokens(), DEFAULT_MAX_OUTPUT_TOKENS);
+        let gateway = gateway.with_max_output_tokens(NonZeroU64::new(8).unwrap());
+        assert_eq!(gateway.max_output_tokens().get(), 8);
     }
 
     // ---- telemetry (#58) ----
@@ -2578,7 +2877,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let body = r#"{"model":"test","messages":[]}"#;
+        let body = r#"{"model":"test","max_tokens":256,"messages":[]}"#;
         let request = format!(
             "POST /v1/chat/completions HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
              {}: {}\r\ncontent-length: {}\r\n\r\n{body}",

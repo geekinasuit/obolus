@@ -80,11 +80,17 @@ Three properties are load-bearing:
   input, quickly and without blocking; the fallible cases fail *closed* (see below), never by
   unwrapping into the hot path.
 
-The determiner is called **once per advertised requirement**, on **every request except the token
-bypass** — the bypass returns before pricing is ever consulted, but an unpaid request that gets a
-402 is priced, because the challenge has to state the amount. It already receives the routed
+The determiner is called **once per advertised requirement**, on **every paying-path request that
+reaches the challenge** — the token bypass returns before pricing is ever consulted, and a request
+refused earlier (unroutable, an ambiguous key, or the output cap below) is never priced, but an
+unpaid request that gets a 402 is priced, because the challenge has to state the amount. It already receives the routed
 `backend` and the request's `model`, so per-backend and per-model policies have the context they
 need without any further plumbing.
+
+A request is priced only once it has passed the output cap (`OBOLUS_MAX_OUTPUT_TOKENS`): every
+request a determiner sees carries a `max_tokens` no greater than the cap, which bounds the
+worst-case output a quote must cover. Pricing by that bound is later work
+([#31](https://github.com/geekinasuit/obolus/issues/31)).
 
 ## Rate structures
 

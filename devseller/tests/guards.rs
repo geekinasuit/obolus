@@ -47,6 +47,7 @@ const OBOLUS_VARS: &[&str] = &[
     "OBOLUS_UPSTREAM_URL",
     "OBOLUS_RESOURCE",
     "OBOLUS_DESCRIPTION",
+    "OBOLUS_MAX_OUTPUT_TOKENS",
     "OBOLUS_ACCEPTS",
     "OBOLUS_NETWORK",
     "OBOLUS_PRICE",
@@ -413,6 +414,28 @@ fn a_testnet_configuration_gets_past_startup() {
     run.must_not_say(BEYOND_LOOPBACK);
 }
 
+/// The output cap is the gateway's, read through the same door: 4096 unset, the configured value
+/// when set, and a refusal for 0 or junk (#31).
+#[test]
+fn the_output_cap_is_read_as_obolus_reads_it() {
+    let default = run(&[]);
+    default.must_have_got_past_startup();
+    default.must_say("obolus-devseller: output cap 4096 tokens");
+
+    let configured = run(&[("OBOLUS_MAX_OUTPUT_TOKENS", "8")]);
+    configured.must_have_got_past_startup();
+    configured.must_say("obolus-devseller: output cap 8 tokens");
+
+    for (value, because) in [
+        ("0", "must be greater than 0"),
+        ("lots", "is not a positive whole number of tokens"),
+    ] {
+        let refused = run(&[("OBOLUS_MAX_OUTPUT_TOKENS", value)]);
+        refused.must_say(because);
+        refused.must_have_refused_during_startup();
+    }
+}
+
 /// A newline in an operator value the banner prints cannot start a banner line of its own (#16).
 ///
 /// Every run here fails `bind`, so a line reading `listening on` can only have come from a value.
@@ -694,6 +717,7 @@ const REFUSED_WHEN_EMPTY: &[(&str, &[(&str, &str)])] = &[
     ("OBOLUS_ADDR", &[]),
     ("OBOLUS_RESOURCE", &[]),
     ("OBOLUS_DESCRIPTION", &[]),
+    ("OBOLUS_MAX_OUTPUT_TOKENS", &[]),
     ("OBOLUS_ACCEPTS", &[]),
     ("OBOLUS_NETWORK", &[]),
     ("OBOLUS_PRICE", &[]),

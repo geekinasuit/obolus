@@ -110,6 +110,11 @@ pub enum Outcome {
     /// so it has no access path or backend and was never charged; kept apart from it because the
     /// request may well have named a model a backend serves.
     AmbiguousKey,
+    /// A paid request did not bound its output within the gateway's cap: it had no `max_tokens`,
+    /// one that is not a non-negative integer, one above the cap, or a `max_completion_tokens` its
+    /// backend might honour instead (#31). Refused with a 400 on the paying path, after routing and
+    /// before pricing, so it has a backend but no offers, and was never charged.
+    OutputCapRefused,
     /// A recognised caller was served on the token path.
     Served,
     /// No payment was presented; the client was challenged.
@@ -189,7 +194,8 @@ pub struct RequestEvent {
     pub backend: Option<String>,
     /// The model the request named, bounded by [`MAX_MODEL_BYTES`].
     pub model: Option<String>,
-    /// Every option this request was quoted, at its determined price. Empty off the payment path.
+    /// Every option this request was quoted, at its determined price. Empty off the payment path,
+    /// and on [`Outcome::OutputCapRefused`], which is refused before anything is quoted.
     pub offers: Vec<Offer>,
     /// The offer the client's payment matched, once one did.
     pub paid: Option<Offer>,
@@ -244,6 +250,7 @@ impl Trace {
             Outcome::Abandoned
             | Outcome::Unroutable
             | Outcome::AmbiguousKey
+            | Outcome::OutputCapRefused
             | Outcome::Served
             | Outcome::PaymentRequired
             | Outcome::PaymentMalformed

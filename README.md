@@ -106,6 +106,7 @@ Configuration is by environment variable:
 | `OBOLUS_PROMO_END` | unset | When the promotional window closes, **Unix seconds** (exclusive). Must be after `OBOLUS_PROMO_START` (an empty or inverted window is a startup error) and not already past at boot (an already-closed window would advertise a discount no client could get — a startup error). A window entirely in the future is fine: it discounts nothing until it opens. |
 | `OBOLUS_MAX_TIMEOUT_SECS` | `300` | **The payment window.** Advertised in the challenge as `maxTimeoutSeconds`, which the reference EVM client makes the lifetime of the authorization it signs. It bounds each paid request: the upstream must send its response head within this many seconds of the request's arrival, less 15 s kept back for settling, or the request fails with a `504` and nothing is charged. Without that bound a slow completion would be served and then fail to settle against an expired authorization. It is also the basis for the settle deadline (this value + a small margin bounds one `/settle` call, so the facilitator's own advertised budget is never undercut by our client timeout). The default matches the TypeScript reference server; the spec's examples use `60`, which leaves a non-streaming completion 45 s. Whole seconds, **must be more than 15**; validated at startup. Solana payments expire with their blockhash (about 60–90 s) whatever this says. |
 | `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS` | `600` | Deadline for the upstream to send a response **head**. Generous by design: for a non-streaming request Ollama withholds the head until generation completes, so for that shape this bounds *total generation time*, not connection setup. A hang-guard against a dead upstream, not a latency policy — set it well above the slowest legitimate completion. On the paying path the payment window above bounds the same wait, and whichever is shorter fires; a bearer-token request has only this one. Whole seconds, **must be > 0** (a 0-second deadline fires immediately and 502s every request); validated at startup. |
+| `OBOLUS_MAX_OUTPUT_TOKENS` | `4096` | **The output cap.** The largest `max_tokens` a paid request may carry. A paid request with no `max_tokens`, one that is not a non-negative integer, or one above this is refused with a `400` before it is quoted or charged; see [What a paid request must ask for](#what-a-paid-request-must-ask-for). Bearer-token requests are not capped. A positive whole number; `0`, junk, or set-but-empty is a startup error. The startup banner names the cap in force. |
 | `OBOLUS_NETWORK` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_PAY_TO` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_ASSET` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
@@ -119,8 +120,8 @@ Configuration is by environment variable:
 | `OBOLUS_TOKEN_AUDIENCE` | unset | The `aud` an honoured token must carry. Set it and `aud` is both **checked and required**. **Leave it unset and a token carrying *any* `aud` is refused** — which is most IdP-issued tokens, so this is the setting to reach for when a token that should work does not. Refusing is deliberate rather than an oversight: `aud` names the service a token was minted for, and a verifier with no expected audience cannot tell "minted for us" from "minted for the wiki". Set-but-empty is a startup error, and so is setting it without `OBOLUS_TOKEN_KEYS` or `OBOLUS_TOKEN_PUBKEY_FILE`. |
 | `OBOLUS_TELEMETRY` | `stdout` | **Where per-request telemetry goes.** Unset or `stdout` writes one JSON line per request to stdout, which carries nothing else (the banner and diagnostics go to stderr); `off` records nothing. Any other value is a startup error, so a typo cannot silently flip it. Every completion request writes a line, an unpaid 402 included, so the volume follows traffic you do not control: rotate or cap wherever stdout lands. The line format, and how to read revenue against cost from it, is in [`docs/telemetry.md`](docs/telemetry.md). |
 
-`OBOLUS_ADDR`, `OBOLUS_PRICE`, `OBOLUS_MAX_TIMEOUT_SECS`, and `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS` are
-validated at startup and abort a bad launch; `OBOLUS_FACILITATOR_URL` must be present and `http://`,
+`OBOLUS_ADDR`, `OBOLUS_PRICE`, `OBOLUS_MAX_TIMEOUT_SECS`, `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS`, and
+`OBOLUS_MAX_OUTPUT_TOKENS` are validated at startup and abort a bad launch; `OBOLUS_FACILITATOR_URL` must be present and `http://`,
 and `OBOLUS_UPSTREAM_URL` (which has a valid default) must also be `http://` if overridden — the
 upstream client speaks plain HTTP only, so an `https://` there fails fast rather than at request time.
 When `OBOLUS_BACKENDS_FILE` is set instead, each declared backend's `baseUrl` faces that same
@@ -391,6 +392,29 @@ can advertise a challenge but never move funds itself. (A startup guard that ref
 non-testnet network unless explicitly armed is a separate protection — see
 [Refusing to advertise an unproven network](#refusing-to-advertise-an-unproven-network).)
 
+## What a paid request must ask for
+
+**A paid request must set `max_tokens`, to at most the output cap.** This is a breaking change for
+clients: a paid request without `max_tokens` used to be served, and is now refused. The cap is
+`OBOLUS_MAX_OUTPUT_TOKENS`, 4096 by default. A request is priced at a flat rate per request, so
+without a bound on its output one payment could buy unbounded generation
+([#31](https://github.com/geekinasuit/obolus/issues/31)).
+
+After routing, and before the request is quoted, verified, or charged, a paid request is refused
+with a `400` when its `max_tokens` is missing, is not a non-negative integer, or is above the cap.
+Each refusal names the cap. The gateway never adds or lowers a `max_tokens` itself: the body
+forwarded upstream is always the client's own bytes.
+
+`max_completion_tokens` depends on the backend. Ollama 0.34.4 was measured to ignore it, so on an
+`ollama` backend it is ignored here too and `max_tokens` is what limits the output. An
+OpenAI-compatible server may let it override `max_tokens` (vLLM does), which would let a small
+`max_tokens` beside a large `max_completion_tokens` get past the cap. So a paid request to an
+`openai-compat` backend that carries `max_completion_tokens` at all is refused, and told to use
+`max_tokens` alone.
+
+The bearer-token path is not capped. A caller whose token is not honoured falls through to the
+paying path, and the cap applies there like any other paid request.
+
 ## When a paid request is charged
 
 x402 v2 defines the `authorization` flow, the only one Obolus runs, as verify → resource → settle →
@@ -444,6 +468,10 @@ Every way the token path can fail lands on the 402 challenge, never on the upstr
 | a token whose `aud` is not the one `OBOLUS_TOKEN_AUDIENCE` names, or is missing, or is not a string or array of strings | 402 challenge |
 | a token while the verifier itself cannot answer | 402 challenge |
 | a token this key verifies | proxies to the upstream, unpaid |
+
+Every row but the last continues on the paying path, so the request then also meets the output cap:
+one without a usable `max_tokens` within the cap gets a `400` there rather than the challenge. See
+[What a paid request must ask for](#what-a-paid-request-must-ask-for).
 
 That asymmetry is deliberate. Answering 402 to a legitimate token-holder costs them a retry;
 serving an unverified caller costs us the inference. So a verifier that is *broken* is treated
@@ -524,7 +552,8 @@ OBOLUS_NETWORK=eip155:84532 OBOLUS_ASSET=0x036CbD53842c5426634e7929541eC2318f3dC
 It listens on `127.0.0.1:8404` (not 8403, so it can run beside a real gateway), is configured by the
 same `OBOLUS_ACCEPTS` or single-chain variables as `obolus`, and serves a canned answer unless
 `OBOLUS_UPSTREAM_URL` names a real model. `cargo run -p obolus-devseller -- --help` (or `--help` on a
-released binary) lists every variable.
+released binary) lists every variable. It enforces the same output cap as `obolus`, set by the same
+`OBOLUS_MAX_OUTPUT_TOKENS`, so a client must send `max_tokens` here too.
 
 Failure comes from two independent knobs, because verification and settlement fail independently.
 Verification passing and settlement *then* failing is the case that decides whether a client
