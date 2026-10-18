@@ -481,12 +481,16 @@ pub enum PricingConfigError {
     /// assets have different decimals one rate would mean different prices.
     ///
     /// [`CostPlusMultiChain`]: PricingConfigError::CostPlusMultiChain
+    ///
+    /// Refused whatever the array's length: `OBOLUS_ACCEPTS` is the multi-chain configuration, and
+    /// a single chain is configured with the single-chain variables instead.
     #[error(
-        "OBOLUS_PRICING is \"token\" and OBOLUS_ACCEPTS is set. Token rates are in atomic units of \
-         a single asset, and the several networks OBOLUS_ACCEPTS advertises carry different assets \
-         and decimals, so one rate is ambiguous across them — multi-chain token pricing is not \
-         supported yet. Unset OBOLUS_ACCEPTS to price a single chain by token rates, or unset \
-         OBOLUS_PRICING to advertise each entry's own amount."
+        "OBOLUS_PRICING is \"token\" and OBOLUS_ACCEPTS is set. OBOLUS_ACCEPTS is the multi-chain \
+         configuration, and token pricing supports a single chain only: a token rate is in atomic \
+         units of one asset, so across networks whose assets have different decimals one rate \
+         would mean different prices. Configure the one chain with OBOLUS_NETWORK / OBOLUS_ASSET / \
+         OBOLUS_PAY_TO / OBOLUS_EXTRA instead of OBOLUS_ACCEPTS, or unset OBOLUS_PRICING to \
+         advertise each entry's own amount."
     )]
     TokenMultiChain,
 
@@ -1885,6 +1889,10 @@ mod tests {
         // OBOLUS_ACCEPTS advertises; and OBOLUS_PRICE would sit inert under rates.
         let multi = select_pricing(env(&[("OBOLUS_PRICING", "token"), ("OBOLUS_ACCEPTS", "[]")]));
         assert_eq!(multi, Err(PricingConfigError::TokenMultiChain));
+        // Refused on presence, so the message must hold for a one-entry array too.
+        let message = PricingConfigError::TokenMultiChain.to_string();
+        assert!(message.contains("OBOLUS_ACCEPTS is the multi-chain configuration"), "{message}");
+        assert!(!message.contains("several networks"), "{message}");
         let priced = select_pricing(env(&[("OBOLUS_PRICING", "token"), ("OBOLUS_PRICE", "1000")]));
         assert_eq!(priced, Err(PricingConfigError::TokenInertPrice));
     }

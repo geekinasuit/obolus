@@ -286,9 +286,16 @@ impl<F: Facilitator> Gateway<F> {
     /// [`crate::pricing::TokenPrice`] determiner (#31).
     ///
     /// A flag beside the determiner rather than something read off it, because a determiner may be
-    /// wrapped (by [`crate::pricing::Promotional`]) and the gateway cannot see through that. Out of
-    /// step, both ways fail closed: without the flag an unrated model is quoted the unpayable
-    /// `u128::MAX`; with it under another rate, an unrated model is refused.
+    /// wrapped (by [`crate::pricing::Promotional`]) and the gateway cannot see through that. `main`
+    /// sets both from one `match`; a library caller that sets only one gets this:
+    ///
+    /// - [`crate::pricing::TokenPrice`] without the flag: an unrated model is not refused, but is
+    ///   quoted an amount no client can pay — `u128::MAX`, or under a promotion that amount
+    ///   discounted, which is still unpayable. Nothing is served or settled.
+    /// - The flag under another determiner: an unrated model is refused with a 400, and a rated
+    ///   one is priced by that determiner. The event's `quote_input_tokens` and `quote_max_tokens`
+    ///   follow the flag, so they are still recorded, although that price was not computed from
+    ///   them.
     pub fn with_model_rates_required(mut self) -> Self {
         self.model_rates_required = true;
         self
@@ -611,8 +618,10 @@ fn unpriced_model_message(model: Option<&str>) -> String {
              priced; ask for a model this gateway prices",
             legible(&bounded_model(model.to_owned())),
         ),
-        None => "the request names no model, so token pricing has no rate to price it by; name a \
-                 model in the \"model\" field"
+        // `None` covers a body with no `model` and one whose `model` could not be read (given
+        // twice, or not a string); the remedy is the same, so the message does not say which.
+        None => "the request names no usable model, so token pricing has no rate to price it by; \
+                 send exactly one \"model\" field, as a string"
             .to_string(),
     }
 }
@@ -670,6 +679,16 @@ async fn paid_completion<F: Facilitator>(
     let Some(requirements) = accepted_for(&priced, &payment) else {
         let accepted = payment.accepted();
         let error = match repriced_for(&priced, &payment) {
+            // Under token pricing the usual cause is the client's own body: a retry whose bytes
+            // differ from the challenged request's is quoted anew. Say so, so a client that
+            // re-serialized its body knows what moved the price.
+            Some(current) if gateway.model_rates_required => format!(
+                "payment is for {} atomic units, but this request costs {} on {}: token pricing \
+                 quotes from the exact request body bytes, so a body that differs from the one \
+                 first challenged is priced anew; pay the amount this challenge quotes, and resend \
+                 this body unchanged",
+                accepted.amount, current.amount, current.network,
+            ),
             Some(current) => format!(
                 "payment is for {} atomic units, but this resource now costs {} on {}; pay the \
                  amount this challenge quotes",
@@ -3577,8 +3596,42 @@ mod tests {
         let padded = format!("{RATED_BODY}   ");
         let (status, _, body) = send(app, token_request(&padded, Some(RATED_QUOTE))).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
-        assert!(challenge_error(&body).unwrap().contains("now costs 15042"), "{body}");
+        let error = challenge_error(&body).unwrap();
+        assert!(error.contains("this request costs 15042"), "{error}");
+        assert!(error.contains("exact request body bytes"), "names the cause: {error}");
         assert_eq!(calls.verifies(), 0);
+    }
+
+    #[tokio::test]
+    async fn token_price_without_the_flag_quotes_an_unrated_model_unpayably() {
+        // The library-caller drift direction: TokenPrice installed, the allowlist flag not set.
+        // The unrated model is not refused, but its quote is one no client can pay.
+        let facilitator = FakeFacilitator::accepting();
+        let calls = facilitator.calls();
+        let upstream = FakeUpstream::streaming();
+        let forwards = upstream.calls();
+        let rate = crate::backends::TokenRate { input: 3_000_000, output: 15_000_000 };
+        let backend = Backend::for_test("rated", vec!["llama3", "unrated"], None, Arc::new(upstream))
+            .with_rates([("llama3".to_string(), rate)].into_iter().collect());
+        let gateway = Gateway::new(
+            facilitator,
+            Arc::new(Backends::from_parts(vec![backend])),
+            resource(),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
+        .with_price_determiner(Arc::new(TokenPrice));
+        let app = router(Access::new(gateway, None));
+        let body = r#"{"model":"unrated","max_tokens":10,"messages":[]}"#;
+        let (status, headers, response) = send(app.clone(), token_request(body, None)).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{response}");
+        let quoted = assert_challenge_headers(&headers, &response).accepts[0].amount.clone();
+        assert_eq!(quoted, u128::MAX.to_string());
+        // A payment for any payable amount matches no option, so nothing is verified, served or
+        // settled.
+        let (status, _, _) = send(app, token_request(body, Some(RATED_QUOTE))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!((calls.verifies(), calls.settles(), forwards.count()), (0, 0, 0));
     }
 
     /// Send a paid request with `body` to a token-priced gateway over `models`, and check it was
@@ -3613,9 +3666,16 @@ mod tests {
     #[tokio::test]
     async fn a_request_naming_no_model_is_refused_as_unpriced_on_a_catch_all() {
         // A catch-all serves a request that names no model, but no rate can apply to one.
-        let error =
-            refused_as_unpriced(vec![], r#"{"max_tokens":10,"messages":[]}"#).await;
-        assert!(error.contains("names no model"), "{error}");
+        // A repeated or non-string `model` reads as none too, and gets the same message.
+        for body in [
+            r#"{"max_tokens":10,"messages":[]}"#,
+            r#"{"model":"llama3","model":"llama3","max_tokens":10,"messages":[]}"#,
+            r#"{"model":5,"max_tokens":10,"messages":[]}"#,
+        ] {
+            let error = refused_as_unpriced(vec![], body).await;
+            assert!(error.contains("names no usable model"), "{body}: {error}");
+            assert!(error.contains("exactly one \"model\" field, as a string"), "{body}: {error}");
+        }
     }
 
     #[tokio::test]

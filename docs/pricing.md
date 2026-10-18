@@ -169,8 +169,8 @@ estimate and `max_tokens`, are recorded on each paid request's telemetry event (
 [telemetry](telemetry.md)).
 
 **A model with no rate is refused, not priced some other way.** Under token pricing, a paid request
-for a model its backend has no rate for, or one that names no model (which a catch-all backend
-would otherwise take), is answered `400` after the output cap and before it is quoted, verified or
+for a model its backend has no rate for, or one that names no usable model (none, a repeated
+`model`, or one that is not a string, which a catch-all backend would otherwise take), is answered `400` after the output cap and before it is quoted, verified or
 charged. There is no fallback to the flat amount. The bearer-token path is not priced, so it is
 unaffected.
 
@@ -178,7 +178,10 @@ unaffected.
 backend's rates and the boot configuration, so a retry carrying the identical body is quoted the
 amount its challenge was, and its payment matches. A client that re-serializes the body between
 the challenge and the retry (different whitespace or key order) may change its length, is quoted
-anew, and gets a re-challenge saying the resource now costs the new amount.
+anew, and gets a re-challenge quoting the new amount. Under token pricing that re-challenge's
+`error` says why: the request costs the new amount because token pricing quotes from the exact
+request body bytes, and the body should be resent unchanged. (Under the other rates the same
+re-challenge says the resource *now costs* the new amount, since there the price itself changed.)
 
 The arithmetic is checked: an overflow anywhere quotes `u128::MAX`, which no client can pay, the
 same fail-closed direction as `CostPlus`. So do the cases the gateway's checks make unreachable — a

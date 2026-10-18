@@ -293,7 +293,7 @@ revenue/cost telemetry — all still stateless. The subsystem currently growing 
 per-backend cost-plus, per-model token pricing, and a time-bounded promotional discount over either
 have landed (each backend declares its own cost or token rates, the margin stays gateway-wide, and
 a promotion is a percentage off during a window), on the seam and registry already described; a genuinely free rate and cross-asset
-(multi-chain) cost-plus are the remaining steps. See [`pricing.md`](pricing.md) for that design.
+(multi-chain) cost-plus and token pricing are the remaining steps. See [`pricing.md`](pricing.md) for that design.
 Telemetry records one event per request and writes it as a JSON line on stdout; OpenTelemetry,
 Kafka, and database transports are later work — see [`telemetry.md`](telemetry.md).
 
