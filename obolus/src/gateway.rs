@@ -518,34 +518,50 @@ fn case_variant_refusal(key: &str, of: &str) -> Response {
 /// Refused, never rewritten: the gateway does not inject or clamp a `max_tokens`, because the bytes
 /// forwarded upstream are always the client's own.
 ///
-/// `max_completion_tokens` is judged per backend kind, by a match with no wildcard arm, so a new
-/// kind cannot compile without deciding what the field means to it.
+/// What passes is bounded per backend kind: one completion of at most `cap` tokens. The fields
+/// that could lift output past `max_tokens` — `max_completion_tokens`, `n` and `best_of` — are
+/// judged by a match with no wildcard arm, so a new kind cannot compile without deciding what
+/// they mean to it.
 fn output_cap_refusal(request: &RequestShape, kind: Kind, cap: NonZeroU64) -> Option<String> {
-    if request.has_max_completion_tokens() {
-        match kind {
-            // Ollama 0.34.4 was measured to ignore the field, so `max_tokens` alone limits output.
-            Kind::Ollama => {}
-            // An OpenAI-compatible server may let it override `max_tokens` (vLLM does), so a small
-            // `max_tokens` beside a large one would get past the cap.
-            Kind::OpenaiCompat => {
-                return Some(format!(
-                    "max_completion_tokens is not accepted on a paid request to this model: its \
-                     backend may honour it in place of max_tokens. Limit output with max_tokens \
-                     alone, at most {cap}, and remove max_completion_tokens"
-                ))
-            }
-            // No upstream of this kind exists yet (`load_backends` refuses it), but a registry can
-            // still be built around one. The Messages API has no such field, so refuse rather than
-            // guess at what a server would do with it.
-            Kind::AnthropicCompat => {
-                return Some(format!(
-                    "max_completion_tokens is not accepted on a paid request to this model; limit \
-                     output with max_tokens alone, at most {cap}"
-                ))
+    // First, and whatever the kind: a read that stopped early never saw the rest of the body, and
+    // a lenient upstream reader may find a larger `max_tokens` there (#31).
+    if !request.read_in_full() {
+        return Some(format!(
+            "the request body could not be read in full as one JSON object, so its output limit \
+             cannot be checked; send valid JSON with max_tokens at most {cap}"
+        ));
+    }
+    let lifts = match kind {
+        // Ollama 0.34.4 was measured to ignore `max_completion_tokens`, and its
+        // `ChatCompletionRequest` has no `n` or `best_of`, so `max_tokens` alone limits output.
+        Kind::Ollama => None,
+        // An OpenAI-compatible server may let `max_completion_tokens` override `max_tokens` (vLLM
+        // does), and generates `n` completions (vLLM does) of up to `max_tokens` each, so any of
+        // these would get past the cap.
+        //
+        // No upstream of the anthropic-compat kind exists yet (`load_backends` refuses it), but a
+        // registry can still be built around one, so it fails closed the same way.
+        Kind::OpenaiCompat | Kind::AnthropicCompat => {
+            if request.has_max_completion_tokens() {
+                Some("max_completion_tokens is not accepted on a paid request to this model: its backend may honour it in place of max_tokens")
+            } else if request.has_n_other_than_one() {
+                Some("\"n\" must be absent or exactly 1 on a paid request to this model: its backend may generate that many completions")
+            } else if request.has_best_of() {
+                Some("best_of is not accepted on a paid request to this model: its backend may generate that many candidates")
+            } else {
+                None
             }
         }
+    };
+    if let Some(why) = lifts {
+        return Some(format!("{why}. Limit output with max_tokens alone, at most {cap}"));
     }
     match request.max_tokens() {
+        // Measured: Ollama 0.34.4 treats `max_tokens: 0` as no limit at all, so 0 bounds nothing.
+        MaxTokens::Limit(0) => Some(format!(
+            "max_tokens must be at least 1 on a paid request (some backends read 0 as no limit); \
+             set it to the most output tokens you want, at most {cap}"
+        )),
         MaxTokens::Limit(n) if n <= cap.get() => None,
         MaxTokens::Limit(n) => Some(format!(
             "max_tokens is {n}, but a paid request may ask for at most {cap} output tokens; set \
@@ -556,7 +572,7 @@ fn output_cap_refusal(request: &RequestShape, kind: Kind, cap: NonZeroU64) -> Op
              at most {cap}"
         )),
         MaxTokens::Invalid => Some(format!(
-            "max_tokens must be a non-negative integer, at most {cap}"
+            "max_tokens must be a positive integer, at most {cap}"
         )),
     }
 }
@@ -2113,7 +2129,7 @@ mod tests {
         let (status, _, response) = send(router(Access::new(gateway, None)), post(body, true, None)).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(response.contains("non-negative integer"), "refused for its max_tokens: {response}");
+        assert!(response.contains("positive integer"), "refused for its max_tokens: {response}");
         assert_eq!(sink.only().backend.as_deref(), Some("b"), "routed to the backend that lists mistral");
     }
 
@@ -2389,7 +2405,7 @@ mod tests {
         for value in [r#""256""#, "1.5", "-1", "null", "18446744073709551616"] {
             let body = format!(r#"{{"model":"test","max_tokens":{value},"messages":[]}}"#);
             let error = refused_by_the_cap(Kind::Ollama, None, &body).await;
-            assert!(error.contains("non-negative integer"), "{value}: {error}");
+            assert!(error.contains("positive integer"), "{value}: {error}");
             assert!(error.contains("4096"), "{value}: {error}");
         }
     }
@@ -2403,9 +2419,106 @@ mod tests {
 
     #[tokio::test]
     async fn a_paid_request_at_or_under_the_cap_is_served() {
-        for limit in [4096, 256, 0] {
+        for limit in [4096, 256, 1] {
             let body = format!(r#"{{"model":"test","max_tokens":{limit},"messages":[]}}"#);
             served_under_the_cap(Kind::Ollama, None, &body).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paid_request_asking_for_zero_output_tokens_is_refused() {
+        // Measured: Ollama 0.34.4 treats `max_tokens: 0` as no limit at all.
+        for kind in [Kind::Ollama, Kind::OpenaiCompat] {
+            let error = refused_by_the_cap(kind, None, r#"{"model":"test","max_tokens":0,"messages":[]}"#).await;
+            assert!(error.contains("at least 1"), "{kind}: {error}");
+        }
+    }
+
+    /// Bodies whose top-level read stops early: after a small `max_tokens`, a top-level key
+    /// `serde_json` cannot decode (a lone surrogate escape) hides whatever follows it, which a
+    /// lenient upstream reader still sees. Then a truncated body, and one with trailing bytes.
+    fn unreadable_bodies() -> Vec<String> {
+        let lone = escape("d800");
+        let hidden = |after: &str| {
+            format!(r#"{{"model":"test","max_tokens":10,"{lone}":1,{after},"messages":[]}}"#)
+        };
+        vec![
+            hidden(r#""max_tokens":100000"#),
+            hidden(r#""MAX_TOKENS":100000"#),
+            hidden(r#""max_completion_tokens":100000"#),
+            r#"{"model":"test","max_tokens":10,"messages":["#.to_string(),
+            r#"{"model":"test","max_tokens":10,"messages":[]} {"max_tokens":100000}"#.to_string(),
+        ]
+    }
+
+    #[test]
+    fn the_unreadable_bodies_really_carry_a_lone_surrogate_escape() {
+        let body = &unreadable_bodies()[0];
+        assert!(body.contains(&format!("{}ud800", '\\')), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_paid_body_that_cannot_be_read_to_its_end_is_refused() {
+        for body in unreadable_bodies() {
+            for kind in [Kind::Ollama, Kind::OpenaiCompat] {
+                let error = refused_by_the_cap(kind, None, &body).await;
+                assert!(error.contains("could not be read in full"), "{kind} {body}: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_token_path_still_forwards_a_body_that_cannot_be_read_to_its_end() {
+        for body in unreadable_bodies() {
+            let (app, _, forwards, sink) =
+                app_capped(Kind::Ollama, None, Some(FakeTokenVerifier::honouring(HONOURED)));
+            let (status, _, _) = send(app, post(body.clone(), false, Some(HONOURED))).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(forwards.count(), 1, "{body}");
+            assert_eq!(sink.only().outcome, Outcome::Served, "{body}");
+        }
+    }
+
+    /// `n` and `best_of` values that would ask an OpenAI-compatible server for more than one
+    /// completion, or that it cannot be shown not to.
+    fn several_choice_bodies() -> Vec<&'static str> {
+        vec![
+            r#"{"model":"test","max_tokens":4096,"n":16,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":4096,"n":"2","messages":[]}"#,
+            r#"{"model":"test","max_tokens":4096,"n":null,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":4096,"n":0,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":4096,"n":1,"n":16,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":4096,"N":16,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":4096,"best_of":4,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":4096,"best_of":1,"messages":[]}"#,
+            r#"{"model":"test","max_tokens":4096,"Best_Of":4,"messages":[]}"#,
+        ]
+    }
+
+    #[tokio::test]
+    async fn n_and_best_of_are_refused_on_an_openai_compat_backend() {
+        // vLLM generates `n` completions of up to `max_tokens` each, so `n: 16` would buy sixteen
+        // times what the cap bounds.
+        for kind in [Kind::OpenaiCompat, Kind::AnthropicCompat] {
+            for body in several_choice_bodies() {
+                let error = refused_by_the_cap(kind, None, body).await;
+                assert!(error.contains("\"n\"") || error.contains("best_of"), "{kind} {body}: {error}");
+                assert!(error.contains("4096"), "{kind} {body}: {error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn n_of_one_is_served_on_an_openai_compat_backend() {
+        served_under_the_cap(Kind::OpenaiCompat, None, r#"{"model":"test","max_tokens":4096,"n":1,"messages":[]}"#)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn n_and_best_of_are_ignored_on_an_ollama_backend() {
+        // Ollama 0.34.4's `ChatCompletionRequest` has neither field, so it drops both.
+        for body in several_choice_bodies() {
+            served_under_the_cap(Kind::Ollama, None, body).await;
         }
     }
 

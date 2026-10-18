@@ -108,7 +108,8 @@ WHERE IT LISTENS, AND WHAT IS BEHIND IT
     OBOLUS_DESCRIPTION            human description in the challenge
     OBOLUS_MAX_OUTPUT_TOKENS      the largest max_tokens a paid request may carry (default 4096),
                                   as `obolus` enforces it: a paid request with no max_tokens, an
-                                  unusable one, or one above this is refused with a 400
+                                  unusable one, 0, or one above this is refused with a 400, as is
+                                  a body that cannot be read in full
 
 WHAT IT CHARGES — two mutually exclusive doors, the same ones `obolus` offers
     OBOLUS_ACCEPTS                JSON array of payment options; supersedes the five below, and

@@ -84,7 +84,7 @@ flowchart TB
   tfwd -->|"error"| t_unavail["upstream_unavailable"]
   tfwd -->|"non-2xx"| t_refused["upstream_refused"]
   tfwd -->|"2xx"| served["served"]
-  token -->|"no"| cap{"max_tokens set, and<br/>within the output cap?"}
+  token -->|"no"| cap{"body read in full,<br/>output bounded within<br/>the output cap?"}
   cap -->|"no"| capped["output_cap_refused"]
   cap --> hdr{"PAYMENT-SIGNATURE<br/>present?"}
   hdr -->|"no"| required["payment_required"]
@@ -114,9 +114,10 @@ used a key readers disagree on, not that it asked for a model nobody serves
 ([#122](https://github.com/geekinasuit/obolus/issues/122)). The refused key is not recorded.
 
 `output_cap_refused` is a paid request that does not bound its output within the gateway's cap
-(`OBOLUS_MAX_OUTPUT_TOKENS`): it has no `max_tokens`, one that is not a non-negative integer, one
-above the cap, or, on an `openai-compat` backend, a `max_completion_tokens` the backend might honour
-instead ([#31](https://github.com/geekinasuit/obolus/issues/31)). It is refused with a `400` on the
+(`OBOLUS_MAX_OUTPUT_TOKENS`): its body could not be read in full, it has no `max_tokens`, one that
+is not a positive integer, or one above the cap, or, on an `openai-compat` backend, it carries
+`max_completion_tokens`, `best_of`, or an `n` other than 1, which the backend might honour to
+generate more ([#31](https://github.com/geekinasuit/obolus/issues/31)). It is refused with a `400` on the
 paying path, after routing and before pricing, so it has `access: "payment"` and a backend but no
 offers, and is never charged. A bearer-token request is not capped and never ends here.
 

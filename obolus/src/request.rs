@@ -1,7 +1,7 @@
 //! What the gateway reads out of a completion request body.
 //!
 //! The body is read in one pass into a [`RequestShape`] — a second read of `model` and of the
-//! top-level keys happens only when a `max_tokens` value cannot be decoded (see
+//! top-level keys happens only when a `max_tokens` or `n` value cannot be decoded (see
 //! [`RequestShape::parse`]) — and is only
 //! ever *read*: the bytes forwarded upstream are always the client's originals, never a
 //! re-serialization of this.
@@ -24,6 +24,9 @@ pub struct RequestShape {
     max_tokens: MaxTokens,
     max_completion_tokens: bool,
     case_variant: Option<CaseVariant>,
+    n_other_than_one: bool,
+    best_of: bool,
+    read_in_full: bool,
 }
 
 /// A top-level key that folds to `model` or `max_tokens` without being exactly that key:
@@ -101,27 +104,65 @@ impl RequestShape {
     /// `null` model, a `model` key given twice, a body that is not an object, trailing bytes, and a
     /// leading byte-order mark all read as no model, as routing always has — and skips every other
     /// value with the same tolerant skip, so no other field can fail the read. A wrong-typed or
-    /// repeated `model` reads as no model without ending the pass. `max_tokens` is judged as it is
-    /// read, and `max_completion_tokens` is only noted as present.
+    /// repeated `model` reads as no model without ending the pass. `max_tokens` and `n` are judged
+    /// as they are read, and `max_completion_tokens` and `best_of` are only noted as present.
     ///
-    /// The one place the pass reads more strictly than a skip is the `max_tokens` value itself: a
+    /// The places the pass reads more strictly than a skip are the `max_tokens` and `n` values: a
     /// string there is decoded, so an invalid UTF-8 byte or a lone surrogate inside it, or a number
     /// too large for an `f64`, fails the pass where a skip would not. That case reads as
-    /// [`MaxTokens::Invalid`], and `model` is then read again on its own, so that a broken
-    /// `max_tokens` still cannot change routing.
+    /// [`MaxTokens::Invalid`] (or as an `n` other than one), and `model` is then read again on its
+    /// own, so that a broken value still cannot change routing.
+    ///
+    /// Whether the pass reached the end of the body without error is kept as
+    /// [`RequestShape::read_in_full`].
     pub fn parse(body: &[u8]) -> Self {
         let mut scan = Scan::default();
         let mut reader = serde_json::Deserializer::from_slice(body);
         let read = TopLevel(&mut scan).deserialize(&mut reader).and_then(|()| reader.end());
+        let read_in_full = read.is_ok();
         let (model, case_variant) = match read {
             Ok(()) => (scan.model, scan.case_variant),
-            Err(_) if scan.in_max_tokens => {
+            Err(_) if scan.in_judged_value => {
                 (model_only(body), scan.case_variant.or_else(|| first_case_variant(body)))
             }
             Err(_) => (None, scan.case_variant),
         };
         let max_tokens = if scan.max_tokens_variant { MaxTokens::Invalid } else { scan.max_tokens };
-        Self { model, max_tokens, max_completion_tokens: scan.max_completion_tokens, case_variant }
+        let n_other_than_one =
+            scan.n_variant || scan.n.is_some_and(|n| n != MaxTokens::Limit(1));
+        Self {
+            model,
+            max_tokens,
+            max_completion_tokens: scan.max_completion_tokens,
+            case_variant,
+            n_other_than_one,
+            best_of: scan.best_of,
+            read_in_full,
+        }
+    }
+
+    /// Whether the top-level value was read through to its end without error, trailing bytes
+    /// included. When it was not, what follows the point the read stopped at was never seen here,
+    /// while a more lenient upstream reader (Go's `encoding/json`, behind Ollama, substitutes
+    /// U+FFFD for an undecodable key and carries on) may still read a `max_tokens` there. So
+    /// nothing this shape says about limits can be vouched for, and a paid request is refused
+    /// (#31). Routing is unaffected: `model` reads as it always has.
+    pub fn read_in_full(&self) -> bool {
+        self.read_in_full
+    }
+
+    /// Whether the body has a top-level `n` that is anything other than exactly the integer `1`,
+    /// or a key that folds to `n` without being it (`N`). An OpenAI-compatible server may
+    /// generate `n` completions, each up to `max_tokens`, so only `n` absent or `1` keeps the
+    /// output within `max_tokens`. An exact `n` given more than once takes its last value.
+    pub fn has_n_other_than_one(&self) -> bool {
+        self.n_other_than_one
+    }
+
+    /// Whether the body has a top-level `best_of`, or a key that folds to it, whatever its value.
+    /// A server that honours it generates that many candidates.
+    pub fn has_best_of(&self) -> bool {
+        self.best_of
     }
 
     /// The `model` the request names, or `None` when it named none — including when the body is not
@@ -136,8 +177,8 @@ impl RequestShape {
         self.max_tokens
     }
 
-    /// Whether the body has a top-level `max_completion_tokens` key at all. Only presence is
-    /// recorded, never the value. Whether the field limits output depends on the backend: Ollama
+    /// Whether the body has a top-level `max_completion_tokens` key at all, or a key that folds to
+    /// it without being it. Only presence is recorded, never the value. Whether the field limits output depends on the backend: Ollama
     /// 0.34.4 was measured to ignore it, while an OpenAI-compatible server may honour it. What to
     /// do about a request limited only through it is the caller's decision, per backend kind.
     pub fn has_max_completion_tokens(&self) -> bool {
@@ -162,7 +203,7 @@ impl RequestShape {
 }
 
 /// The first top-level key that folds to `model` or `max_tokens` without being it, read by a pass
-/// that skips every value. The fallback for a pass that failed inside a `max_tokens` value, whose
+/// that skips every value. The fallback for a pass that failed inside a `max_tokens` or `n` value, whose
 /// keys after that point it never saw.
 fn first_case_variant(body: &[u8]) -> Option<CaseVariant> {
     /// Writes what it finds into the slot rather than returning it, so that the find survives the
@@ -195,7 +236,7 @@ fn first_case_variant(body: &[u8]) -> Option<CaseVariant> {
 }
 
 /// `model` read on its own, as a struct holding only `model` reads it. The fallback for a pass that
-/// failed inside a `max_tokens` value (see [`RequestShape::parse`]): there, only this read can say
+/// failed inside a `max_tokens` or `n` value (see [`RequestShape::parse`]): there, only this read can say
 /// what `model` would have been.
 fn model_only(body: &[u8]) -> Option<String> {
     #[derive(Deserialize)]
@@ -212,9 +253,15 @@ struct Scan {
     model: Option<String>,
     max_tokens: MaxTokens,
     max_completion_tokens: bool,
-    /// Set while a `max_tokens` value is being read, and cleared once it has been: still set after
-    /// an error means the error was inside that value.
-    in_max_tokens: bool,
+    /// The last exact `n` value, judged as `max_tokens` is; `None` when there is none.
+    n: Option<MaxTokens>,
+    /// Set once a key that folds to `n` without being it has been seen.
+    n_variant: bool,
+    /// Set once a `best_of` key, or one that folds to it, has been seen.
+    best_of: bool,
+    /// Set while a `max_tokens` or `n` value is being read, and cleared once it has been: still
+    /// set after an error means the error was inside that value.
+    in_judged_value: bool,
     /// Set once a key that folds to `max_tokens` without being it has been seen. It makes the
     /// result [`MaxTokens::Invalid`] whatever else the body holds, because readers disagree on
     /// such a key: a case-insensitive one may take its limit from it, an exact one ignores it.
@@ -229,7 +276,10 @@ impl Default for Scan {
             model: None,
             max_tokens: MaxTokens::Absent,
             max_completion_tokens: false,
-            in_max_tokens: false,
+            n: None,
+            n_variant: false,
+            best_of: false,
+            in_judged_value: false,
             max_tokens_variant: false,
             case_variant: None,
         }
@@ -248,8 +298,14 @@ enum Key {
     /// by such a key, one that matches exactly will not, so what the request asks for depends on
     /// who reads it.
     Variant(CaseVariant),
-    /// Exactly `max_completion_tokens`.
+    /// `max_completion_tokens`, or a key that folds to it.
     MaxCompletionTokens,
+    /// Exactly `n`.
+    N,
+    /// A key that folds to `n` without being it: `N`.
+    NVariant,
+    /// `best_of`, or a key that folds to it.
+    BestOf,
     Other,
 }
 
@@ -273,8 +329,14 @@ impl<'de> Visitor<'de> for KeyVisitor {
             "model" => Key::Model,
             "max_tokens" => Key::MaxTokens,
             "max_completion_tokens" => Key::MaxCompletionTokens,
+            "n" => Key::N,
             _ => match ["model", "max_tokens"].into_iter().find(|target| folds_to(key, target)) {
                 Some(of) => Key::Variant(CaseVariant { key: key.to_owned(), of }),
+                // The fields that can lift output past `max_tokens` on some server are matched
+                // case-insensitively too, so a reader that folds keys cannot find one this missed.
+                None if folds_to(key, "max_completion_tokens") => Key::MaxCompletionTokens,
+                None if folds_to(key, "n") => Key::NVariant,
+                None if folds_to(key, "best_of") => Key::BestOf,
                 None => Key::Other,
             },
         })
@@ -350,9 +412,24 @@ impl<'de> Visitor<'de> for TopLevel<'_> {
                     // Recorded before the value is read, so a value that fails to read still
                     // leaves the key counted.
                     self.0.max_tokens = MaxTokens::Invalid;
-                    self.0.in_max_tokens = true;
+                    self.0.in_judged_value = true;
                     self.0.max_tokens = map.next_value::<Judged>()?.0;
-                    self.0.in_max_tokens = false;
+                    self.0.in_judged_value = false;
+                }
+                Key::N => {
+                    // As for `max_tokens`: a value that fails to read still counts as not `1`.
+                    self.0.n = Some(MaxTokens::Invalid);
+                    self.0.in_judged_value = true;
+                    self.0.n = Some(map.next_value::<Judged>()?.0);
+                    self.0.in_judged_value = false;
+                }
+                Key::NVariant => {
+                    self.0.n_variant = true;
+                    map.next_value::<IgnoredAny>()?;
+                }
+                Key::BestOf => {
+                    self.0.best_of = true;
+                    map.next_value::<IgnoredAny>()?;
                 }
                 Key::Variant(variant) => {
                     // Sticky, whatever order the keys come in: see `Scan::max_tokens_variant`.
@@ -837,6 +914,58 @@ mod tests {
         assert_eq!(escape("005f").as_bytes(), &[b'\\', b'u', b'0', b'0', b'5', b'f']);
         let body = object(&[(&["max", &escape("005f"), "tokens"].concat(), "7")]);
         assert!(!String::from_utf8(body).unwrap().contains("max_tokens"));
+    }
+
+    /// `(body, read in full, n other than one, best_of present)`.
+    fn output_field_cases() -> Vec<(Vec<u8>, bool, bool, bool)> {
+        let lone = escape("d800");
+        let s = |text: &str| text.as_bytes().to_vec();
+        vec![
+            (s(r#"{"model":"m","max_tokens":5}"#), true, false, false),
+            (s(r#"{"model":"m","n":1}"#), true, false, false),
+            (s(r#"{"model":"m","n":2}"#), true, true, false),
+            (s(r#"{"model":"m","n":0}"#), true, true, false),
+            (s(r#"{"model":"m","n":"1"}"#), true, true, false),
+            (s(r#"{"model":"m","n":null}"#), true, true, false),
+            (s(r#"{"model":"m","n":1.0}"#), true, true, false),
+            (s(r#"{"model":"m","n":2,"n":1}"#), true, false, false),
+            (s(r#"{"model":"m","n":1,"n":2}"#), true, true, false),
+            (s(r#"{"model":"m","N":1}"#), true, true, false),
+            (s(r#"{"model":"m","best_of":1}"#), true, false, true),
+            (s(r#"{"model":"m","BEST_OF":3}"#), true, false, true),
+            // Nested fields are content, not fields of the request.
+            (s(r#"{"model":"m","options":{"n":4,"best_of":2}}"#), true, false, false),
+            // A read that stops early: an undecodable key, a truncated body, trailing bytes, a
+            // leading byte-order mark, a body that is not JSON at all.
+            (object(&[("model", r#""m""#), ("max_tokens", "5"), (&lone, "1"), ("max_tokens", "9")]), false, false, false),
+            (s(r#"{"model":"m","max_tokens":5"#), false, false, false),
+            (s(r#"{"model":"m"} x"#), false, false, false),
+            (bytes(&[b"\xef\xbb\xbf", br#"{"model":"m"}"#]), false, false, false),
+            (s("not json"), false, false, false),
+            // A broken `n` value fails the strict read: not in full, and not one.
+            (object(&[("model", r#""m""#), ("n", &format!("\"{lone}\""))]), false, true, false),
+            // A lone surrogate inside a skipped value does not stop the read.
+            (object(&[("model", r#""m""#), ("messages", &format!(r#"[{{"content":"{lone}"}}]"#))]), true, false, false),
+        ]
+    }
+
+    #[test]
+    fn reads_the_fields_that_can_lift_output_past_max_tokens() {
+        for (body, in_full, n, best_of) in output_field_cases() {
+            let shown = String::from_utf8_lossy(&body);
+            let shape = RequestShape::parse(&body);
+            assert_eq!(shape.read_in_full(), in_full, "read in full: {shown}");
+            assert_eq!(shape.has_n_other_than_one(), n, "n other than one: {shown}");
+            assert_eq!(shape.has_best_of(), best_of, "best_of: {shown}");
+            // None of it may change routing.
+            assert_eq!(shape.model(), old_model_read(&body).as_deref(), "model of {shown}");
+        }
+    }
+
+    #[test]
+    fn a_folded_max_completion_tokens_counts_as_present() {
+        let shape = RequestShape::parse(br#"{"model":"m","Max_Completion_Tokens":9}"#);
+        assert!(shape.has_max_completion_tokens());
     }
 
     #[test]

@@ -106,7 +106,7 @@ Configuration is by environment variable:
 | `OBOLUS_PROMO_END` | unset | When the promotional window closes, **Unix seconds** (exclusive). Must be after `OBOLUS_PROMO_START` (an empty or inverted window is a startup error) and not already past at boot (an already-closed window would advertise a discount no client could get — a startup error). A window entirely in the future is fine: it discounts nothing until it opens. |
 | `OBOLUS_MAX_TIMEOUT_SECS` | `300` | **The payment window.** Advertised in the challenge as `maxTimeoutSeconds`, which the reference EVM client makes the lifetime of the authorization it signs. It bounds each paid request: the upstream must send its response head within this many seconds of the request's arrival, less 15 s kept back for settling, or the request fails with a `504` and nothing is charged. Without that bound a slow completion would be served and then fail to settle against an expired authorization. It is also the basis for the settle deadline (this value + a small margin bounds one `/settle` call, so the facilitator's own advertised budget is never undercut by our client timeout). The default matches the TypeScript reference server; the spec's examples use `60`, which leaves a non-streaming completion 45 s. Whole seconds, **must be more than 15**; validated at startup. Solana payments expire with their blockhash (about 60–90 s) whatever this says. |
 | `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS` | `600` | Deadline for the upstream to send a response **head**. Generous by design: for a non-streaming request Ollama withholds the head until generation completes, so for that shape this bounds *total generation time*, not connection setup. A hang-guard against a dead upstream, not a latency policy — set it well above the slowest legitimate completion. On the paying path the payment window above bounds the same wait, and whichever is shorter fires; a bearer-token request has only this one. Whole seconds, **must be > 0** (a 0-second deadline fires immediately and 502s every request); validated at startup. |
-| `OBOLUS_MAX_OUTPUT_TOKENS` | `4096` | **The output cap.** The largest `max_tokens` a paid request may carry. A paid request with no `max_tokens`, one that is not a non-negative integer, or one above this is refused with a `400` before it is quoted or charged; see [What a paid request must ask for](#what-a-paid-request-must-ask-for). Bearer-token requests are not capped. A positive whole number; `0`, junk, or set-but-empty is a startup error. The startup banner names the cap in force. |
+| `OBOLUS_MAX_OUTPUT_TOKENS` | `4096` | **The output cap.** The largest `max_tokens` a paid request may carry. A paid request with no `max_tokens`, one that is not a positive integer (`0` included), or one above this is refused with a `400` before it is quoted or charged, as is one whose body cannot be read in full, and, on an `openai-compat` backend, one carrying `max_completion_tokens`, `best_of`, or an `n` other than `1`; see [What a paid request must ask for](#what-a-paid-request-must-ask-for). Bearer-token requests are not capped. A positive whole number; `0`, junk, or set-but-empty is a startup error. The startup banner names the cap in force. |
 | `OBOLUS_NETWORK` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_PAY_TO` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
 | `OBOLUS_ASSET` | placeholder | Obviously-fake by default; override for a real (testnet) network. |
@@ -401,16 +401,30 @@ without a bound on its output one payment could buy unbounded generation
 ([#31](https://github.com/geekinasuit/obolus/issues/31)).
 
 After routing, and before the request is quoted, verified, or charged, a paid request is refused
-with a `400` when its `max_tokens` is missing, is not a non-negative integer, or is above the cap.
+with a `400` when:
+
+- its body cannot be read in full as one JSON object: truncated, followed by trailing bytes, or
+  holding a top-level key the gateway cannot decode. What follows the point the read stopped at is
+  unseen here, while a more lenient upstream reader (Ollama's) may find a larger `max_tokens` there;
+- its `max_tokens` is missing, is not a positive integer, or is above the cap. `0` is refused too:
+  Ollama 0.34.4 was measured to treat `max_tokens: 0` as no limit at all;
+- on an `openai-compat` backend, it carries a field that could lift output past `max_tokens` (see
+  below).
+
 Each refusal names the cap. The gateway never adds or lowers a `max_tokens` itself: the body
 forwarded upstream is always the client's own bytes.
 
-`max_completion_tokens` depends on the backend. Ollama 0.34.4 was measured to ignore it, so on an
-`ollama` backend it is ignored here too and `max_tokens` is what limits the output. An
-OpenAI-compatible server may let it override `max_tokens` (vLLM does), which would let a small
-`max_tokens` beside a large `max_completion_tokens` get past the cap. So a paid request to an
-`openai-compat` backend that carries `max_completion_tokens` at all is refused, and told to use
-`max_tokens` alone.
+What may lift output past `max_tokens` depends on the backend, so the rule is per kind. What passes
+is, on either kind, one completion of at most the cap:
+
+| Field | `ollama` | `openai-compat` |
+|---|---|---|
+| `max_completion_tokens` | ignored: Ollama 0.34.4 was measured to ignore it | refused: a server may let it override `max_tokens` (vLLM does) |
+| `n` | ignored: Ollama 0.34.4's request type has no such field | refused unless absent or exactly `1`: a server may generate `n` completions of up to `max_tokens` each (vLLM does) |
+| `best_of` | ignored, likewise | refused whenever present |
+
+These keys are matched however they are capitalised (`N`, `Best_Of`), since a case-insensitive
+reader would take them all the same.
 
 The bearer-token path is not capped. A caller whose token is not honoured falls through to the
 paying path, and the cap applies there like any other paid request.
@@ -457,7 +471,8 @@ path exists because an operator's own traffic shouldn't have to round-trip throu
 not because anonymous callers are second-class. Nothing here may quietly make paying the grudging
 option.
 
-Every way the token path can fail lands on the 402 challenge, never on the upstream:
+Every way the token path can fail lands on the paying path, never on the upstream: the 402
+challenge, or a `400` if the request fails the output cap there:
 
 | The caller sends | Obolus does |
 |---|---|
@@ -469,14 +484,16 @@ Every way the token path can fail lands on the 402 challenge, never on the upstr
 | a token while the verifier itself cannot answer | 402 challenge |
 | a token this key verifies | proxies to the upstream, unpaid |
 
-Every row but the last continues on the paying path, so the request then also meets the output cap:
-one without a usable `max_tokens` within the cap gets a `400` there rather than the challenge. See
-[What a paid request must ask for](#what-a-paid-request-must-ask-for).
-
 That asymmetry is deliberate. Answering 402 to a legitimate token-holder costs them a retry;
 serving an unverified caller costs us the inference. So a verifier that is *broken* is treated
 exactly like a token that is *bad* — the split between the two exists so the log can tell an
 operator which happened, and control flow never reads it.
+
+Every row marked 402 is the paying path, so the output cap applies before any challenge. A request
+whose body cannot be read in full, whose `max_tokens` is missing, unusable, `0` or above the cap, or
+that carries `max_completion_tokens`, an `n` other than `1`, or `best_of` to an `openai-compat`
+backend, gets a `400` there instead of the 402. See
+[What a paid request must ask for](#what-a-paid-request-must-ask-for).
 
 ### Rotating the signing key
 

@@ -110,9 +110,10 @@ pub enum Outcome {
     /// so it has no access path or backend and was never charged; kept apart from it because the
     /// request may well have named a model a backend serves.
     AmbiguousKey,
-    /// A paid request did not bound its output within the gateway's cap: it had no `max_tokens`,
-    /// one that is not a non-negative integer, one above the cap, or a `max_completion_tokens` its
-    /// backend might honour instead (#31). Refused with a 400 on the paying path, after routing and
+    /// A paid request did not bound its output within the gateway's cap: its body could not be
+    /// read in full, it had no `max_tokens`, one that is not a positive integer, or one above the
+    /// cap, or it carried a `max_completion_tokens`, `n` or `best_of` its backend might honour to
+    /// generate more (#31). Refused with a 400 on the paying path, after routing and
     /// before pricing, so it has a backend but no offers, and was never charged.
     OutputCapRefused,
     /// A recognised caller was served on the token path.

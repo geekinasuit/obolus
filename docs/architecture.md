@@ -142,8 +142,10 @@ shipped artifacts.
 payment requirement. This is the subject of [`pricing.md`](pricing.md); the short version is a
 `PriceDeterminer::quote(PriceContext) -> u128` trait, called once per advertised requirement and
 only on the paying path. Before it is called, the gateway refuses with a `400` a paid request whose
-`max_tokens` is missing, unusable, or above the output cap (`OBOLUS_MAX_OUTPUT_TOKENS`), so no
-quote has to cover more output than the cap
+body cannot be read in full, whose `max_tokens` is missing, unusable, `0`, or above the output cap
+(`OBOLUS_MAX_OUTPUT_TOKENS`), or which carries a field its backend kind may honour to lift output
+past `max_tokens` (`max_completion_tokens`, `n` other than 1, or `best_of` on `openai-compat`). So
+per kind, no quote has to cover more than one completion of at most the cap
 ([#31](https://github.com/geekinasuit/obolus/issues/31)).
 
 **Telemetry seam (`telemetry.rs`).** Recording what happened to each request, for reckoning
