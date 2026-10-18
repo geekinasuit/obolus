@@ -86,9 +86,9 @@ use crate::backends::{Backend, Backends, RouteError};
 use crate::facilitator::{Facilitator, FacilitatorError};
 use crate::pricing::{PriceContext, PriceDeterminer, StaticPrice};
 use crate::request::RequestShape;
-use crate::telemetry::{AccessPath, NoTelemetry, Offer, Outcome, Recorder, Telemetry, Trace};
+use crate::telemetry::{bounded_model, AccessPath, NoTelemetry, Offer, Outcome, Recorder, Telemetry, Trace};
 use crate::upstream::{Upstream, UpstreamResponse};
-use crate::arming::ArmedRequirements;
+use crate::arming::{legible, ArmedRequirements};
 use crate::x402::{
     self, PaymentPayload, PaymentRequired, PaymentRequirements, ResourceInfo, SettlementReceipt,
     UnsupportedTransfer,
@@ -458,6 +458,35 @@ fn route_failure(err: RouteError) -> Response {
     }
 }
 
+/// What a request whose body has a case variant of `of` is told, naming the variant `key`.
+///
+/// `key` is client text. A key that reaches here folds to `model` or `max_tokens`, so it is already
+/// short and printable, but it is still cut to [`crate::telemetry::MAX_MODEL_BYTES`] and then
+/// rendered through [`legible`], the escaping #16 introduced for operator values. That keeps the
+/// message one bounded line whatever it is handed, and shows U+212A and U+017F as escapes rather
+/// than as the `K` and `s` they look like.
+fn case_variant_message(key: &str, of: &str) -> String {
+    format!(
+        "request body has the key {}, which some JSON readers take for {}; use the exact lowercase \
+         key {} and no other spelling of it",
+        legible(&bounded_model(key.to_owned())),
+        legible(of),
+        legible(of),
+    )
+}
+
+/// A body carrying a case variant of `model` or `max_tokens`, refused as the client's 400 (#122).
+///
+/// Refused rather than read one way or the other: Go's `encoding/json`, behind Ollama, matches keys
+/// case-insensitively and lets a later duplicate win, while an exact reader ignores the variant. So
+/// a gateway that routed or priced by either reading could be serving a model, or a token limit,
+/// other than the one it charged for.
+fn case_variant_refusal(key: &str, of: &str) -> Response {
+    let message = case_variant_message(key, of);
+    eprintln!("obolus: refused before routing: {message}");
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
 /// The paying path. Not an axum handler — [`completion`] is the route, and reaches this when the
 /// caller presented no token we honour.
 ///
@@ -696,6 +725,11 @@ async fn serve<F: Facilitator>(
     // Parsed from a copy: the bytes forwarded below are the client's originals.
     let request = RequestShape::parse(&body);
     trace.model = request.model().map(str::to_owned);
+    // A case variant of `model` or `max_tokens` is refused at the same point and for the same
+    // reason: which model or limit the request asks for depends on who reads it (#122).
+    if let Some(variant) = request.case_variant() {
+        return (case_variant_refusal(variant.key(), variant.of()), Outcome::AmbiguousKey);
+    }
     let backend = match access.gateway.backends.route(request.model()) {
         Ok(backend) => backend,
         Err(err) => return (route_failure(err), Outcome::Unroutable),
@@ -2021,6 +2055,169 @@ mod tests {
 
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
         assert_eq!(*seen.lock().unwrap(), vec![MaxTokens::Limit(256)], "one quote, for one option");
+    }
+
+    // ---- case-variant keys (#122) ----
+
+    /// A JSON escape for the code point `hex`, assembled at run time so that the escape never
+    /// appears in this source file, where editing tools decode it.
+    fn escape(hex: &str) -> String {
+        format!("{}u{hex}", '\\')
+    }
+
+    /// A JSON object of `(key, raw JSON value)` pairs, in order; keys are written as given.
+    fn object(entries: &[(&str, &str)]) -> String {
+        let body: Vec<String> = entries.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
+        format!("{{{}}}", body.join(","))
+    }
+
+    fn kelvin_variant() -> String {
+        ["max_to", &char::from_u32(0x212A).unwrap().to_string(), "ens"].concat()
+    }
+
+    fn long_s_variant() -> String {
+        ["max_token", &char::from_u32(0x017F).unwrap().to_string()].concat()
+    }
+
+    /// `(body, the key as the refusal must name it)`: every case variant, before and after the
+    /// exact key it varies. The `model` variants name `mistral`, a model the exact key does not
+    /// route to; the exact key names `llama3`, which backend `a` serves.
+    fn variant_bodies() -> Vec<(String, String)> {
+        let escaped_model = [escape("004d").as_str(), "ODEL"].concat();
+        let model_variants =
+            [("MODEL", "MODEL".to_string()), ("Model", "Model".to_string()), ("MODEL", escaped_model)];
+        let mut rows = Vec::new();
+        for (decoded, written) in model_variants {
+            rows.push((object(&[("model", r#""llama3""#), (&written, r#""mistral""#), ("messages", "[]")]), decoded.to_string()));
+            rows.push((object(&[(&written, r#""mistral""#), ("model", r#""llama3""#), ("messages", "[]")]), decoded.to_string()));
+        }
+        for variant in ["MAX_TOKENS".to_string(), kelvin_variant(), long_s_variant()] {
+            rows.push((object(&[("model", r#""llama3""#), ("max_tokens", "200"), (&variant, "3")]), variant.clone()));
+            rows.push((object(&[("model", r#""llama3""#), (&variant, "3"), ("max_tokens", "200")]), variant.clone()));
+        }
+        rows
+    }
+
+    fn post(body: String, paid: bool, token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method("POST").uri("/v1/chat/completions");
+        if paid {
+            builder = builder.header(x402::HEADER_PAYMENT_SIGNATURE, x402::encode_payment(&payment()));
+        }
+        if let Some(token) = token {
+            builder = builder.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body)).unwrap()
+    }
+
+    /// The `error` of a refusal, with a check that it names `key` escaped, as `legible` renders it.
+    fn assert_names_the_key(status: StatusCode, body: &str, key: &str) {
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains(&legible(key)), "names {key:?}: {error}");
+        assert!(error.is_ascii(), "a look-alike character is escaped, not shown: {error}");
+    }
+
+    #[tokio::test]
+    async fn a_case_variant_key_is_refused_on_the_paying_path_before_routing_or_payment() {
+        for (body, key) in variant_bodies() {
+            let (app, calls, a_calls, b_calls) = app_two_backends();
+            let (status, _, response) = send(app, post(body.clone(), true, None)).await;
+            assert_names_the_key(status, &response, &key);
+            assert_eq!(a_calls.count() + b_calls.count(), 0, "no backend was reached for {body}");
+            assert_eq!(calls.verifies(), 0, "the payment was never verified for {body}");
+            assert_eq!(calls.settles(), 0, "nothing was settled for {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_case_variant_key_is_refused_on_the_token_path_too() {
+        // The token path is the allowlist bypass the defect is worst on: no payment would limit it.
+        for (body, key) in variant_bodies() {
+            let (app, calls, forwards) = app_with_verifier(
+                FakeFacilitator::accepting(),
+                FakeUpstream::streaming(),
+                FakeTokenVerifier::honouring(HONOURED),
+            );
+            let (status, _, response) = send(app, post(body.clone(), false, Some(HONOURED))).await;
+            assert_names_the_key(status, &response, &key);
+            assert_eq!(forwards.count(), 0, "the upstream was never called for {body}");
+            assert_eq!(calls.verifies() + calls.settles(), 0, "no facilitator call for {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_refusal_tells_the_client_what_to_send_instead() {
+        let (app, _, _, _) = app_two_backends();
+        let body = object(&[("model", r#""llama3""#), ("MODEL", r#""mistral""#)]);
+        let (_, _, response) = send(app, post(body, true, None)).await;
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("exact lowercase key \"model\""), "{error}");
+    }
+
+    #[tokio::test]
+    async fn keys_that_do_not_fold_and_nested_variants_route_as_before() {
+        let bodies = [
+            // Exact keys only.
+            object(&[("model", r#""llama3""#), ("max_tokens", "5"), ("messages", "[]")]),
+            // A capital I where `model` has an l: no reader folds that to `model`.
+            object(&[("model", r#""llama3""#), ("modeI", r#""mistral""#)]),
+            // Variants nested in `messages` and `options` are content, not fields of the request.
+            object(&[
+                ("model", r#""llama3""#),
+                ("messages", r#"[{"role":"user","content":"hi","MODEL":"mistral"}]"#),
+                ("options", r#"{"MAX_TOKENS":3,"Model":"mistral"}"#),
+            ]),
+        ];
+        for body in bodies {
+            let (app, calls, a_calls, b_calls) = app_two_backends();
+            let (status, _, _) = send(app, post(body.clone(), true, None)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(a_calls.count(), 1, "routed by its exact model: {body}");
+            assert_eq!(b_calls.count(), 0, "{body}");
+            assert_eq!(calls.settles(), 1, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_case_variant_refusal_is_recorded_before_any_access_path_and_costs_nothing() {
+        // The model value is the one client string an event carries; make it hostile — long, with
+        // a newline and U+202E — and check the line stays one bounded line.
+        // The variant key is upper case so that its absence from the line can be checked.
+        let hostile = format!("\n{}{}", char::from_u32(0x202E).unwrap(), "x".repeat(100_000));
+        let body = object(&[("model", &serde_json::to_string(&hostile).unwrap()), ("MODEL", r#""m""#)]);
+        let (app, sink) = app_recording(FakeFacilitator::accepting(), FakeUpstream::streaming(), None);
+        let (status, _, _) = send(app, post(body, true, None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::AmbiguousKey);
+        assert_eq!(event.access, None);
+        assert_eq!(event.backend, None);
+        assert!(event.offers.is_empty(), "nothing was quoted");
+        assert!(!event.upstream_invoked);
+        assert_eq!(event.cost.as_deref(), Some("0"));
+        assert_eq!(event.revenue.as_deref(), Some("0"));
+        let line = crate::telemetry::json_line(&event);
+        assert!(line.len() < 1024, "bounded: {} bytes", line.len());
+        assert!(!line.contains('\n'), "one line: {line}");
+        // The refused key itself is not part of the event: the outcome says why it was refused.
+        assert!(!line.contains("MODEL"), "{line}");
+    }
+
+    #[test]
+    fn the_refusal_bounds_and_escapes_whatever_key_it_is_given() {
+        // No key that reaches the refusal can be long or hold a control character: it folds to
+        // `model` or `max_tokens`, so it is a few ASCII letters, `_`, U+212A or U+017F (checked in
+        // `request.rs`). The bound is held anyway, so the rendering does not depend on that.
+        let hostile = format!("a\nobolus: forged line{}{}", char::from_u32(0x202E).unwrap(), "y".repeat(1_000_000));
+        let response = case_variant_refusal(&hostile, "model");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rendered = case_variant_message(&hostile, "model");
+        assert!(rendered.len() <= 6 * crate::telemetry::MAX_MODEL_BYTES + 200, "{} bytes", rendered.len());
+        assert!(rendered.is_ascii(), "{rendered}");
+        assert!(!rendered.chars().any(|c| c.is_control()), "{rendered}");
+        assert!(rendered.contains("a\\nobolus: forged line\\u{202e}y"), "{rendered}");
     }
 
     // ---- telemetry (#58) ----

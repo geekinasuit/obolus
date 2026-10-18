@@ -120,7 +120,11 @@ backend that serves that alias; a backend with an empty `models` list is a *catc
 serves any request and is legal only as the sole backend. The registry is built at boot from a
 JSON file (`OBOLUS_BACKENDS_FILE`) or, for the single-backend case, synthesized from
 `OBOLUS_UPSTREAM_URL`. Unroutable requests are refused before any payment is taken — the gateway
-has no refund path, so it never charges for work it cannot route.
+has no refund path, so it never charges for work it cannot route. A body with a case variant of
+the `model` or `max_tokens` key (`MODEL`, `Max_Tokens`) is refused with a `400` at the same point,
+on both access paths, because a case-insensitive upstream reader would route or limit by the
+variant while the gateway priced the exact key
+([#122](https://github.com/geekinasuit/obolus/issues/122)).
 
 **Upstream seam (`upstream.rs`).** Serving the inference. The `Upstream` trait is object-safe
 (its `forward` returns a boxed future), so the registry can hold heterogeneous backends behind
@@ -231,7 +235,7 @@ sequenceDiagram
   participant U as Upstream
 
   C->>G: request (names a model, no payment)
-  G->>G: route model → backend<br/>(unroutable → 4xx, never charged)
+  G->>G: route model → backend<br/>(unroutable or case-variant key → 4xx, never charged)
   G->>P: quote(context) for each armed requirement
   P-->>G: atomic amount per option
   G-->>C: 402 Payment Required (quoted options)

@@ -1,7 +1,8 @@
 //! What the gateway reads out of a completion request body.
 //!
-//! The body is read in one pass into a [`RequestShape`] — a second read of `model` alone happens
-//! only when a `max_tokens` value cannot be decoded (see [`RequestShape::parse`]) — and is only
+//! The body is read in one pass into a [`RequestShape`] — a second read of `model` and of the
+//! top-level keys happens only when a `max_tokens` value cannot be decoded (see
+//! [`RequestShape::parse`]) — and is only
 //! ever *read*: the bytes forwarded upstream are always the client's originals, never a
 //! re-serialization of this.
 //!
@@ -22,6 +23,33 @@ pub struct RequestShape {
     model: Option<String>,
     max_tokens: MaxTokens,
     max_completion_tokens: bool,
+    case_variant: Option<CaseVariant>,
+}
+
+/// A top-level key that folds to `model` or `max_tokens` without being exactly that key:
+/// `MODEL`, `Max_Tokens`, `max_to` + U+212A + `ens`, and the like. The fold rule is the one
+/// [`MaxTokens`] describes.
+///
+/// Upstream readers disagree on such a key. Go's `encoding/json`, behind Ollama, matches keys
+/// case-insensitively and lets a later duplicate win, so it may route or limit by the variant; an
+/// exact reader ignores it. A request carrying one is refused rather than read either way (#122).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseVariant {
+    key: String,
+    of: &'static str,
+}
+
+impl CaseVariant {
+    /// The key as it reads after JSON unescaping. Always as many characters as [`CaseVariant::of`],
+    /// each an ASCII letter, `_`, U+212A or U+017F, so at most a few bytes longer than it.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// The exact key this one folds to: `"model"` or `"max_tokens"`.
+    pub fn of(&self) -> &'static str {
+        self.of
+    }
 }
 
 /// The request's `max_tokens` field, kept distinct in all three ways it can arrive.
@@ -85,13 +113,15 @@ impl RequestShape {
         let mut scan = Scan::default();
         let mut reader = serde_json::Deserializer::from_slice(body);
         let read = TopLevel(&mut scan).deserialize(&mut reader).and_then(|()| reader.end());
-        let model = match read {
-            Ok(()) => scan.model,
-            Err(_) if scan.in_max_tokens => model_only(body),
-            Err(_) => None,
+        let (model, case_variant) = match read {
+            Ok(()) => (scan.model, scan.case_variant),
+            Err(_) if scan.in_max_tokens => {
+                (model_only(body), scan.case_variant.or_else(|| first_case_variant(body)))
+            }
+            Err(_) => (None, scan.case_variant),
         };
         let max_tokens = if scan.max_tokens_variant { MaxTokens::Invalid } else { scan.max_tokens };
-        Self { model, max_tokens, max_completion_tokens: scan.max_completion_tokens }
+        Self { model, max_tokens, max_completion_tokens: scan.max_completion_tokens, case_variant }
     }
 
     /// The `model` the request names, or `None` when it named none — including when the body is not
@@ -113,6 +143,55 @@ impl RequestShape {
     pub fn has_max_completion_tokens(&self) -> bool {
         self.max_completion_tokens
     }
+
+    /// The first top-level key in the body that folds to `model` or `max_tokens` without being it,
+    /// or `None` when there is none. Only top-level keys count: one nested in `messages` or
+    /// `options` is content, not a field of the request.
+    ///
+    /// Reading it does not change [`RequestShape::model`], which stays the exact key's value; the
+    /// gateway refuses a request that has one before routing it (#122).
+    ///
+    /// A key after a `max_tokens` value that fails the strict read is still found, by a second,
+    /// skip-only pass. The residual is a top-level key or `model` string that `serde_json` cannot
+    /// decode (an invalid UTF-8 byte, a lone surrogate) *before* the variant: the read stops there
+    /// and the variant is not seen. That leaves `model` as `None`, so it cannot route a request to
+    /// a declared model's backend; only a sole catch-all would take it, and that serves any model.
+    pub fn case_variant(&self) -> Option<&CaseVariant> {
+        self.case_variant.as_ref()
+    }
+}
+
+/// The first top-level key that folds to `model` or `max_tokens` without being it, read by a pass
+/// that skips every value. The fallback for a pass that failed inside a `max_tokens` value, whose
+/// keys after that point it never saw.
+fn first_case_variant(body: &[u8]) -> Option<CaseVariant> {
+    /// Writes what it finds into the slot rather than returning it, so that the find survives the
+    /// error the deserializer reports when the visitor stops before the end of the object.
+    struct Keys<'s>(&'s mut Option<CaseVariant>);
+
+    impl<'de> Visitor<'de> for Keys<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<Key>()? {
+                if let Key::Variant(variant) = key {
+                    *self.0 = Some(variant);
+                    return Ok(());
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+
+    let mut found = None;
+    let mut reader = serde_json::Deserializer::from_slice(body);
+    let _ = serde::Deserializer::deserialize_map(&mut reader, Keys(&mut found));
+    found
 }
 
 /// `model` read on its own, as a struct holding only `model` reads it. The fallback for a pass that
@@ -140,6 +219,8 @@ struct Scan {
     /// result [`MaxTokens::Invalid`] whatever else the body holds, because readers disagree on
     /// such a key: a case-insensitive one may take its limit from it, an exact one ignores it.
     max_tokens_variant: bool,
+    /// The first key seen that folds to `model` or `max_tokens` without being it.
+    case_variant: Option<CaseVariant>,
 }
 
 impl Default for Scan {
@@ -150,6 +231,7 @@ impl Default for Scan {
             max_completion_tokens: false,
             in_max_tokens: false,
             max_tokens_variant: false,
+            case_variant: None,
         }
     }
 }
@@ -161,10 +243,11 @@ enum Key {
     Model,
     /// Exactly `max_tokens`.
     MaxTokens,
-    /// A key that is not `max_tokens` but that [`folds_to`] it: `MAX_TOKENS`, `Max_Tokens`, and
-    /// the like. A reader that matches keys case-insensitively may take its limit from such a key,
-    /// one that matches exactly will not, so the request's limit depends on who reads it.
-    MaxTokensVariant,
+    /// A key that is not `model` or `max_tokens` but that [`folds_to`] one of them: `MODEL`,
+    /// `Max_Tokens`, and the like. A reader that matches keys case-insensitively may route or limit
+    /// by such a key, one that matches exactly will not, so what the request asks for depends on
+    /// who reads it.
+    Variant(CaseVariant),
     /// Exactly `max_completion_tokens`.
     MaxCompletionTokens,
     Other,
@@ -190,8 +273,10 @@ impl<'de> Visitor<'de> for KeyVisitor {
             "model" => Key::Model,
             "max_tokens" => Key::MaxTokens,
             "max_completion_tokens" => Key::MaxCompletionTokens,
-            _ if folds_to(key, "max_tokens") => Key::MaxTokensVariant,
-            _ => Key::Other,
+            _ => match ["model", "max_tokens"].into_iter().find(|target| folds_to(key, target)) {
+                Some(of) => Key::Variant(CaseVariant { key: key.to_owned(), of }),
+                None => Key::Other,
+            },
         })
     }
 }
@@ -269,9 +354,12 @@ impl<'de> Visitor<'de> for TopLevel<'_> {
                     self.0.max_tokens = map.next_value::<Judged>()?.0;
                     self.0.in_max_tokens = false;
                 }
-                Key::MaxTokensVariant => {
+                Key::Variant(variant) => {
                     // Sticky, whatever order the keys come in: see `Scan::max_tokens_variant`.
-                    self.0.max_tokens_variant = true;
+                    if variant.of == "max_tokens" {
+                        self.0.max_tokens_variant = true;
+                    }
+                    self.0.case_variant.get_or_insert(variant);
                     map.next_value::<IgnoredAny>()?;
                 }
                 Key::MaxCompletionTokens => {
@@ -554,11 +642,163 @@ mod tests {
             })
             .map(|body| (body, Some("m"), Invalid, false))
             .collect();
+        // A key that folds to `model` is refused by the gateway, not read here: `model` stays the
+        // exact key's value, as the old read had it, whichever side of it the variant sits.
+        let model_folded: Vec<(Vec<u8>, Option<&'static str>, MaxTokens, bool)> = model_fold_variants()
+            .iter()
+            .flat_map(|variant| {
+                let v = variant.as_str();
+                [
+                    (object(&[("model", r#""m""#), (v, r#""x""#)]), Some("m")),
+                    (object(&[(v, r#""x""#), ("model", r#""m""#)]), Some("m")),
+                    (object(&[(v, r#""x""#)]), None),
+                ]
+            })
+            .map(|(body, model)| (body, model, Absent, false))
+            .collect();
+        let after_a_broken_max_tokens: Vec<(Vec<u8>, Option<&'static str>, MaxTokens, bool)> =
+            broken_max_tokens()
+                .iter()
+                .map(|value| {
+                    (object(&[("model", r#""m""#), ("max_tokens", value), ("MODEL", r#""x""#)]), Some("m"), Invalid, false)
+                })
+                .collect();
         text.into_iter()
             .map(|(body, model, max, mct)| (body.as_bytes().to_vec(), model, max, mct))
             .chain(built)
             .chain(folded)
+            .chain(model_folded)
+            .chain(after_a_broken_max_tokens)
             .collect()
+    }
+
+    /// Keys that fold to `model` without being `model`. `model` has neither a `k` nor an `s`, so
+    /// every one is an ASCII case variant; the last is `MODEL` with its `M` written as an escape.
+    fn model_fold_variants() -> Vec<String> {
+        vec![
+            "MODEL".to_string(),
+            "Model".to_string(),
+            "mODEl".to_string(),
+            [escape("004d").as_str(), "ODEL"].concat(),
+        ]
+    }
+
+    /// `max_tokens` values the strict read rejects but a skip accepts, so that the pass fails
+    /// inside the value and `parse` falls back to reading the rest of the body tolerantly.
+    fn broken_max_tokens() -> Vec<String> {
+        vec!["1e400".to_string(), format!("\"{}\"", escape("d800"))]
+    }
+
+    /// `(body, the first case-variant key and what it folds to)`, for [`RequestShape::case_variant`].
+    fn case_variant_cases() -> Vec<(Vec<u8>, Option<(String, &'static str)>)> {
+        let kelvin = char::from_u32(0x212A).unwrap().to_string();
+        let long_s = char::from_u32(0x017F).unwrap().to_string();
+        let found = |key: &str, of: &'static str| Some((key.to_string(), of));
+        let mut rows: Vec<(Vec<u8>, Option<(String, &'static str)>)> = vec![
+            // Exact keys only: nothing to refuse.
+            (object(&[("model", r#""m""#), ("max_tokens", "5"), ("messages", "[]")]), None),
+            (object(&[("model", r#""m""#)]), None),
+            (b"[\"MODEL\"]".to_vec(), None),
+            (b"not json".to_vec(), None),
+            // Near misses that fold to neither key: a capital I for the l, an extra letter, a hyphen.
+            (object(&[("model", r#""m""#), ("modeI", r#""x""#)]), None),
+            (object(&[("model", r#""m""#), ("models", r#""x""#)]), None),
+            (object(&[("model", r#""m""#), ("max-tokens", "3")]), None),
+            // Only top-level keys count: a variant nested in `messages` or `options` is just content.
+            (
+                object(&[
+                    ("model", r#""m""#),
+                    ("messages", r#"[{"role":"user","MODEL":"x","MAX_TOKENS":3}]"#),
+                    ("options", r#"{"Model":"x","max_tokens":1,"MAX_TOKENS":3}"#),
+                ]),
+                None,
+            ),
+            // The first variant in the body is the one named, whichever key it folds to.
+            (object(&[("model", r#""m""#), ("MAX_TOKENS", "3"), ("MODEL", r#""x""#)]), found("MAX_TOKENS", "max_tokens")),
+            (object(&[("MODEL", r#""x""#), ("Max_Tokens", "3")]), found("MODEL", "model")),
+            // The key is reported decoded, as a reader that matched it would have seen it.
+            (object(&[("model", r#""m""#), (&[escape("004d").as_str(), "ODEL"].concat(), r#""x""#)]), found("MODEL", "model")),
+            (
+                object(&[("model", r#""m""#), (&["max_to", &escape("212a"), "ens"].concat(), "3")]),
+                Some((["max_to", &kelvin, "ens"].concat(), "max_tokens")),
+            ),
+            // Known residual (see `case_variant`): a lone surrogate in an earlier top-level key
+            // stops the read before the variant. `model` then reads as none, so routing cannot be
+            // steered by it.
+            (object(&[(&escape("d800"), "1"), ("MODEL", r#""x""#)]), None),
+        ];
+        for variant in model_fold_variants() {
+            let decoded = if variant.starts_with('\\') { "MODEL".to_string() } else { variant.clone() };
+            for body in [
+                object(&[("model", r#""m""#), (&variant, r#""x""#)]),
+                object(&[(&variant, r#""x""#), ("model", r#""m""#)]),
+                object(&[(&variant, r#""x""#)]),
+            ] {
+                rows.push((body, Some((decoded.clone(), "model"))));
+            }
+        }
+        let max_tokens_variants = [
+            "MAX_TOKENS".to_string(),
+            ["max_to", &kelvin, "ens"].concat(),
+            ["max_token", &long_s].concat(),
+        ];
+        for variant in max_tokens_variants {
+            for body in [
+                object(&[("model", r#""m""#), (&variant, "3")]),
+                object(&[("model", r#""m""#), (&variant, "3"), ("max_tokens", "200")]),
+                object(&[("model", r#""m""#), ("max_tokens", "200"), (&variant, "3")]),
+            ] {
+                rows.push((body, Some((variant.clone(), "max_tokens"))));
+            }
+        }
+        // A variant after a `max_tokens` value that fails the strict read is still found.
+        for value in broken_max_tokens() {
+            rows.push((
+                object(&[("model", r#""m""#), ("max_tokens", &value), ("MODEL", r#""x""#)]),
+                found("MODEL", "model"),
+            ));
+            rows.push((
+                object(&[("model", r#""m""#), ("MAX_TOKENS", "3"), ("max_tokens", &value), ("MODEL", r#""x""#)]),
+                found("MAX_TOKENS", "max_tokens"),
+            ));
+        }
+        rows
+    }
+
+    #[test]
+    fn names_the_first_case_variant_key() {
+        for (body, expected) in case_variant_cases() {
+            let shown = String::from_utf8_lossy(&body);
+            let found = RequestShape::parse(&body).case_variant().map(|v| (v.key().to_string(), v.of()));
+            assert_eq!(found, expected, "case variant of {shown}");
+        }
+    }
+
+    #[test]
+    fn the_escaped_model_variant_really_carries_an_escape() {
+        let body = object(&[(&[escape("004d").as_str(), "ODEL"].concat(), r#""x""#)]);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.contains("\\u004d") && !text.contains("MODEL"), "{text}");
+    }
+
+    #[test]
+    fn every_key_that_folds_is_short_and_free_of_controls() {
+        // What reaches a refusal message is a key that folds to `model` or `max_tokens`: the same
+        // number of characters, each an ASCII letter or `_`, U+212A or U+017F. So it can never be
+        // long or carry a control, bidi or line-breaking character. `folds_to` compares character
+        // by character over equal lengths, so checking every scalar value against every character
+        // of both targets covers every key.
+        let allowed = |c: char| c.is_ascii_alphabetic() || c == '_' || c as u32 == 0x212A || c as u32 == 0x017F;
+        let (mut c_buf, mut t_buf) = ([0u8; 4], [0u8; 4]);
+        for t in "model".chars().chain("max_tokens".chars()) {
+            let t_str = t.encode_utf8(&mut t_buf);
+            for c in (0u32..0x11_0000).filter_map(char::from_u32) {
+                if folds_to(c.encode_utf8(&mut c_buf), t_str) {
+                    assert!(allowed(c), "{c:?} folds to {t:?}");
+                    assert!(c.len_utf8() <= 3, "{c:?}");
+                }
+            }
+        }
     }
 
     /// A JSON escape for the code point `hex`, as six characters in the body. Assembled at run time

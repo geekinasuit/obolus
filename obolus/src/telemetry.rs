@@ -104,6 +104,11 @@ pub fn record(sink: &dyn Telemetry, event: RequestEvent) {
 pub enum Outcome {
     /// No backend serves the requested model, or the request named none where one was required.
     Unroutable,
+    /// The body has a top-level key that differs from `model` or `max_tokens` only in case, which
+    /// readers disagree on (#122). Refused with a 400 before routing, like [`Outcome::Unroutable`],
+    /// so it has no access path or backend and was never charged; kept apart from it because the
+    /// request may well have named a model a backend serves.
+    AmbiguousKey,
     /// A recognised caller was served on the token path.
     Served,
     /// No payment was presented; the client was challenged.
@@ -176,9 +181,10 @@ pub struct RequestEvent {
     /// sink reports the same instant however long it queues the event.
     pub ts_ms: u64,
     pub outcome: Outcome,
-    /// `None` only for [`Outcome::Unroutable`], which is decided before the access path is.
+    /// `None` only for [`Outcome::Unroutable`] and [`Outcome::AmbiguousKey`], which are decided
+    /// before the access path is.
     pub access: Option<AccessPath>,
-    /// The routed backend's id; `None` when the request was unroutable.
+    /// The routed backend's id; `None` when the request was refused before routing.
     pub backend: Option<String>,
     /// The model the request named, bounded by [`MAX_MODEL_BYTES`].
     pub model: Option<String>,
@@ -236,6 +242,7 @@ impl Trace {
             Outcome::Abandoned if self.settle_attempted => None,
             Outcome::Abandoned
             | Outcome::Unroutable
+            | Outcome::AmbiguousKey
             | Outcome::Served
             | Outcome::PaymentRequired
             | Outcome::PaymentMalformed
@@ -264,7 +271,9 @@ impl Trace {
     }
 }
 
-fn bounded_model(model: String) -> String {
+/// `model` cut to at most [`MAX_MODEL_BYTES`], at a character boundary. Also bounds the key a
+/// case-variant refusal names, before it is escaped.
+pub(crate) fn bounded_model(model: String) -> String {
     if model.len() <= MAX_MODEL_BYTES {
         return model;
     }
