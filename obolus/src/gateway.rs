@@ -81,12 +81,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
-use serde::Deserialize;
-
 use crate::access::{bearer_token, TokenPath};
 use crate::backends::{Backend, Backends, RouteError};
 use crate::facilitator::{Facilitator, FacilitatorError};
 use crate::pricing::{PriceContext, PriceDeterminer, StaticPrice};
+use crate::request::RequestShape;
 use crate::telemetry::{AccessPath, NoTelemetry, Offer, Outcome, Recorder, Telemetry, Trace};
 use crate::upstream::{Upstream, UpstreamResponse};
 use crate::arming::ArmedRequirements;
@@ -295,11 +294,11 @@ impl<F: Facilitator> Gateway<F> {
     ///
     /// Built once per paying request and threaded through the challenge and settle path, so every
     /// re-challenge quotes the price the client first saw. Never reached on the token path.
-    fn priced(&self, model: Option<&str>, backend: &Backend) -> Vec<PaymentRequirements> {
+    fn priced(&self, request: &RequestShape, backend: &Backend) -> Vec<PaymentRequirements> {
         self.requirements
             .iter()
             .map(|requirement| {
-                let amount = self.price.quote(PriceContext { model, backend, requirement });
+                let amount = self.price.quote(PriceContext { request, backend, requirement });
                 PaymentRequirements { amount: amount.to_string(), ..requirement.clone() }
             })
             .collect()
@@ -433,22 +432,6 @@ fn payment_window_elapsed() -> Response {
 
 async fn health() -> &'static str {
     "ok"
-}
-
-/// Just enough of the request body to route on. Every other field is ignored, and the *original*
-/// bytes are what gets forwarded — this reads a copy to pick a backend, it never re-serializes the
-/// request. `#[serde(default)]` so a body that omits `model` parses to `None` rather than failing.
-#[derive(Deserialize)]
-struct ModelField {
-    #[serde(default)]
-    model: Option<String>,
-}
-
-/// The `model` the request names, or `None` when it named none — including when the body is not JSON
-/// we can read a `model` out of. A `None` routes to a catch-all if one exists (the single-backend
-/// case, unchanged from before routing) and is a `400` otherwise; it is never a `500`.
-fn requested_model(body: &Bytes) -> Option<String> {
-    serde_json::from_slice::<ModelField>(body).ok().and_then(|parsed| parsed.model)
 }
 
 /// A routing failure rendered as the client's 4xx. The model name is the client's own input, so
@@ -710,9 +693,10 @@ async fn serve<F: Facilitator>(
     // Route before anything else. An unroutable request is refused here — before the token check
     // and before any payment — so it is never charged (Obolus has no refund path), and both the
     // recognised-caller path and the paying path forward to the same backend the model resolves to.
-    let model = requested_model(&body);
-    trace.model = model.clone();
-    let backend = match access.gateway.backends.route(model.as_deref()) {
+    // Read once, from a copy: the bytes forwarded below are the client's originals.
+    let request = RequestShape::parse(&body);
+    trace.model = request.model().map(str::to_owned);
+    let backend = match access.gateway.backends.route(request.model()) {
         Ok(backend) => backend,
         Err(err) => return (route_failure(err), Outcome::Unroutable),
     };
@@ -752,7 +736,7 @@ async fn serve<F: Facilitator>(
     // fault can never turn a free, honoured request into a 500. The determined prices are quoted in
     // the challenge and charged at settlement (see [`paid_completion`]).
     trace.access = Some(AccessPath::Payment);
-    let priced = access.gateway.priced(model.as_deref(), backend);
+    let priced = access.gateway.priced(&request, backend);
     paid_completion(access.gateway.clone(), upstream, priced, headers, body, arrival, trace).await
 }
 
@@ -776,7 +760,9 @@ mod tests {
     use crate::backends::Backend;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
     use crate::pricing::{CostPlus, FlatPrice, Promotional, StaticPrice};
+    use crate::request::MaxTokens;
     use crate::telemetry::{FakeTelemetry, RequestEvent};
+    use std::sync::Mutex;
     use crate::upstream::{FakeUpstream, OllamaUpstream, UpstreamCalls};
     use crate::arming::{check_arming, is_provably_testnet};
     use crate::x402::{PaymentPayload, SettlementReceipt, SCHEME_EXACT, X402_VERSION};
@@ -1984,6 +1970,57 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(a_calls.count() + b_calls.count(), 0, "no backend was reached");
         assert_eq!(calls.verifies(), 0, "and nothing was charged");
+    }
+
+    #[tokio::test]
+    async fn a_malformed_max_tokens_still_routes_by_its_model() {
+        // Only `model` decides routing. A `max_tokens` the gateway cannot use must not be able to
+        // fail the read `model` comes out of — were it to, this request would lose its model and be
+        // refused as naming none, a routing change made by a field routing never looks at.
+        let (app, _calls, a_calls, b_calls) = app_two_backends();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(x402::HEADER_PAYMENT_SIGNATURE, x402::encode_payment(&payment()))
+            .body(Body::from(r#"{"model":"mistral","max_tokens":"abc","messages":[]}"#))
+            .unwrap();
+        let (status, _headers, _body) = send(app, request).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(b_calls.count(), 1, "the backend that lists mistral was reached");
+        assert_eq!(a_calls.count(), 0, "the backend that lists only llama3 was not");
+    }
+
+    /// A determiner that quotes the armed amount, as [`StaticPrice`] does, and keeps the
+    /// `max_tokens` of every request it was asked to price.
+    struct RecordingPrice(Arc<Mutex<Vec<MaxTokens>>>);
+
+    impl PriceDeterminer for RecordingPrice {
+        fn quote(&self, ctx: PriceContext<'_>) -> u128 {
+            self.0.lock().unwrap().push(ctx.request.max_tokens());
+            StaticPrice.quote(ctx)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_determiner_sees_the_requests_max_tokens() {
+        // The parsed body reaches the price seam: what a determiner reads off `PriceContext` is
+        // the request's own `max_tokens`, not a default.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (app, _) = app_priced_with(
+            FakeFacilitator::accepting(),
+            FakeUpstream::streaming(),
+            Arc::new(RecordingPrice(seen.clone())),
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::from(r#"{"model":"test","max_tokens":256,"messages":[]}"#))
+            .unwrap();
+        let (status, _, _) = send(app, request).await;
+
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(*seen.lock().unwrap(), vec![MaxTokens::Limit(256)], "one quote, for one option");
     }
 
     // ---- telemetry (#58) ----

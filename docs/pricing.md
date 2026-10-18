@@ -52,7 +52,7 @@ payment requirement.
 
 ```rust
 struct PriceContext<'a> {
-    model: Option<&'a str>,   // the model the request named, if any
+    request: &'a RequestShape, // what the body asked for: its model, if any, and max_tokens
     backend: &'a Backend,     // the backend it routed to (id, kind, models, precedence, …)
     requirement: &'a PaymentRequirements, // the one advertised option being priced
 }

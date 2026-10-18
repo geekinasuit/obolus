@@ -22,21 +22,23 @@
 //! rate structures the vision names are built on top of this trait; [`FlatPrice`] is the first.
 
 use crate::backends::Backend;
+use crate::request::RequestShape;
 use crate::x402::PaymentRequirements;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// What a single quote is about: the model the request named (or `None`), the backend it routed to,
-/// and the advertised payment requirement being priced.
+/// What a single quote is about: what the request body asked for (its model and output-token
+/// limit), the backend it routed to, and the advertised payment requirement being priced.
 ///
 /// The determiner is called once per advertised requirement, so `requirement` is the *one* option
 /// being priced — a determiner prices each `(scheme, network)` independently and never sees the set
-/// as a whole. `model` and `backend` are what a per-model or per-backend policy keys on; the
-/// default rate ignores both.
+/// as a whole. The request's model and the backend are what a per-model or per-backend policy keys
+/// on; the default rate ignores both.
 pub struct PriceContext<'a> {
-    /// The `model` field of the request, if it named one. `None` for a request a catch-all backend
-    /// took without a model (the single-backend case).
-    pub model: Option<&'a str>,
+    /// What the gateway read from the request body: [`RequestShape::model`] (`None` for a request a
+    /// catch-all backend took without a model, the single-backend case) and the output-token limit
+    /// it asked for.
+    pub request: &'a RequestShape,
     /// The backend this request routed to. Carries the operator's per-backend metadata a policy may
     /// price on — `id`, `kind`, `models`, `precedence`, and the declared `cost` the cost-plus rate
     /// marks up.
@@ -244,7 +246,7 @@ mod tests {
     use super::*;
     use crate::upstream::{FakeUpstream, Upstream};
     use crate::x402::{PaymentRequirements, SCHEME_EXACT};
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     fn backend() -> Backend {
         let upstream: Arc<dyn Upstream> = Arc::new(FakeUpstream::streaming());
@@ -264,8 +266,12 @@ mod tests {
         }
     }
 
+    /// The request every unit test prices: one naming `a-model` and nothing else.
+    static REQUEST: LazyLock<RequestShape> =
+        LazyLock::new(|| RequestShape::parse(br#"{"model":"a-model"}"#));
+
     fn ctx<'a>(backend: &'a Backend, requirement: &'a PaymentRequirements) -> PriceContext<'a> {
-        PriceContext { model: Some("a-model"), backend, requirement }
+        PriceContext { request: &REQUEST, backend, requirement }
     }
 
     #[test]
