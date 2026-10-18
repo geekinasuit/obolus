@@ -182,10 +182,10 @@ disagree.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `v` | integer | Line format version, currently `1`. Bumped when a field changes meaning or is removed. Adding a field does not bump it, so ignore keys you do not know. |
+| `v` | integer | Line format version, currently `1`. Bumped when a field changes meaning or is removed. Adding a field, or a new value of an enumerated field such as `outcome`, does not bump it, so ignore keys you do not know and handle values you do not know. |
 | `kind` | string | `"request"`. |
 | `ts_ms` | integer | Unix milliseconds when the event was recorded, stamped once by the gateway rather than by each sink. |
-| `outcome` | string | One of the outcomes above. |
+| `outcome` | string | One of the outcomes above. New outcomes can be added without a version bump. |
 | `access` | string \| null | `"payment"` or `"token"`; `null` only for `unroutable` and `ambiguous_key`, which are decided first. |
 | `backend` | string \| null | The routed backend's id; `null` for `unroutable` and `ambiguous_key`. |
 | `model` | string \| null | The model the request named, cut to at most 256 bytes; `null` if it named none. |

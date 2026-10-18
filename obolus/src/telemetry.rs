@@ -55,7 +55,8 @@ use serde::Serialize;
 use crate::x402::PaymentRequirements;
 
 /// The version of the line format [`json_line`] writes. Bumped when a field changes meaning or is
-/// removed; adding a field is not a bump, so a consumer should ignore fields it does not know.
+/// removed. Adding a field, or a new [`Outcome`], is not a bump, so a consumer should ignore fields
+/// it does not know and handle outcomes it does not know.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The longest `model` an event records, in bytes. The model is the client's own input, and a
