@@ -38,8 +38,19 @@ pub struct RequestShape {
 /// string; Go's `encoding/json`, which Ollama uses, substitutes U+FFFD and carries on. So such a
 /// byte placed *before* `max_tokens` reads here as `Absent` while Ollama honours the limit.
 ///
-/// A key given more than once takes its last value, as Go's `encoding/json` (which Ollama uses)
-/// and `serde_json`'s own maps do.
+/// Keys are compared after JSON unescaping. An exact `max_tokens` given more than once takes its
+/// last value.
+///
+/// **A key that folds to `max_tokens` without being it makes the result [`MaxTokens::Invalid`]**,
+/// whatever its value, wherever it sits relative to an exact `max_tokens`, and whether or not one
+/// is present. Upstream readers disagree on such a key: a case-insensitive one (Go's
+/// `encoding/json`, behind Ollama) may take its limit from it, while an exact one (a typical
+/// Python server behind `openai-compat`) ignores it. So no limit read here could be trusted to be
+/// the one the upstream applies, and the request is marked unusable rather than guessed at. A key
+/// folds to `max_tokens` when it has the same number of characters and each one either equals the
+/// target's ignoring ASCII case, or is U+212A KELVIN SIGN where the target has `k`, or U+017F
+/// LATIN SMALL LETTER LONG S where it has `s` — the only non-ASCII characters whose Unicode simple
+/// fold reaches an ASCII letter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaxTokens {
     /// The body has no top-level `max_tokens` key, or failed to parse before one.
@@ -79,7 +90,8 @@ impl RequestShape {
             Err(_) if scan.in_max_tokens => model_only(body),
             Err(_) => None,
         };
-        Self { model, max_tokens: scan.max_tokens, max_completion_tokens: scan.max_completion_tokens }
+        let max_tokens = if scan.max_tokens_variant { MaxTokens::Invalid } else { scan.max_tokens };
+        Self { model, max_tokens, max_completion_tokens: scan.max_completion_tokens }
     }
 
     /// The `model` the request names, or `None` when it named none — including when the body is not
@@ -124,23 +136,84 @@ struct Scan {
     /// Set while a `max_tokens` value is being read, and cleared once it has been: still set after
     /// an error means the error was inside that value.
     in_max_tokens: bool,
+    /// Set once a key that folds to `max_tokens` without being it has been seen. It makes the
+    /// result [`MaxTokens::Invalid`] whatever else the body holds, because readers disagree on
+    /// such a key: a case-insensitive one may take its limit from it, an exact one ignores it.
+    max_tokens_variant: bool,
 }
 
 impl Default for Scan {
     fn default() -> Self {
-        Self { model: None, max_tokens: MaxTokens::Absent, max_completion_tokens: false, in_max_tokens: false }
+        Self {
+            model: None,
+            max_tokens: MaxTokens::Absent,
+            max_completion_tokens: false,
+            in_max_tokens: false,
+            max_tokens_variant: false,
+        }
     }
 }
 
-/// The top-level keys the pass acts on. Any other key is `Other`, and its value is skipped.
-#[derive(Deserialize)]
-#[serde(field_identifier, rename_all = "snake_case")]
+/// The top-level keys the pass acts on, compared after JSON unescaping. Any other key is `Other`,
+/// and its value is skipped.
 enum Key {
+    /// Exactly `model`, as a derived struct matches it.
     Model,
+    /// Exactly `max_tokens`.
     MaxTokens,
+    /// A key that is not `max_tokens` but that [`folds_to`] it: `MAX_TOKENS`, `Max_Tokens`, and
+    /// the like. A reader that matches keys case-insensitively may take its limit from such a key,
+    /// one that matches exactly will not, so the request's limit depends on who reads it.
+    MaxTokensVariant,
+    /// Exactly `max_completion_tokens`.
     MaxCompletionTokens,
-    #[serde(other)]
     Other,
+}
+
+impl<'de> Deserialize<'de> for Key {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_identifier(KeyVisitor)
+    }
+}
+
+struct KeyVisitor;
+
+impl<'de> Visitor<'de> for KeyVisitor {
+    type Value = Key;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("an object key")
+    }
+
+    fn visit_str<E>(self, key: &str) -> Result<Key, E> {
+        Ok(match key {
+            "model" => Key::Model,
+            "max_tokens" => Key::MaxTokens,
+            "max_completion_tokens" => Key::MaxCompletionTokens,
+            _ if folds_to(key, "max_tokens") => Key::MaxTokensVariant,
+            _ => Key::Other,
+        })
+    }
+}
+
+/// Whether `key` matches the ASCII `target` under Unicode simple case folding. This is not an
+/// attempt to reproduce any one reader's key matching; it is wide enough that every key a
+/// case-insensitive reader (Go's `encoding/json` among them) could match to `target` is caught.
+///
+/// For an ASCII target that comes down to three rules per character, with the two strings the same
+/// length in characters: the characters are equal ignoring ASCII case; or the target is `k` and the
+/// character is U+212A KELVIN SIGN; or the target is `s` and the character is U+017F LATIN SMALL
+/// LETTER LONG S. Those two are the only non-ASCII characters whose simple fold reaches an ASCII
+/// letter.
+fn folds_to(key: &str, target: &str) -> bool {
+    const KELVIN_SIGN: u32 = 0x212A;
+    const LONG_S: u32 = 0x017F;
+    key.chars().count() == target.chars().count()
+        && key.chars().zip(target.chars()).all(|(c, t)| {
+            c.eq_ignore_ascii_case(&t)
+                || (t == 'k' && c as u32 == KELVIN_SIGN)
+                || (t == 's' && c as u32 == LONG_S)
+        })
 }
 
 /// The pass over the top-level value. Mirrors what `#[derive(Deserialize)]` generates for a struct
@@ -195,6 +268,11 @@ impl<'de> Visitor<'de> for TopLevel<'_> {
                     self.0.in_max_tokens = true;
                     self.0.max_tokens = map.next_value::<Judged>()?.0;
                     self.0.in_max_tokens = false;
+                }
+                Key::MaxTokensVariant => {
+                    // Sticky, whatever order the keys come in: see `Scan::max_tokens_variant`.
+                    self.0.max_tokens_variant = true;
+                    map.next_value::<IgnoredAny>()?;
                 }
                 Key::MaxCompletionTokens => {
                     self.0.max_completion_tokens = true;
@@ -375,8 +453,6 @@ mod tests {
             (r#"{"model":"m","max_completion_tokens":"x"}"#, Some("m"), Absent, true),
             (r#"{"model":"m","max_completion_tokens":null}"#, Some("m"), Absent, true),
             (r#"{"model":"m","max_tokens":32,"max_completion_tokens":64}"#, Some("m"), Limit(32), true),
-            // Keys are compared after unescaping, as every JSON reader does.
-            (r#"{"model":"m","max_tokens":7}"#, Some("m"), Limit(7), false),
             // A nested `max_tokens` is not the request's.
             (r#"{"model":"m","options":{"max_tokens":9}}"#, Some("m"), Absent, false),
             (r#"{}"#, None, Absent, false),
@@ -422,6 +498,7 @@ mod tests {
             (r#"{"model":"\ud800","max_tokens":5000}"#, None, Absent, false),
         ];
         let u64_max = format!(r#"{{"model":"m","max_tokens":{}}}"#, u64::MAX);
+        let exact_escaped = ["max", &escape("005f"), "tokens"].concat();
         let built: Vec<(Vec<u8>, Option<&'static str>, MaxTokens, bool)> = vec![
             (u64_max.into_bytes(), Some("m"), Limit(u64::MAX), false),
             // Arrays nested past serde_json's document-tree depth limit, before and after the key.
@@ -447,11 +524,71 @@ mod tests {
             (bytes(&[br#"{"model":"a"#, b"\xff", br#"","max_tokens":5000}"#]), None, Absent, false),
             // A leading byte-order mark is not JSON.
             (bytes(&[b"\xef\xbb\xbf", br#"{"model":"m","max_tokens":5}"#]), None, Absent, false),
+            // Keys are compared after JSON unescaping: `max`, an escaped `_`, then `tokens` is the
+            // exact key.
+            (object(&[("model", r#""m""#), (&exact_escaped, "7")]), Some("m"), Limit(7), false),
+            // Near misses that no reader folds to `max_tokens` are just other keys.
+            (object(&[("model", r#""m""#), ("max_tokenss", "9")]), Some("m"), Absent, false),
+            (object(&[("model", r#""m""#), ("max-tokens", "9")]), Some("m"), Absent, false),
         ];
+        let folded: Vec<(Vec<u8>, Option<&'static str>, MaxTokens, bool)> = fold_variants()
+            .iter()
+            .flat_map(|variant| {
+                let v = variant.as_str();
+                [
+                    // Alone, and before and after an exact key: always `Invalid`, never the
+                    // exact key's value.
+                    object(&[("model", r#""m""#), (v, "100000")]),
+                    object(&[("model", r#""m""#), (v, "100000"), ("max_tokens", "5")]),
+                    object(&[("model", r#""m""#), ("max_tokens", "5"), (v, "100000")]),
+                    object(&[("model", r#""m""#), ("max_tokens", "5"), (v, "null")]),
+                ]
+            })
+            .map(|body| (body, Some("m"), Invalid, false))
+            .collect();
         text.into_iter()
             .map(|(body, model, max, mct)| (body.as_bytes().to_vec(), model, max, mct))
             .chain(built)
+            .chain(folded)
             .collect()
+    }
+
+    /// A JSON escape for the code point `hex`, as six characters in the body. Assembled at run time
+    /// so that the escape never appears in this source file, where editing tools decode it.
+    fn escape(hex: &str) -> String {
+        format!("{}u{hex}", '\\')
+    }
+
+    /// A JSON object of the given `(key, raw JSON value)` pairs, in order. Keys are written as
+    /// given, so a key may carry escapes.
+    fn object(entries: &[(&str, &str)]) -> Vec<u8> {
+        let body: Vec<String> = entries.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect();
+        format!("{{{}}}", body.join(",")).into_bytes()
+    }
+
+    /// Keys that fold to `max_tokens` (see `folds_to`) without being `max_tokens` itself.
+    fn fold_variants() -> Vec<String> {
+        let kelvin = char::from_u32(0x212A).unwrap().to_string();
+        let long_s = char::from_u32(0x017F).unwrap().to_string();
+        vec![
+            "MAX_TOKENS".to_string(),
+            "Max_Tokens".to_string(),
+            ["max_to", &kelvin, "ens"].concat(),
+            ["max_token", &long_s].concat(),
+            // Escaped forms of a variant: an escaped `_` in an upper-case key, and the Kelvin sign
+            // written as an escape.
+            ["MAX", &escape("005f"), "TOKENS"].concat(),
+            ["max_to", &escape("212a"), "ens"].concat(),
+        ]
+    }
+
+    #[test]
+    fn the_escaped_rows_really_carry_escapes() {
+        // The escaped-key rows test unescaping only if the body holds a backslash escape rather
+        // than the character it stands for.
+        assert_eq!(escape("005f").as_bytes(), &[b'\\', b'u', b'0', b'0', b'5', b'f']);
+        let body = object(&[(&["max", &escape("005f"), "tokens"].concat(), "7")]);
+        assert!(!String::from_utf8(body).unwrap().contains("max_tokens"));
     }
 
     #[test]
