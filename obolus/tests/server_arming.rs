@@ -786,7 +786,7 @@ fn the_backend_config_and_the_upstream_cost_at_once_refuse_to_start() {
     run.must_have_refused_during_startup();
 }
 
-// ---- per-model token rates (#31): validated, then refused as inert ----
+// ---- per-model token rates (#31): validated, then live only under token pricing ----
 
 /// The inert-rates refusal's lead. Asserted present for valid rates and absent for malformed ones,
 /// so the two directions share one needle.
@@ -799,7 +799,7 @@ const COST_REFUSALS: [&str; 2] = ["declare no cost", "declare a cost"];
 const VALID_RATES: &str = r#"{"llama3":{"input":"3000000","output":"15000000"}}"#;
 
 #[test]
-fn valid_rates_in_the_backends_file_are_refused_as_inert_under_every_rate() {
+fn valid_rates_in_the_backends_file_are_refused_as_inert_under_static_and_cost_plus() {
     // Static: no backend may carry a cost, or the inert-cost refusal fires first.
     let uncosted = temp_file(
         "backends-rates-static.json",
@@ -845,7 +845,7 @@ fn malformed_rates_in_the_backends_file_name_the_field_not_the_inert_refusal() {
 }
 
 #[test]
-fn valid_model_rates_for_the_single_backend_are_refused_as_inert_under_every_rate() {
+fn valid_model_rates_for_the_single_backend_are_refused_as_inert_under_static_and_cost_plus() {
     for vars in [
         vec![("OBOLUS_MODEL_RATES", VALID_RATES)],
         vec![
@@ -894,6 +894,97 @@ fn the_backend_config_and_the_model_rates_at_once_refuse_to_start() {
     run.must_say("OBOLUS_BACKENDS_FILE and OBOLUS_MODEL_RATES are both set");
     run.must_not_say(INERT_RATES);
     run.must_have_refused_during_startup();
+}
+
+// ---- token pricing (#31) ----
+
+/// The token-pricing refusal of a backend with no rates.
+const UNRATED: &str = "declare no token rates";
+
+/// Rates for the model `post_unpaid` asks for: $3 and $15 per million tokens in USDC.
+const TEST_MODEL_RATES: &str = r#"{"test":{"input":"3000000","output":"15000000"}}"#;
+
+#[test]
+fn a_token_priced_boot_names_the_rate_and_each_backends_rates() {
+    let run = run(&[("OBOLUS_PRICING", "token"), ("OBOLUS_MODEL_RATES", TEST_MODEL_RATES)]);
+    run.must_have_got_past_startup();
+    run.must_say("obolus: pricing: token");
+    run.must_say(r#"token rates per million tokens in atomic units: "test" in 3000000 out 15000000"#);
+    run.must_say("priced by the token rate above");
+    run.must_not_say(INERT_RATES);
+}
+
+#[test]
+fn a_token_priced_boot_from_a_backends_file_names_each_backends_rates() {
+    let path = temp_file(
+        "backends-token-rated.json",
+        r#"[{"id":"a","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"],"rates":{"llama3":{"input":"3000000","output":"15000000"}}},
+            {"id":"b","kind":"ollama","baseUrl":"http://10.0.0.2","models":["mistral"],"rates":{"mistral":{"input":"0","output":"2000000"}}}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path), ("OBOLUS_PRICING", "token")]);
+    run.must_have_got_past_startup();
+    run.must_say("obolus: pricing: token");
+    run.must_say(r#"backend "a""#);
+    run.must_say(r#"token rates per million tokens in atomic units: "llama3" in 3000000 out 15000000"#);
+    run.must_say(r#"token rates per million tokens in atomic units: "mistral" in 0 out 2000000"#);
+    for needle in COST_REFUSALS {
+        run.must_not_say(needle);
+    }
+}
+
+#[test]
+fn token_pricing_without_rates_refuses_to_start() {
+    let run = run(&[("OBOLUS_PRICING", "token")]);
+    run.must_say(&format!(r#"{UNRATED}: "default""#));
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn token_pricing_refuses_a_backend_without_rates_naming_it() {
+    let path = temp_file(
+        "backends-token-unrated.json",
+        &format!(
+            r#"[{{"id":"rated","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"],"rates":{VALID_RATES}}},
+               {{"id":"bare","kind":"ollama","baseUrl":"http://10.0.0.2","models":["mistral"]}}]"#
+        ),
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path), ("OBOLUS_PRICING", "token")]);
+    run.must_say(&format!(r#"{UNRATED}: "bare""#));
+    run.must_not_say(r#""rated""#);
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn token_pricing_refuses_the_margin_and_the_upstream_cost() {
+    for var in ["OBOLUS_MARGIN_BPS", "OBOLUS_UPSTREAM_COST"] {
+        let run = run(&[
+            ("OBOLUS_PRICING", "token"),
+            ("OBOLUS_MODEL_RATES", TEST_MODEL_RATES),
+            (var, "1000"),
+        ]);
+        run.must_say(&format!("{var} configure cost-plus pricing"));
+        run.must_have_refused_during_startup();
+        run.must_not_say(ADVERTISEMENT_LINE);
+    }
+}
+
+#[test]
+fn the_running_binary_quotes_by_token_rates_and_refuses_an_unrated_model() {
+    // The wiring no library test can see: `main` installs the determiner and the allowlist.
+    let live = serve_live(&[("OBOLUS_PRICING", "token"), ("OBOLUS_MODEL_RATES", TEST_MODEL_RATES)]);
+    // 47 bytes, by hand: ceil(47 / 4) = 12 input tokens. 12 × 3_000_000 + 256 × 15_000_000 =
+    // 3_876_000_000, over 1_000_000 = 3_876 atomic units.
+    let body = r#"{"model":"test","max_tokens":256,"messages":[]}"#;
+    assert_eq!(body.len(), 47, "the hand computation assumes 47 bytes");
+    let response = post_unpaid_body(&live.addr, body);
+    assert!(response.starts_with("HTTP/1.1 402"), "expected a challenge; got:\n{response}");
+    assert!(response.contains(r#""amount":"3876""#), "{response}");
+
+    let unrated = post_unpaid_body(&live.addr, r#"{"model":"other","max_tokens":256,"messages":[]}"#);
+    assert!(unrated.starts_with("HTTP/1.1 400"), "expected a refusal; got:\n{unrated}");
+    assert!(unrated.contains("has no token rate"), "{unrated}");
 }
 
 #[test]

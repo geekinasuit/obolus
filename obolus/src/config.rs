@@ -398,6 +398,10 @@ pub enum PricingChoice {
     /// value, which `main` attaches to the sole backend (`None` when a backends file declares the
     /// cost per entry instead). Every backend having a cost is enforced by [`require_backend_costs`].
     CostPlus { margin_bps: u32, upstream_cost: Option<u128> },
+    /// Token pricing ([`crate::pricing::TokenPrice`]): each request quoted from its model's declared
+    /// per-million-token rates on the routed backend. Carries nothing: the rates live on the
+    /// backends, and that every backend has some is enforced by [`require_backend_rates`].
+    Token,
 }
 
 /// Why a pricing configuration could not be turned into a [`PricingChoice`]. Each is a boot refusal:
@@ -410,7 +414,8 @@ pub enum PricingConfigError {
     /// price the operator did not choose.
     #[error(
         "OBOLUS_PRICING {value:?} is not a known rate. Set it to \"static\" (the default — each \
-         advertised option keeps its own configured amount) or \"cost-plus\", or unset it."
+         advertised option keeps its own configured amount), \"cost-plus\" or \"token\", or unset \
+         it."
     )]
     UnknownRate { value: String },
 
@@ -471,9 +476,35 @@ pub enum PricingConfigError {
     )]
     InertPrice,
 
+    /// `token` is selected alongside the multi-chain `OBOLUS_ACCEPTS`. The [`CostPlusMultiChain`]
+    /// reasoning, for rates: a rate is in atomic units of one asset, so across networks whose
+    /// assets have different decimals one rate would mean different prices.
+    ///
+    /// [`CostPlusMultiChain`]: PricingConfigError::CostPlusMultiChain
+    #[error(
+        "OBOLUS_PRICING is \"token\" and OBOLUS_ACCEPTS is set. Token rates are in atomic units of \
+         a single asset, and the several networks OBOLUS_ACCEPTS advertises carry different assets \
+         and decimals, so one rate is ambiguous across them — multi-chain token pricing is not \
+         supported yet. Unset OBOLUS_ACCEPTS to price a single chain by token rates, or unset \
+         OBOLUS_PRICING to advertise each entry's own amount."
+    )]
+    TokenMultiChain,
+
+    /// `token` is selected alongside an explicitly configured `OBOLUS_PRICE`, which would sit inert:
+    /// the amount comes from the rates. The [`InertPrice`] rule, for rates.
+    ///
+    /// [`InertPrice`]: PricingConfigError::InertPrice
+    #[error(
+        "OBOLUS_PRICING is \"token\", which sets every amount from the requested model's token \
+         rates, but OBOLUS_PRICE is also set and would be silently ignored. Remove OBOLUS_PRICE, or \
+         unset OBOLUS_PRICING to charge that amount instead."
+    )]
+    TokenInertPrice,
+
     /// Cost-plus's parameters are set, but `cost-plus` is not selected — so they would sit inert. The
     /// `OBOLUS_TOKEN_ISSUER`-without-a-key shape: configuration that cannot take effect refuses
-    /// rather than being dropped.
+    /// rather than being dropped. Under `token` too: rates are the client's price, so there is no
+    /// cost to mark up and no margin to add.
     #[error(
         "{vars} configure cost-plus pricing, but OBOLUS_PRICING is not \"cost-plus\", so they would \
          be silently ignored. Set OBOLUS_PRICING=cost-plus to use them, or unset them."
@@ -501,16 +532,26 @@ pub enum PricingConfigError {
     )]
     InertBackendCost { ids: String },
 
-    /// A backend declares token rates, from the backends file or `OBOLUS_MODEL_RATES`. They
-    /// validated, but no rate in this version reads them, so they would sit inert. Raised by
-    /// [`refuse_inert_rates`].
+    /// A backend declares token rates, from the backends file or `OBOLUS_MODEL_RATES`, but `token`
+    /// is not selected, so they would sit inert. Raised by [`require_backend_rates`].
     #[error(
         "these backends declare token rates: {ids}. The rates are valid, but they take effect \
-         only under token pricing, which this version of obolus does not have yet \
-         (https://github.com/geekinasuit/obolus/issues/31), so they would be silently ignored. \
-         Remove \"rates\" from OBOLUS_BACKENDS_FILE, or unset OBOLUS_MODEL_RATES."
+         only under token pricing, and OBOLUS_PRICING is not \"token\", so they would be silently \
+         ignored. Set OBOLUS_PRICING=token to price by them, or remove \"rates\" from \
+         OBOLUS_BACKENDS_FILE or unset OBOLUS_MODEL_RATES."
     )]
     InertRates { ids: String },
+
+    /// `token` is selected but one or more backends declare no rates. A backend without rates
+    /// could serve no paid request, every one refused as unpriced, so it is refused at boot, as a
+    /// costless backend is under cost-plus. Raised by [`require_backend_rates`].
+    #[error(
+        "OBOLUS_PRICING is \"token\" but these backends declare no token rates: {ids}. Token \
+         pricing quotes each request from its model's rates, so a backend without any could serve \
+         no paid request — set OBOLUS_MODEL_RATES for the single-backend setup, or a per-entry \
+         \"rates\" in OBOLUS_BACKENDS_FILE."
+    )]
+    UnratedBackends { ids: String },
 }
 
 /// Turn the pricing environment into a [`PricingChoice`], or refuse.
@@ -528,24 +569,36 @@ pub enum PricingConfigError {
 pub fn select_pricing<F: Fn(&str) -> Option<String>>(
     get: F,
 ) -> Result<PricingChoice, PricingConfigError> {
-    // The orphaned-parameter refusal, shared by the unset and explicit-`static` paths: cost-plus's
-    // parameters set without cost-plus selected would sit inert.
-    let static_or_orphan = |get: &F| -> Result<PricingChoice, PricingConfigError> {
+    // The orphaned-parameter refusal, shared by every rate but cost-plus: cost-plus's parameters
+    // set without cost-plus selected would sit inert.
+    let unorphaned = |get: &F, choice: PricingChoice| -> Result<PricingChoice, PricingConfigError> {
         let orphaned: Vec<&str> = [UPSTREAM_COST_VAR, MARGIN_BPS_VAR]
             .into_iter()
             .filter(|&k| get(k).is_some())
             .collect();
         if orphaned.is_empty() {
-            Ok(PricingChoice::Static)
+            Ok(choice)
         } else {
             Err(PricingConfigError::OrphanedParams { vars: orphaned.join(", ") })
         }
     };
 
     match get(PRICING_VAR) {
-        None => static_or_orphan(&get),
+        None => unorphaned(&get, PricingChoice::Static),
         Some(raw) => match raw.trim() {
-            "static" => static_or_orphan(&get),
+            "static" => unorphaned(&get, PricingChoice::Static),
+            "token" => {
+                // The combination refusals first, in cost-plus's order and for its reasons: a
+                // rate is in one asset's atomic units, and the amount comes from the rates.
+                if get("OBOLUS_ACCEPTS").is_some() {
+                    return Err(PricingConfigError::TokenMultiChain);
+                }
+                if get("OBOLUS_PRICE").is_some() {
+                    return Err(PricingConfigError::TokenInertPrice);
+                }
+                // Rates are the client's price: no cost under them and no margin on top.
+                unorphaned(&get, PricingChoice::Token)
+            }
             "cost-plus" => {
                 // Combination refusals before parameter parsing: a wrong pairing is a more
                 // fundamental misconfiguration than a malformed parameter, and naming it first is
@@ -610,17 +663,7 @@ pub fn require_backend_costs(
     backends: &Backends,
     pricing: PricingChoice,
 ) -> Result<(), PricingConfigError> {
-    let named = |select: fn(&crate::backends::Backend) -> bool| -> String {
-        backends
-            .backends()
-            .iter()
-            .filter(|b| select(b))
-            // Quoted and escaped: an id is operator text, and these refusals print before the
-            // posture lines, so a newline in one could write a startup line of its own (#16).
-            .map(|b| legible(&b.id))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let named = |select: fn(&crate::backends::Backend) -> bool| named_backends(backends, select);
     match pricing {
         PricingChoice::CostPlus { .. } => {
             let missing = named(|b| b.cost.is_none());
@@ -630,7 +673,8 @@ pub fn require_backend_costs(
                 Err(PricingConfigError::MissingBackendCost { ids: missing })
             }
         }
-        PricingChoice::Static => {
+        // Under token pricing the rates are the client's price, so a cost would sit unread too.
+        PricingChoice::Static | PricingChoice::Token => {
             let inert = named(|b| b.cost.is_some());
             if inert.is_empty() {
                 Ok(())
@@ -641,31 +685,48 @@ pub fn require_backend_costs(
     }
 }
 
-/// Refuse declared token rates that no selected rate would read.
+/// The ids of the backends `select` picks, each quoted and escaped, comma-separated; empty when it
+/// picks none. An id is operator text, and the refusals that carry these print before the posture
+/// lines, so a newline in one could otherwise write a startup line of its own (#16).
+fn named_backends(backends: &Backends, select: fn(&crate::backends::Backend) -> bool) -> String {
+    backends
+        .backends()
+        .iter()
+        .filter(|b| select(b))
+        .map(|b| legible(&b.id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The rates twin of [`require_backend_costs`]: does the selected rate agree with the token rates
+/// the backends declare?
 ///
 /// Rates are validated where they are declared — per entry in
 /// [`crate::backends::load_backends`], or by [`select_model_rates`] for the single backend — so a
-/// malformed one has already been refused, with its specific defect, before this runs. What is
-/// left is the rule the boot path holds throughout: configuration that cannot take effect refuses
-/// rather than being silently dropped.
+/// malformed one has already been refused, with its specific defect, before this runs. Two
+/// refusals are left, the same pair cost-plus has for costs:
+/// - token pricing with a backend that declares no rates → [`PricingConfigError::UnratedBackends`]:
+///   that backend could serve no paid request. This covers "no rates at all" too.
+/// - rates under any other rate → [`PricingConfigError::InertRates`]: nothing would read them.
 ///
-/// **This is the one place token pricing lifts.** No [`PricingChoice`] reads rates today, so every
-/// arm below refuses them. The match is exhaustive on purpose: adding a token-pricing variant does
-/// not compile until it is given an arm here, and that arm is where rates become live (#31).
-pub fn refuse_inert_rates(
+/// A backend that rates some of its models but not others is not refused here: a request for an
+/// unrated model is refused before payment instead, with a 400 naming it (see
+/// [`crate::gateway`]).
+pub fn require_backend_rates(
     backends: &Backends,
     pricing: PricingChoice,
 ) -> Result<(), PricingConfigError> {
     match pricing {
+        PricingChoice::Token => {
+            let unrated = named_backends(backends, |b| b.rates.is_empty());
+            if unrated.is_empty() {
+                Ok(())
+            } else {
+                Err(PricingConfigError::UnratedBackends { ids: unrated })
+            }
+        }
         PricingChoice::Static | PricingChoice::CostPlus { .. } => {
-            let rated = backends
-                .backends()
-                .iter()
-                .filter(|b| !b.rates.is_empty())
-                // Quoted and escaped, as in `require_backend_costs` (#16).
-                .map(|b| legible(&b.id))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let rated = named_backends(backends, |b| !b.rates.is_empty());
             if rated.is_empty() {
                 Ok(())
             } else {
@@ -1642,7 +1703,7 @@ mod tests {
         }
     }
 
-    // --- token rates: the OBOLUS_MODEL_RATES door and the inert-rates refusal (#31) ---
+    // --- token rates: the OBOLUS_MODEL_RATES door and require_backend_rates (#31) ---
 
     use crate::backends::{RateDefect, TokenRate};
     use std::env::VarError;
@@ -1729,18 +1790,17 @@ mod tests {
     }
 
     #[test]
-    fn rates_under_every_current_rate_are_refused_as_inert_naming_the_backend() {
-        // No rate in this version reads token rates, so any declared rate would sit unread.
+    fn rates_under_static_or_cost_plus_are_refused_as_inert_naming_the_backend() {
+        // Only token pricing reads token rates, so under any other rate a declared one sits unread.
         let backends = Backends::from_parts(vec![backend_costing("plain", None), backend_rated("rated")]);
         for pricing in [
             PricingChoice::Static,
             PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None },
         ] {
-            let err = refuse_inert_rates(&backends, pricing).unwrap_err();
+            let err = require_backend_rates(&backends, pricing).unwrap_err();
             assert_eq!(err, PricingConfigError::InertRates { ids: r#""rated""#.to_string() }, "{pricing:?}");
             let message = err.to_string();
-            assert!(message.contains("token pricing"), "{message}");
-            assert!(message.contains("https://github.com/geekinasuit/obolus/issues/31"), "{message}");
+            assert!(message.contains("OBOLUS_PRICING=token"), "{message}");
         }
     }
 
@@ -1751,16 +1811,90 @@ mod tests {
             PricingChoice::Static,
             PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None },
         ] {
-            assert_eq!(refuse_inert_rates(&backends, pricing), Ok(()));
+            assert_eq!(require_backend_rates(&backends, pricing), Ok(()));
         }
     }
 
     #[test]
-    fn a_backend_id_in_an_inert_rates_refusal_cannot_start_a_line() {
-        let backends = Backends::from_parts(vec![backend_rated("a\nobolus: listening on")]);
-        let message = refuse_inert_rates(&backends, PricingChoice::Static).unwrap_err().to_string();
-        assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
-        assert!(message.contains(r#""a\nobolus: listening on""#), "quoted, escaped: {message}");
+    fn a_backend_id_in_a_rates_refusal_cannot_start_a_line() {
+        let forged = "a\nobolus: listening on";
+        for (backend, pricing) in [
+            (backend_rated(forged), PricingChoice::Static),
+            (backend_costing(forged, None), PricingChoice::Token),
+        ] {
+            let backends = Backends::from_parts(vec![backend]);
+            let message = require_backend_rates(&backends, pricing).unwrap_err().to_string();
+            assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+            assert!(message.contains(r#""a\nobolus: listening on""#), "quoted, escaped: {message}");
+        }
+    }
+
+    #[test]
+    fn token_pricing_is_selected_by_name() {
+        assert_eq!(select_pricing(env(&[("OBOLUS_PRICING", "token")])), Ok(PricingChoice::Token));
+    }
+
+    #[test]
+    fn token_pricing_accepts_backends_that_all_declare_rates() {
+        let backends = Backends::from_parts(vec![backend_rated("a"), backend_rated("b")]);
+        assert_eq!(require_backend_rates(&backends, PricingChoice::Token), Ok(()));
+    }
+
+    #[test]
+    fn token_pricing_without_any_rates_is_refused() {
+        // Nothing could be served paid: every model would be refused as unpriced.
+        let backends = Backends::from_parts(vec![backend_costing("a", None)]);
+        let err = require_backend_rates(&backends, PricingChoice::Token).unwrap_err();
+        assert_eq!(err, PricingConfigError::UnratedBackends { ids: r#""a""#.to_string() });
+        let message = err.to_string();
+        assert!(message.contains("OBOLUS_MODEL_RATES"), "{message}");
+    }
+
+    #[test]
+    fn token_pricing_refuses_a_backend_without_rates_naming_it() {
+        // A backend with no rates would serve nothing paid. Refused at boot, as a costless backend
+        // is under cost-plus, rather than discovered one 400 at a time.
+        let backends = Backends::from_parts(vec![backend_rated("rated"), backend_costing("bare", None)]);
+        let err = require_backend_rates(&backends, PricingChoice::Token).unwrap_err();
+        assert_eq!(err, PricingConfigError::UnratedBackends { ids: r#""bare""#.to_string() });
+    }
+
+    #[test]
+    fn token_pricing_refuses_the_margin_and_the_upstream_cost() {
+        // Rates are the client's price: no margin goes on top and no cost is marked up, so either
+        // variable would sit inert.
+        for var in [UPSTREAM_COST_VAR, MARGIN_BPS_VAR] {
+            let err = select_pricing(env(&[("OBOLUS_PRICING", "token"), (var, "1000")])).unwrap_err();
+            assert!(
+                matches!(&err, PricingConfigError::OrphanedParams { vars } if vars == var),
+                "got {err:?} for {var}",
+            );
+        }
+    }
+
+    #[test]
+    fn token_pricing_refuses_a_backend_cost() {
+        let backends = Backends::from_parts(vec![backend_rated("rated").with_cost(1000)]);
+        let err = require_backend_costs(&backends, PricingChoice::Token).unwrap_err();
+        assert_eq!(err, PricingConfigError::InertBackendCost { ids: r#""rated""#.to_string() });
+    }
+
+    #[test]
+    fn token_pricing_alongside_obolus_accepts_or_an_explicit_price_is_refused() {
+        // A rate is in atomic units of one asset, so it is ambiguous across the several assets
+        // OBOLUS_ACCEPTS advertises; and OBOLUS_PRICE would sit inert under rates.
+        let multi = select_pricing(env(&[("OBOLUS_PRICING", "token"), ("OBOLUS_ACCEPTS", "[]")]));
+        assert_eq!(multi, Err(PricingConfigError::TokenMultiChain));
+        let priced = select_pricing(env(&[("OBOLUS_PRICING", "token"), ("OBOLUS_PRICE", "1000")]));
+        assert_eq!(priced, Err(PricingConfigError::TokenInertPrice));
+    }
+
+    #[test]
+    fn an_unknown_rate_refusal_names_every_rate() {
+        let message = PricingConfigError::UnknownRate { value: "x".to_string() }.to_string();
+        for rate in ["\"static\"", "\"cost-plus\"", "\"token\""] {
+            assert!(message.contains(rate), "{message}");
+        }
     }
 
     // The boot instant these promo tests place windows relative to. Fixed, so every refusal —

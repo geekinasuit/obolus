@@ -85,7 +85,7 @@ use axum::{Json, Router};
 use crate::access::{bearer_token, TokenPath};
 use crate::backends::{Backend, Backends, Kind, RouteError};
 use crate::facilitator::{Facilitator, FacilitatorError};
-use crate::pricing::{PriceContext, PriceDeterminer, StaticPrice};
+use crate::pricing::{estimated_input_tokens, model_rate, PriceContext, PriceDeterminer, StaticPrice};
 use crate::request::{MaxTokens, RequestShape};
 use crate::telemetry::{bounded_model, AccessPath, NoTelemetry, Offer, Outcome, Recorder, Telemetry, Trace};
 use crate::upstream::{Upstream, UpstreamResponse};
@@ -206,6 +206,9 @@ pub struct Gateway<F: Facilitator> {
     /// The largest `max_tokens` a paid request may carry. Defaults to
     /// [`DEFAULT_MAX_OUTPUT_TOKENS`]; [`Gateway::with_max_output_tokens`] sets another.
     max_output_tokens: NonZeroU64,
+    /// Whether a paid request must name a model its backend has a token rate for. Set by
+    /// [`Gateway::with_model_rates_required`] beside the token-pricing determiner.
+    model_rates_required: bool,
 }
 
 impl<F: Facilitator> Gateway<F> {
@@ -274,7 +277,21 @@ impl<F: Facilitator> Gateway<F> {
             price: Arc::new(StaticPrice),
             telemetry: Arc::new(NoTelemetry),
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            model_rates_required: false,
         })
+    }
+
+    /// Refuse, before pricing, a paid request for a model its backend has no token rate for, and
+    /// record each paid request's token-quote inputs. `main` sets this with the
+    /// [`crate::pricing::TokenPrice`] determiner (#31).
+    ///
+    /// A flag beside the determiner rather than something read off it, because a determiner may be
+    /// wrapped (by [`crate::pricing::Promotional`]) and the gateway cannot see through that. Out of
+    /// step, both ways fail closed: without the flag an unrated model is quoted the unpayable
+    /// `u128::MAX`; with it under another rate, an unrated model is refused.
+    pub fn with_model_rates_required(mut self) -> Self {
+        self.model_rates_required = true;
+        self
     }
 
     /// Set the output cap: the largest `max_tokens` a paid request may carry. The token path is not
@@ -582,6 +599,30 @@ fn output_cap_response(message: String) -> Response {
     (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// What a paid request is told when token pricing has no rate for the model it names.
+///
+/// The model is client text, and a catch-all routes any string, so it is cut to
+/// [`crate::telemetry::MAX_MODEL_BYTES`] and rendered through [`legible`], as
+/// [`case_variant_message`] does with a key.
+fn unpriced_model_message(model: Option<&str>) -> String {
+    match model {
+        Some(model) => format!(
+            "model {} has no token rate on this gateway, so a paid request for it cannot be \
+             priced; ask for a model this gateway prices",
+            legible(&bounded_model(model.to_owned())),
+        ),
+        None => "the request names no model, so token pricing has no rate to price it by; name a \
+                 model in the \"model\" field"
+            .to_string(),
+    }
+}
+
+/// A paid request for a model with no token rate, refused as the client's 400 before payment.
+fn unpriced_model_refusal(model: Option<&str>) -> Response {
+    let message = unpriced_model_message(model);
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
 /// The paying path. Not an axum handler — [`completion`] is the route, and reaches this when the
 /// caller presented no token we honour.
 ///
@@ -876,6 +917,21 @@ async fn serve<F: Facilitator>(
     if let Some(message) = output_cap_refusal(&request, backend.kind, access.gateway.max_output_tokens) {
         return (output_cap_response(message), Outcome::OutputCapRefused);
     }
+    // Under token pricing, a model without a rate on the backend it routed to is refused here,
+    // after the cap and before the price or the challenge, so it is never quoted or charged.
+    // There is no fallback to another price (#31).
+    if access.gateway.model_rates_required {
+        if model_rate(&request, backend).is_none() {
+            return (unpriced_model_refusal(request.model()), Outcome::UnpricedModel);
+        }
+        // The quote's inputs, read from the same request the determiner prices. The cap above
+        // has made `max_tokens` a limit.
+        trace.quote_input_tokens = Some(estimated_input_tokens(request.body_len()));
+        trace.quote_max_tokens = match request.max_tokens() {
+            MaxTokens::Limit(n) => Some(n),
+            MaxTokens::Absent | MaxTokens::Invalid => None,
+        };
+    }
     let priced = access.gateway.priced(&request, backend);
     paid_completion(access.gateway.clone(), upstream, priced, headers, body, arrival, trace).await
 }
@@ -899,7 +955,7 @@ mod tests {
     use crate::access::FakeTokenVerifier;
     use crate::backends::Backend;
     use crate::facilitator::{FakeCalls, FakeFacilitator};
-    use crate::pricing::{CostPlus, FlatPrice, Promotional, StaticPrice};
+    use crate::pricing::{CostPlus, FlatPrice, Promotional, StaticPrice, TokenPrice};
     use crate::telemetry::{FakeTelemetry, RequestEvent};
     use std::sync::Mutex;
     use crate::upstream::{FakeUpstream, OllamaUpstream, UpstreamCalls};
@@ -2699,6 +2755,8 @@ mod tests {
                 cost: Some(TEST_COST.to_string()),
                 revenue: Some("1000".to_string()),
                 transaction: Some("0xTEST-TX-HASH-NOT-A-REAL-TRANSACTION".to_string()),
+                quote_input_tokens: None,
+                quote_max_tokens: None,
             }
         );
     }
@@ -3425,5 +3483,174 @@ mod tests {
             armed(vec![requirements_with_window(SHORTEST_WINDOW)]),
         );
         assert!(built.is_ok(), "one second more than the reserve is accepted");
+    }
+
+    // ---- token pricing (#31) ----
+
+    /// The body the token-pricing tests send. Exactly 50 bytes (asserted below), so 13 estimated
+    /// input tokens.
+    const RATED_BODY: &str = r#"{"model":"llama3","max_tokens":1000,"messages":[]}"#;
+
+    /// [`RATED_BODY`]'s quote at $3/M input and $15/M output in USDC, by hand: 50 bytes / 4 = 12.5,
+    /// rounded up to 13 input tokens. 13 × 3_000_000 = 39_000_000; 1000 × 15_000_000 =
+    /// 15_000_000_000; the sum, 15_039_000_000, over 1_000_000 is 15_039 atomic units.
+    const RATED_QUOTE: &str = "15039";
+
+    /// A token-priced gateway over one backend of `models` (a catch-all when empty) that rates only
+    /// `llama3`, with the token path on when `verifier` is, and handles on every seam.
+    fn app_token_priced(
+        models: Vec<&str>,
+        verifier: Option<FakeTokenVerifier>,
+    ) -> (Router, FakeCalls, UpstreamCalls, FakeTelemetry) {
+        let facilitator = FakeFacilitator::accepting();
+        let calls = facilitator.calls();
+        let upstream = FakeUpstream::streaming();
+        let forwards = upstream.calls();
+        let sink = FakeTelemetry::default();
+        let rate = crate::backends::TokenRate { input: 3_000_000, output: 15_000_000 };
+        let backend = Backend::for_test("rated", models, None, Arc::new(upstream))
+            .with_rates([("llama3".to_string(), rate)].into_iter().collect());
+        let gateway = Gateway::new(
+            facilitator,
+            Arc::new(Backends::from_parts(vec![backend])),
+            resource(),
+            armed(vec![requirements()]),
+        )
+        .unwrap()
+        .with_price_determiner(Arc::new(TokenPrice))
+        .with_model_rates_required()
+        .with_telemetry(Arc::new(sink.clone()));
+        let token = verifier.map(|verifier| TokenPath::new(Arc::new(verifier)));
+        (router(Access::new(gateway, token)), calls, forwards, sink)
+    }
+
+    /// A request carrying `body` and, when given, a payment for the advertised option at `amount`.
+    fn token_request(body: &str, amount: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method("POST").uri("/v1/chat/completions");
+        if let Some(amount) = amount {
+            let paid = paying(PaymentRequirements { amount: amount.to_string(), ..requirements() });
+            builder = builder.header(x402::HEADER_PAYMENT_SIGNATURE, x402::encode_payment(&paid));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn token_pricing_quotes_the_formula_in_the_challenge() {
+        assert_eq!(RATED_BODY.len(), 50, "the hand computation of RATED_QUOTE assumes 50 bytes");
+        let (app, _, _, sink) = app_token_priced(vec!["llama3"], None);
+        let (status, headers, body) = send(app, token_request(RATED_BODY, None)).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+        let challenge = assert_challenge_headers(&headers, &body);
+        assert_eq!(challenge.accepts[0].amount, RATED_QUOTE);
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::PaymentRequired);
+        assert_eq!((event.quote_input_tokens, event.quote_max_tokens), (Some(13), Some(1000)));
+    }
+
+    #[tokio::test]
+    async fn a_paid_retry_of_the_same_body_is_matched_and_settled_at_the_quoted_amount() {
+        // The quote depends only on the body, the backend's rates and the boot configuration, so
+        // the paid retry recomputes the amount its challenge quoted, matches, and is charged it.
+        let (app, calls, forwards, sink) = app_token_priced(vec!["llama3"], None);
+        let (_, headers, body) = send(app.clone(), token_request(RATED_BODY, None)).await;
+        let quoted = assert_challenge_headers(&headers, &body).accepts[0].amount.clone();
+        assert_eq!(quoted, RATED_QUOTE);
+
+        let (status, _, body) = send(app, token_request(RATED_BODY, Some(&quoted))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(forwards.count(), 1);
+        let settled = calls.settled_requirements();
+        assert_eq!(settled.len(), 1, "exactly one settlement");
+        assert_eq!(settled[0].amount, RATED_QUOTE, "charged the amount the challenge quoted");
+        let events = sink.events();
+        let paid = events.last().unwrap();
+        assert_eq!(paid.outcome, Outcome::Settled);
+        assert_eq!(paid.revenue.as_deref(), Some(RATED_QUOTE));
+        assert_eq!((paid.quote_input_tokens, paid.quote_max_tokens), (Some(13), Some(1000)));
+    }
+
+    #[tokio::test]
+    async fn a_retry_with_different_bytes_is_quoted_anew() {
+        // One more byte of whitespace is a different body: 51 bytes is still 13 tokens, but 53 is
+        // 14, so the old amount no longer matches and the client is told the new price.
+        let (app, calls, _, _) = app_token_priced(vec!["llama3"], None);
+        let padded = format!("{RATED_BODY}   ");
+        let (status, _, body) = send(app, token_request(&padded, Some(RATED_QUOTE))).await;
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{body}");
+        assert!(challenge_error(&body).unwrap().contains("now costs 15042"), "{body}");
+        assert_eq!(calls.verifies(), 0);
+    }
+
+    /// Send a paid request with `body` to a token-priced gateway over `models`, and check it was
+    /// refused as an unpriced model before payment. Returns the refusal's `error`.
+    async fn refused_as_unpriced(models: Vec<&str>, body: &str) -> String {
+        let (app, calls, forwards, sink) = app_token_priced(models, None);
+        let (status, _, response) = send(app, token_request(body, Some(RATED_QUOTE))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        assert_eq!((calls.verifies(), calls.settles()), (0, 0), "no facilitator call for {body}");
+        assert_eq!(forwards.count(), 0, "the upstream was never called for {body}");
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::UnpricedModel, "{body}");
+        assert_eq!(event.access, Some(AccessPath::Payment), "{body}");
+        assert_eq!(event.backend.as_deref(), Some("rated"), "{body}");
+        assert!(event.offers.is_empty(), "nothing was quoted for {body}");
+        assert_eq!((event.quote_input_tokens, event.quote_max_tokens), (None, None), "{body}");
+        assert_eq!((event.cost, event.revenue.as_deref()), (Some("0".to_string()), Some("0")), "{body}");
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        json["error"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_model_without_a_rate_is_refused_before_payment() {
+        let error = refused_as_unpriced(
+            vec!["llama3", "unrated"],
+            r#"{"model":"unrated","max_tokens":10,"messages":[]}"#,
+        )
+        .await;
+        assert!(error.contains(r#"model "unrated" has no token rate"#), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_no_model_is_refused_as_unpriced_on_a_catch_all() {
+        // A catch-all serves a request that names no model, but no rate can apply to one.
+        let error =
+            refused_as_unpriced(vec![], r#"{"max_tokens":10,"messages":[]}"#).await;
+        assert!(error.contains("names no model"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_unpriced_refusal_bounds_and_escapes_the_model() {
+        // A catch-all routes any string, so the model named back is client text of any length.
+        let model = format!("a\\n{}", "b".repeat(1000));
+        let body = format!(r#"{{"model":"{model}","max_tokens":10,"messages":[]}}"#);
+        let error = refused_as_unpriced(vec![], &body).await;
+        assert!(!error.contains('\n'), "a raw newline reached the message: {error}");
+        assert!(error.contains(r#""a\nbbb"#), "quoted and escaped: {error}");
+        assert!(error.len() < 600, "bounded: {} bytes", error.len());
+    }
+
+    #[tokio::test]
+    async fn the_token_path_serves_an_unrated_model_unpriced() {
+        // A recognised caller is not priced, so token pricing's refusal never reaches it.
+        let (app, calls, forwards, sink) =
+            app_token_priced(vec!["llama3", "unrated"], Some(FakeTokenVerifier::honouring(HONOURED)));
+        let body = r#"{"model":"unrated","messages":[]}"#.to_string();
+        let (status, _, _) = send(app, post(body, false, Some(HONOURED))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(forwards.count(), 1);
+        assert_eq!((calls.verifies(), calls.settles()), (0, 0));
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::Served);
+        assert_eq!((event.quote_input_tokens, event.quote_max_tokens), (None, None));
+    }
+
+    #[tokio::test]
+    async fn the_quote_inputs_are_not_recorded_under_other_rates() {
+        let (app, sink) =
+            app_recording(FakeFacilitator::accepting(), FakeUpstream::streaming(), None);
+        send(app, completion_request(None)).await;
+        let event = sink.only();
+        assert_eq!(event.outcome, Outcome::PaymentRequired);
+        assert_eq!((event.quote_input_tokens, event.quote_max_tokens), (None, None));
     }
 }

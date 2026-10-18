@@ -30,7 +30,7 @@ use obolus::arming::{
     check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
-    parse_accepts, parse_extra, refuse_inert_rates, require_backend_costs, select_max_output_tokens,
+    parse_accepts, parse_extra, require_backend_costs, require_backend_rates, select_max_output_tokens,
     select_model_rates, select_pricing,
     select_promo, select_telemetry, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
     PricingChoice, SharedOffer, TelemetryChoice, EXTRA_VAR,
@@ -38,7 +38,7 @@ use obolus::config::{
 use obolus::backends::{load_backends, Backends};
 use obolus::facilitator::DelegatedFacilitator;
 use obolus::gateway::{router, Access, Gateway, SETTLE_RESERVE_SECS};
-use obolus::pricing::{CostPlus, PriceDeterminer, Promotional, StaticPrice};
+use obolus::pricing::{CostPlus, PriceDeterminer, Promotional, StaticPrice, TokenPrice};
 use obolus::telemetry::LineSink;
 use obolus::x402::PaymentRequirements;
 
@@ -258,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             // The single backend's token rates, validated here so a malformed value is reported
-            // before `refuse_inert_rates` below refuses valid ones as unread.
+            // before `require_backend_rates` below checks them against the selected rate.
             let backends = Backends::single_ollama(&upstream_url, head_timeout);
             match select_model_rates(|k| std::env::var(k))? {
                 Some(rates) => backends.with_sole_rates(rates),
@@ -354,10 +354,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Which rate prices each request (#57). Unset or `static` keeps the armed per-option amounts;
-    // `cost-plus` determines the amount from a declared upstream cost and margin. Selected here,
+    // `cost-plus` determines the amount from a declared upstream cost and margin, and `token` from
+    // per-model token rates (#31). Selected here,
     // before the arming guard and the banner, for the same reason the supersession refusals in the
     // requirements block are early: a pricing configuration this process will refuse must never
-    // first advertise a price, and cost-plus makes the per-option amount inert — which the banner
+    // first advertise a price, and cost-plus and token make the per-option amount inert — which the banner
     // below must then not print as if a client would pay it. `OBOLUS_ACCEPTS` and `OBOLUS_PRICE` are
     // already mutually exclusive by here (the block above refuses both at once), so the inert-amount
     // refusals inside can fire on at most one of them.
@@ -400,9 +401,10 @@ async fn main() -> anyhow::Result<()> {
     // naming the backends. `select_pricing` sees only the environment and `load_backends` only the
     // file — this is the one place that holds both.
     require_backend_costs(&backends, pricing)?;
-    // Declared token rates have validated by here (per entry, or `select_model_rates`), but no rate
-    // in this version reads them; refused as inert until token pricing lifts this (#31).
-    refuse_inert_rates(&backends, pricing)?;
+    // The rates twin, for declared token rates, which have validated by here (per entry, or
+    // `select_model_rates`): token pricing needs every backend to declare some, and under any
+    // other rate they would sit unread (#31).
+    require_backend_rates(&backends, pricing)?;
     // Sealed now the rate is known and every cost is settled. Shared, so the banner below can read it.
     let backends = Arc::new(backends);
 
@@ -469,13 +471,15 @@ async fn main() -> anyhow::Result<()> {
     //
     // The base is built explicitly even for static (which the constructor already defaults to) so a
     // promotion has a determiner to wrap uniformly: `Promotional` discounts whatever its base quotes,
-    // static or cost-plus alike. Installing `StaticPrice` explicitly is the same behaviour as the
+    // static, cost-plus or token alike. Installing `StaticPrice` explicitly is the same behaviour as the
     // default.
     let base: Arc<dyn PriceDeterminer> = match pricing {
         PricingChoice::Static => Arc::new(StaticPrice),
         // The cost is not here: it lives on each backend and the determiner reads it per request
         // (see `CostPlus`). The margin is the gateway-wide half.
         PricingChoice::CostPlus { margin_bps, .. } => Arc::new(CostPlus::new(margin_bps)),
+        // The rates live on each backend and the determiner reads them per request.
+        PricingChoice::Token => Arc::new(TokenPrice),
     };
     let determiner: Arc<dyn PriceDeterminer> = match promo {
         None => base,
@@ -483,6 +487,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let gateway =
         gateway.with_price_determiner(determiner).with_max_output_tokens(max_output_tokens);
+    // Token pricing's allowlist: a paid request for a model with no rate is refused before it is
+    // quoted. Set from the same `pricing` the base determiner above was chosen by.
+    let gateway = match pricing {
+        PricingChoice::Token => gateway.with_model_rates_required(),
+        PricingChoice::Static | PricingChoice::CostPlus { .. } => gateway,
+    };
 
     // The bearer-token path and the access surface it joins, here — after the arming guard and
     // `Gateway::new`, before the first posture line below — so that every configuration refusal this
@@ -681,14 +691,31 @@ async fn main() -> anyhow::Result<()> {
             Some(c) => format!(", cost {c} atomic units"),
             None => String::new(),
         };
+        // The declared token rates, likewise: present exactly under token pricing (the coverage
+        // check refuses them under any other rate), where they are what this backend's requests
+        // are quoted from. Model names are operator text, so escaped like the rest.
+        let rates = if backend.rates.is_empty() {
+            String::new()
+        } else {
+            let each = backend
+                .rates
+                .iter()
+                .map(|(model, rate)| {
+                    format!("{} in {} out {}", legible(model), rate.input, rate.output)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(", token rates per million tokens in atomic units: {each}")
+        };
         eprintln!(
-            "obolus: upstream (inference) -> backend {} kind {} at {} ({}, serves {}{})",
+            "obolus: upstream (inference) -> backend {} kind {} at {} ({}, serves {}{}{})",
             legible(&backend.id),
             backend.kind,
             legible(&backend.base_url),
             if backend.has_key { "keyed" } else { "keyless" },
             models,
             cost,
+            rates,
         );
     }
     // The unconditional half of the posture: true on every instance, armed or not. The
@@ -712,6 +739,12 @@ async fn main() -> anyhow::Result<()> {
         PricingChoice::CostPlus { margin_bps, .. } => eprintln!(
             "obolus: pricing: cost-plus — every request quoted at its backend's declared cost \
              + {margin_bps} bps margin (each backend's cost is on its line above)."
+        ),
+        PricingChoice::Token => eprintln!(
+            "obolus: pricing: token — every paid request quoted at ceil((ceil(body bytes / 4) x \
+             input rate + max_tokens x output rate) / 1000000) from its model's rates on its \
+             backend (each backend's rates are on its line above); a paid request for a model \
+             with no rate is refused with a 400 before it is quoted."
         ),
     }
     // The promotional line, when a discount is configured. Its parameters, like the rate line: the
@@ -740,6 +773,12 @@ async fn main() -> anyhow::Result<()> {
             // option without it rather than a number no client would pay.
             PricingChoice::CostPlus { .. } => eprintln!(
                 "obolus:   - network {} / asset {} / pay-to {} / priced by the cost-plus rate above",
+                legible(&r.network),
+                legible(&r.asset),
+                legible(&r.pay_to)
+            ),
+            PricingChoice::Token => eprintln!(
+                "obolus:   - network {} / asset {} / pay-to {} / priced by the token rate above",
                 legible(&r.network),
                 legible(&r.asset),
                 legible(&r.pay_to)

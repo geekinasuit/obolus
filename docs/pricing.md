@@ -52,7 +52,7 @@ payment requirement.
 
 ```rust
 struct PriceContext<'a> {
-    request: &'a RequestShape, // what the body asked for: its model, if any, and max_tokens
+    request: &'a RequestShape, // what the body asked for: its model, if any, max_tokens, and its length
     backend: &'a Backend,     // the backend it routed to (id, kind, models, precedence, …)
     requirement: &'a PaymentRequirements, // the one advertised option being priced
 }
@@ -82,8 +82,8 @@ Three properties are load-bearing:
 
 The determiner is called **once per advertised requirement**, on **every paying-path request that
 passes routing and the output cap**, paid or not — the token bypass returns before pricing is ever
-consulted, and a request refused earlier (unroutable, an ambiguous key, or the output cap below) is
-never priced, but an unpaid request that gets a 402 is priced, because the challenge has to state
+consulted, and a request refused earlier (unroutable, an ambiguous key, the output cap below, or,
+under token pricing, a model with no rate) is never priced, but an unpaid request that gets a 402 is priced, because the challenge has to state
 the amount, and a paid one is priced because its settlement charges that quote. It already receives the routed
 `backend` and the request's `model`, so per-backend and per-model policies have the context they
 need without any further plumbing.
@@ -92,8 +92,8 @@ A request is priced only once it has passed the output cap (`OBOLUS_MAX_OUTPUT_T
 request a determiner sees was read in full and carries a `max_tokens` from 1 to the cap, and on an
 `openai-compat` backend carries no `max_completion_tokens`, no `best_of`, and no `n` other than 1
 (Ollama has none of those fields). So, per backend kind, it asks for one completion of at most the
-cap, which bounds the worst-case output a quote must cover. Pricing by that bound is later work
-([#31](https://github.com/geekinasuit/obolus/issues/31)).
+cap, which bounds the worst-case output a quote must cover. Token pricing (below) prices output at
+exactly that bound ([#31](https://github.com/geekinasuit/obolus/issues/31)).
 
 ## Rate structures
 
@@ -136,12 +136,65 @@ one atomic cost is well-defined only against one asset — so the *cost* varies 
 *denomination* does not. How costs are declared, and the boot refusals that keep every backend
 covered, are in [The granularity decision](#the-granularity-decision) below.
 
+**`TokenPrice` — per-model token rates.** Each request is quoted from the rates its model has on
+the routed backend (see [Token rates](#token-rates) for how they are declared):
+
+```
+input_tokens = ceil(body_bytes / 4)
+quote        = ceil((input_tokens * input_rate + max_tokens * output_rate) / 1000000)
+```
+
+Rates are in atomic units per million tokens. `body_bytes` is the length of the whole request body
+as received, not just the prompt text: it is what the gateway forwards, and the gateway does not
+otherwise interpret the message format. `max_tokens` is the request's own, which the output cap
+has already required to be from 1 to the cap. Both divisions round up, so a fraction of a token or
+of an atomic unit is charged as a whole one rather than given away.
+
+Worked example, in USDC (6 decimals): $3 per million input tokens (`"3000000"`), $15 per million
+output tokens (`"15000000"`), a 2 KB body (2048 bytes) and `max_tokens` 1000.
+
+```
+input_tokens = ceil(2048 / 4)                          = 512
+input        = 512 * 3000000                           = 1536000000
+output       = 1000 * 15000000                         = 15000000000
+quote        = ceil((1536000000 + 15000000000) / 1000000) = 16536 atomic units = $0.016536
+```
+
+The rates are the client's price. Nothing is marked up, so a cost or a margin under this rate is a
+boot refusal (below). The output is priced at the most the request asked for, because the quote
+comes before anything is generated: a request that stops early has paid for tokens it did not
+receive. A finer output price, and a remedy for that overpayment, are tracked in
+[#120](https://github.com/geekinasuit/obolus/issues/120). The quote's two inputs, the input
+estimate and `max_tokens`, are recorded on each paid request's telemetry event (see
+[telemetry](telemetry.md)).
+
+**A model with no rate is refused, not priced some other way.** Under token pricing, a paid request
+for a model its backend has no rate for, or one that names no model (which a catch-all backend
+would otherwise take), is answered `400` after the output cap and before it is quoted, verified or
+charged. There is no fallback to the flat amount. The bearer-token path is not priced, so it is
+unaffected.
+
+**A paid retry must resend the same bytes.** The quote depends only on the body, the routed
+backend's rates and the boot configuration, so a retry carrying the identical body is quoted the
+amount its challenge was, and its payment matches. A client that re-serializes the body between
+the challenge and the retry (different whitespace or key order) may change its length, is quoted
+anew, and gets a re-challenge saying the resource now costs the new amount.
+
+The arithmetic is checked: an overflow anywhere quotes `u128::MAX`, which no client can pay, the
+same fail-closed direction as `CostPlus`. So do the cases the gateway's checks make unreachable — a
+model with no rate, a `max_tokens` that is not a limit — and a computed zero, which the boot rules
+rule out (a rate with both sides `0` is refused, and `max_tokens` is at least 1) but which would
+otherwise reach the unsupported zero-amount settle
+([#67](https://github.com/geekinasuit/obolus/issues/67)).
+
+Like cost-plus, token pricing is **single-chain**: a rate is in atomic units of one asset.
+
 **`Promotional` — a time-bounded discount over a base rate.** A promotion is a percentage off,
 active during a `[start, end)` window (Unix seconds, `start` inclusive, `end` exclusive): inside
 the window the quote is the base rate's quote marked *down* by a discount in basis points; outside
 it the base rate applies unchanged. It is a **modifier**, not a rate of its own — `OBOLUS_PRICING`
-still selects the base (`static` or `cost-plus`), and the promotional variables wrap whatever that
-produces.
+still selects the base (`static`, `cost-plus` or `token`), and the promotional variables wrap
+whatever that produces.
 
 The discount is a *percentage*, deliberately, not a fixed atomic amount: a percentage is
 asset-agnostic, so one promotion is correct across payment options whose assets carry different
@@ -179,9 +232,10 @@ The pricing rate is selected by environment variables, parsed at boot by `select
 
 | Variable | Meaning |
 |---|---|
-| `OBOLUS_PRICING` | The rate: unset or `static` (the default — each option keeps its own configured amount), or `cost-plus`. |
+| `OBOLUS_PRICING` | The rate: unset or `static` (the default — each option keeps its own configured amount), `cost-plus`, or `token`. |
 | `OBOLUS_UPSTREAM_COST` | Cost-plus, single-backend only: the sole backend's cost, in atomic units. With a backends file the cost is declared per entry instead (a `"cost"` on each backend), and this variable is refused alongside the file. |
 | `OBOLUS_MARGIN_BPS` | Cost-plus only: the gateway-wide margin, in basis points (`10000` = 100%). Required under `cost-plus`. |
+| `OBOLUS_MODEL_RATES` | Token pricing, single-backend only: the sole backend's per-model rates (see [Token rates](#token-rates)). With a backends file the rates are declared per entry instead, and this variable is refused alongside the file. |
 | `OBOLUS_PROMO_DISCOUNT_BPS` | Promotional discount off the selected rate, in basis points (`2500` = 25% off). Set with the two window variables — all three, or none. Must be in `1..10000`: a zero discount and a discount of 100% or more are both refused. |
 | `OBOLUS_PROMO_START` | When the promotional window opens, Unix seconds (inclusive). |
 | `OBOLUS_PROMO_END` | When the promotional window closes, Unix seconds (exclusive). Must be after `OBOLUS_PROMO_START`, and not already in the past at boot. |
@@ -217,10 +271,12 @@ with a `models` list, a rate for a model not on it is refused as a likely typo. 
 and the single backend, accept any model name. Names match exactly, as routing does, so a case
 variant is a distinct model.
 
-**No rate reads them yet.** Token pricing, which will, is a later release
-([#31](https://github.com/geekinasuit/obolus/issues/31)). Until then valid rates are refused at
-boot as inert (`refuse_inert_rates`), after validation, so a malformed rate is still reported with
-its specific defect.
+**Only token pricing reads them** ([#31](https://github.com/geekinasuit/obolus/issues/31)). After
+validation, so that a malformed rate is still reported with its specific defect,
+`require_backend_rates` checks them against the selected rate: under `token` every backend must
+declare at least one rate, and under any other rate a declared rate is refused as inert. A backend
+that rates some of its models and not others is accepted; a paid request for one of the unrated
+models is the per-request `400` described under `TokenPrice` above.
 
 ### Boot refusals
 
@@ -231,7 +287,7 @@ follows). The rate parameters, not a computed quote, are what the banner prints 
 does start: per-backend cost makes quotes vary, so a single boot-time number would drift — the
 margin is stated once on the rate line and each backend's cost on its own line.
 
-- **Unknown rate.** `OBOLUS_PRICING` names something that is neither `static` nor `cost-plus`
+- **Unknown rate.** `OBOLUS_PRICING` names something that is not `static`, `cost-plus` or `token`
   (a typo, or an unexpanded `${VAR}` that arrived empty) — refused rather than guessed, so a
   mistyped rate never silently falls back to a price the operator did not choose.
 - **Missing / malformed / zero cost or margin.** Cost-plus infers no money value, so a missing
@@ -259,8 +315,14 @@ margin is stated once on the rate line and each backend's cost on its own line.
 - **Orphaned cost-plus parameters.** `OBOLUS_UPSTREAM_COST` / `OBOLUS_MARGIN_BPS` set without
   `cost-plus` selected would sit inert — refused rather than dropped. Its per-backend twin: a
   backend that declares a `"cost"` under a non-cost-plus rate is refused too, naming the entry.
-- **Token rates.** Malformed rates are refused naming the backend, model and field; valid ones
-  are refused as inert, naming the backends, because no rate in this version reads them (see
+  Both hold under `token` as under `static`: token rates are the client's price, with no cost to
+  mark up and no margin on top.
+- **Token pricing alongside multi-chain `OBOLUS_ACCEPTS`, or an explicit `OBOLUS_PRICE`.** Refused
+  for cost-plus's reasons: a rate is in atomic units of one asset, and under rates a configured
+  price would sit inert.
+- **Token rates.** Malformed rates are refused naming the backend, model and field. Under `token`,
+  a backend that declares no rates is refused, naming it, since it could serve no paid request;
+  under any other rate, valid rates are refused as inert, naming the backends (see
   [Token rates](#token-rates)). `OBOLUS_MODEL_RATES` alongside a backends file, or set but empty,
   is refused too.
 - **Incomplete or invalid promotional window.** The three promotional variables are all-or-none; a
@@ -338,9 +400,9 @@ flowchart TB
   reqs --> sel["select_pricing (env)<br/>rate + gateway-wide margin"]
   sel --> cov{"require_backend_costs:<br/>cost-plus → every backend has a cost?<br/>other rate → no backend has a cost?"}
   cov -->|"no → name the offending ids"| refuse(["refuse to start"])
-  cov -->|"yes"| inert{"refuse_inert_rates:<br/>does any backend declare token rates?"}
-  inert -->|"yes → name the backends"| refuse
-  inert -->|"no"| arm["check_arming → witness"]
+  cov -->|"yes"| rates{"require_backend_rates:<br/>token → every backend has rates?<br/>other rate → no backend has rates?"}
+  rates -->|"no → name the offending ids"| refuse
+  rates -->|"yes"| arm["check_arming → witness"]
   arm --> gw["build gateway + install determiner"]
   gw --> banner["banner (rate parameters, not a quote)"]
 ```

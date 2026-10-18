@@ -116,6 +116,11 @@ pub enum Outcome {
     /// generate more (#31). Refused with a 400 on the paying path, after routing and
     /// before pricing, so it has a backend but no offers, and was never charged.
     OutputCapRefused,
+    /// Under token pricing, a paid request named a model its backend has no token rate for, or
+    /// named no model at all (#31). Refused with a 400 on the paying path, after the output cap and
+    /// before pricing, so like [`Outcome::OutputCapRefused`] it has a backend but no offers, and
+    /// was never charged.
+    UnpricedModel,
     /// A recognised caller was served on the token path.
     Served,
     /// No payment was presented; the client was challenged.
@@ -196,7 +201,8 @@ pub struct RequestEvent {
     /// The model the request named, bounded by [`MAX_MODEL_BYTES`].
     pub model: Option<String>,
     /// Every option this request was quoted, at its determined price. Empty off the payment path,
-    /// and on [`Outcome::OutputCapRefused`], which is refused before anything is quoted.
+    /// and on [`Outcome::OutputCapRefused`] and [`Outcome::UnpricedModel`], which are refused
+    /// before anything is quoted.
     pub offers: Vec<Offer>,
     /// The offer the client's payment matched, once one did.
     pub paid: Option<Offer>,
@@ -210,6 +216,13 @@ pub struct RequestEvent {
     pub revenue: Option<String>,
     /// The settlement transaction, on [`Outcome::Settled`] when the facilitator reported one.
     pub transaction: Option<String>,
+    /// Under token pricing, the input-token estimate the quote was computed from
+    /// ([`crate::pricing::estimated_input_tokens`]). `None` under any other rate, off the payment
+    /// path, and for a request refused before it was quoted.
+    pub quote_input_tokens: Option<u64>,
+    /// Under token pricing, the request's `max_tokens`, which the quote prices output at. `None`
+    /// exactly when [`RequestEvent::quote_input_tokens`] is.
+    pub quote_max_tokens: Option<u64>,
 }
 
 /// The facts the gateway gathers while serving one request, from which a [`RequestEvent`] is built.
@@ -231,6 +244,8 @@ pub struct Trace {
     /// Whether `settle` was called — the fact that makes an abandoned request's revenue unknowable.
     pub settle_attempted: bool,
     pub transaction: Option<String>,
+    pub quote_input_tokens: Option<u64>,
+    pub quote_max_tokens: Option<u64>,
 }
 
 impl Trace {
@@ -252,6 +267,7 @@ impl Trace {
             | Outcome::Unroutable
             | Outcome::AmbiguousKey
             | Outcome::OutputCapRefused
+            | Outcome::UnpricedModel
             | Outcome::Served
             | Outcome::PaymentRequired
             | Outcome::PaymentMalformed
@@ -276,6 +292,8 @@ impl Trace {
             cost,
             revenue,
             transaction: self.transaction,
+            quote_input_tokens: self.quote_input_tokens,
+            quote_max_tokens: self.quote_max_tokens,
         }
     }
 }
@@ -544,6 +562,8 @@ mod tests {
             upstream_status: Some(200),
             settle_attempted: true,
             transaction: None,
+            quote_input_tokens: None,
+            quote_max_tokens: None,
         }
     }
 
@@ -646,9 +666,18 @@ mod tests {
                 r#""offers":[{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"}],"#,
                 r#""paid":{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"},"#,
                 r#""upstream_invoked":true,"upstream_status":200,"cost":"800","revenue":"1000","#,
-                r#""transaction":"0xTEST-TX"}"#,
+                r#""transaction":"0xTEST-TX","quote_input_tokens":null,"quote_max_tokens":null}"#,
             )
         );
+    }
+
+    #[test]
+    fn a_token_priced_line_carries_the_quote_inputs() {
+        // docs/telemetry.md shows these two fields' token-pricing form.
+        let trace =
+            Trace { quote_input_tokens: Some(512), quote_max_tokens: Some(1000), ..paid_trace() };
+        let line = json_line(&trace.finish(Outcome::Settled, TS));
+        assert!(line.ends_with(r#""quote_input_tokens":512,"quote_max_tokens":1000}"#), "{line}");
     }
 
     #[test]
@@ -660,7 +689,8 @@ mod tests {
             concat!(
                 r#"{"v":1,"kind":"request","ts_ms":0,"outcome":"unroutable","access":null,"backend":null,"model":null,"#,
                 r#""offers":[],"paid":null,"upstream_invoked":false,"upstream_status":null,"#,
-                r#""cost":"0","revenue":"0","transaction":null}"#,
+                r#""cost":"0","revenue":"0","transaction":null,"quote_input_tokens":null,"#,
+                r#""quote_max_tokens":null}"#,
             )
         );
     }
