@@ -194,6 +194,34 @@ The promotional variables are a **modifier** layered over whichever rate `OBOLUS
 parsed separately by `select_promo`; they do not change the rate choice, and unset they leave the
 selected rate untouched.
 
+### Token rates
+
+Per-model token rates are declared where cost is: a `"rates"` object on a backends-file entry, or
+`OBOLUS_MODEL_RATES` (the same object) for the single backend.
+
+```json
+"rates": {"llama3": {"input": "3000000", "output": "15000000"}}
+```
+
+Each value is a decimal string in the advertised asset's **atomic units per million tokens**,
+written like `cost`. For USDC (6 decimals), `"3000000"` is $3 per million tokens. `input` prices
+prompt tokens and `output` generated ones; both are required, and no other key is accepted.
+
+Rates are validated at boot by one function for both doors. A value must be ASCII digits only, so
+a sign, decimal, exponent or a JSON number is refused, as is anything a `u128` cannot hold. A
+missing or unknown key, a repeated model or key, an empty object or model name, and a rate whose
+`input` and `output` are both `0` are refused too. The both-zero case is refused because every
+quote would be 0, and a zero-amount settle is unsupported
+([#67](https://github.com/geekinasuit/obolus/issues/67)); one zero side is allowed. On an entry
+with a `models` list, a rate for a model not on it is refused as a likely typo. A catch-all entry,
+and the single backend, accept any model name. Names match exactly, as routing does, so a case
+variant is a distinct model.
+
+**No rate reads them yet.** Token pricing, which will, is a later release
+([#31](https://github.com/geekinasuit/obolus/issues/31)). Until then valid rates are refused at
+boot as inert (`refuse_inert_rates`), after validation, so a malformed rate is still reported with
+its specific defect.
+
 ### Boot refusals
 
 A gateway that priced wrongly — or advertised an amount it would not charge — is worse than one
@@ -231,6 +259,10 @@ margin is stated once on the rate line and each backend's cost on its own line.
 - **Orphaned cost-plus parameters.** `OBOLUS_UPSTREAM_COST` / `OBOLUS_MARGIN_BPS` set without
   `cost-plus` selected would sit inert — refused rather than dropped. Its per-backend twin: a
   backend that declares a `"cost"` under a non-cost-plus rate is refused too, naming the entry.
+- **Token rates.** Malformed rates are refused naming the backend, model and field; valid ones
+  are refused as inert, naming the backends, because no rate in this version reads them (see
+  [Token rates](#token-rates)). `OBOLUS_MODEL_RATES` alongside a backends file, or set but empty,
+  is refused too.
 - **Incomplete or invalid promotional window.** The three promotional variables are all-or-none; a
   partial set is refused, naming what is missing, rather than silently dropped (the `select_promo`
   twin of orphaned cost-plus parameters). And each of a zero discount (a promotion that discounts
@@ -257,7 +289,8 @@ resolves it by separating the axes.
 - **Per-model cost.** The seam already carries `model`, so this is a config-shape question, not a
   structural one. Deferred because a backend commonly maps to one upstream pricing tier, and
   per-model cost multiplies configuration for a need that has not yet appeared. Deferring it costs
-  nothing structurally.
+  nothing structurally. Per-model *token rates* are a separate thing, for token pricing; see
+  [Token rates](#token-rates).
 - **Per-client pricing.** Needs a notion of client identity that the stateless gateway does not
   have. Out of scope for the current milestone.
 - **Cross-asset (multi-chain) cost-plus.** The denomination crossing. See below.
@@ -305,7 +338,9 @@ flowchart TB
   reqs --> sel["select_pricing (env)<br/>rate + gateway-wide margin"]
   sel --> cov{"require_backend_costs:<br/>cost-plus → every backend has a cost?<br/>other rate → no backend has a cost?"}
   cov -->|"no → name the offending ids"| refuse(["refuse to start"])
-  cov -->|"yes"| arm["check_arming → witness"]
+  cov -->|"yes"| inert{"refuse_inert_rates:<br/>does any backend declare token rates?"}
+  inert -->|"yes → name the backends"| refuse
+  inert -->|"no"| arm["check_arming → witness"]
   arm --> gw["build gateway + install determiner"]
   gw --> banner["banner (rate parameters, not a quote)"]
 ```
