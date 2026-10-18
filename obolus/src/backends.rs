@@ -37,13 +37,14 @@
 //! fail-loud exists to prevent. Two backends that name the same alias at the same precedence are
 //! refused too — the route would be ambiguous — as are two backends sharing an `id`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::HeaderValue;
 use serde::Deserialize;
 
-use crate::arming::escape_controls;
+use crate::arming::{escape_controls, legible};
 use crate::upstream::{OllamaUpstream, Upstream};
 
 /// The wire protocol a backend speaks. A closed set on purpose: an operator's `kind` string is
@@ -100,6 +101,266 @@ struct BackendEntry {
     /// up per request.
     #[serde(default)]
     cost: Option<String>,
+    /// Per-model token rates, `{"<model>": {"input": "<atomic>", "output": "<atomic>"}}`, kept
+    /// loose here and validated in [`build_backend`]: a shape error raised inside serde would
+    /// surface as [`BackendError::Malformed`], which cannot name the backend, the model or the
+    /// field. `None` when absent, so an absent `rates` and an empty `{}` stay distinguishable.
+    #[serde(default)]
+    rates: Option<Loose<Loose<serde_json::Value>>>,
+}
+
+/// One model's token rates, in the advertised asset's atomic units **per million tokens** — for
+/// USDC (6 decimals), `3_000_000` is $3 per million. Read by token pricing (#31); no rate in this
+/// version reads it, so a configured rate is refused at boot as inert (see
+/// [`crate::config::refuse_inert_rates`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenRate {
+    /// Per million prompt tokens.
+    pub input: u128,
+    /// Per million generated tokens.
+    pub output: u128,
+}
+
+/// A backend's token rates by model name, matched exactly, as routing matches `models`. Ordered,
+/// so anything that lists them does so in a fixed order. Empty when none are declared: an empty
+/// `rates` object is refused, so empty can only mean absent.
+pub type ModelRates = BTreeMap<String, TokenRate>;
+
+/// A JSON value read without letting serde's map collapse repeated keys: serde_json keeps the last
+/// of two equal keys, which would silently drop a rate. An object keeps every entry in order; any
+/// other value keeps only what kind of value it was, for the refusal to name.
+#[derive(Debug)]
+enum Loose<V> {
+    Object(Vec<(String, V)>),
+    Other(&'static str),
+}
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for Loose<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+        struct LooseVisitor<V>(std::marker::PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for LooseVisitor<V> {
+            type Value = Loose<V>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry::<String, V>()? {
+                    entries.push(entry);
+                }
+                Ok(Loose::Object(entries))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Loose::Other("an array"))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(Loose::Other("a string"))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(Loose::Other("a boolean"))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(Loose::Other("a number"))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(Loose::Other("a number"))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(Loose::Other("a number"))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(Loose::Other("null"))
+            }
+        }
+
+        deserializer.deserialize_any(LooseVisitor(std::marker::PhantomData))
+    }
+}
+
+/// What is wrong with a `rates` object. The caller adds where it came from — a backend in the
+/// backends file ([`BackendError::BadRates`]) or `OBOLUS_MODEL_RATES`. Every model name, key and
+/// value is operator text, so each is rendered through [`legible`] (#16).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RateDefect {
+    /// The env-var text is not JSON at all. Carries serde's message, control characters escaped.
+    #[error("not valid JSON: {0}")]
+    NotJson(String),
+
+    #[error(
+        "rates must be a JSON object mapping each model to {{\"input\",\"output\"}} rates, \
+         not {found}"
+    )]
+    NotAnObject { found: &'static str },
+
+    #[error("rates is an empty object: declare a rate for at least one model, or remove it")]
+    Empty,
+
+    #[error("rates has an empty model name; each key must name a model")]
+    EmptyModel,
+
+    #[error("rates names model {} more than once", legible(.model))]
+    DuplicateModel { model: String },
+
+    /// The typo guard: a backend that lists its `models` serves exactly those, so a rate for any
+    /// other name could never apply.
+    #[error(
+        "rates names model {}, which is not in this backend's models list, so its rate could \
+         never apply. Is it a typo?",
+        legible(.model)
+    )]
+    UnservedModel { model: String },
+
+    #[error(
+        "model {}: a rate must be an object {{\"input\",\"output\"}}, not {found}",
+        legible(.model)
+    )]
+    RateNotAnObject { model: String, found: &'static str },
+
+    #[error(
+        "model {}: unknown key {}; a rate has exactly \"input\" and \"output\"",
+        legible(.model),
+        legible(.key)
+    )]
+    UnknownKey { model: String, key: String },
+
+    #[error("model {}: key {} appears more than once", legible(.model), legible(.key))]
+    DuplicateKey { model: String, key: String },
+
+    #[error("model {}: {field} is missing; a rate needs both \"input\" and \"output\"", legible(.model))]
+    MissingField { model: String, field: &'static str },
+
+    /// A JSON number, say. Written as a string for the reason `cost` is: an atomic amount can
+    /// exceed what a JSON number represents exactly.
+    #[error(
+        "model {}: {field} must be a string of atomic units per million tokens, like \"3000000\", \
+         not {found}",
+        legible(.model)
+    )]
+    NotAString { model: String, field: &'static str, found: &'static str },
+
+    #[error(
+        "model {}: {field} {} is not a non-negative integer in atomic units per million tokens \
+         (digits only: no sign, decimals, separators, spaces or exponent; \
+         no larger than a u128 holds)",
+        legible(.model),
+        legible(.value)
+    )]
+    BadValue { model: String, field: &'static str, value: String },
+
+    /// Both sides zero: every quote would be 0, and a zero-amount settle is unsupported (#67), the
+    /// same reason `OBOLUS_UPSTREAM_COST=0` is refused. One zero side is allowed.
+    #[error(
+        "model {}: input and output are both 0, so every quote would be 0, and a zero-amount \
+         settle is not supported. One side may be 0, not both.",
+        legible(.model)
+    )]
+    BothZero { model: String },
+}
+
+/// Parse a `rates` object given as JSON text — the single-backend `OBOLUS_MODEL_RATES` door.
+/// `served` is the backend's `models` list; empty for a catch-all, which accepts a rate for any
+/// model.
+pub fn parse_rates_json(raw: &str, served: &[String]) -> Result<ModelRates, RateDefect> {
+    let loose: Loose<Loose<serde_json::Value>> = serde_json::from_str(raw)
+        .map_err(|e| RateDefect::NotJson(escape_controls(&e.to_string())))?;
+    parse_rates(loose, served)
+}
+
+/// Validate a loosely-read `rates` object into [`ModelRates`]. The one place the rules live, for
+/// both the backends file and `OBOLUS_MODEL_RATES`.
+fn parse_rates(
+    raw: Loose<Loose<serde_json::Value>>,
+    served: &[String],
+) -> Result<ModelRates, RateDefect> {
+    let entries = match raw {
+        Loose::Object(entries) => entries,
+        Loose::Other(found) => return Err(RateDefect::NotAnObject { found }),
+    };
+    if entries.is_empty() {
+        return Err(RateDefect::Empty);
+    }
+    let mut rates = ModelRates::new();
+    for (model, rate) in entries {
+        if model.trim().is_empty() {
+            return Err(RateDefect::EmptyModel);
+        }
+        if rates.contains_key(&model) {
+            return Err(RateDefect::DuplicateModel { model });
+        }
+        // Exact match, as routing matches `models`: a case variant is a different model.
+        if !served.is_empty() && !served.contains(&model) {
+            return Err(RateDefect::UnservedModel { model });
+        }
+        let rate = parse_rate(&model, rate)?;
+        rates.insert(model, rate);
+    }
+    Ok(rates)
+}
+
+/// One model's `{"input","output"}` object.
+fn parse_rate(model: &str, raw: Loose<serde_json::Value>) -> Result<TokenRate, RateDefect> {
+    let fields = match raw {
+        Loose::Object(fields) => fields,
+        Loose::Other(found) => {
+            return Err(RateDefect::RateNotAnObject { model: model.to_string(), found })
+        }
+    };
+    let (mut input, mut output) = (None, None);
+    for (key, value) in fields {
+        let (field, slot) = match key.as_str() {
+            "input" => ("input", &mut input),
+            "output" => ("output", &mut output),
+            _ => return Err(RateDefect::UnknownKey { model: model.to_string(), key }),
+        };
+        if slot.is_some() {
+            return Err(RateDefect::DuplicateKey { model: model.to_string(), key });
+        }
+        *slot = Some(parse_rate_value(model, field, value)?);
+    }
+    let missing = |field| RateDefect::MissingField { model: model.to_string(), field };
+    let rate = TokenRate {
+        input: input.ok_or_else(|| missing("input"))?,
+        output: output.ok_or_else(|| missing("output"))?,
+    };
+    if rate.input == 0 && rate.output == 0 {
+        return Err(RateDefect::BothZero { model: model.to_string() });
+    }
+    Ok(rate)
+}
+
+/// A decimal string of ASCII digits, parsed as `u128`. The digit check comes first because Rust's
+/// unsigned `parse` accepts a leading `+`; the parse then catches overflow. Leading zeros are
+/// accepted, as they are for `cost`: `007` is still a decimal integer.
+fn parse_rate_value(
+    model: &str,
+    field: &'static str,
+    value: serde_json::Value,
+) -> Result<u128, RateDefect> {
+    use serde_json::Value;
+    let text = match value {
+        Value::String(text) => text,
+        other => {
+            let found = match other {
+                Value::Number(_) => "a number",
+                Value::Bool(_) => "a boolean",
+                Value::Null => "null",
+                Value::Array(_) => "an array",
+                Value::Object(_) => "an object",
+                Value::String(_) => unreachable!("matched above"),
+            };
+            return Err(RateDefect::NotAString { model: model.to_string(), field, found });
+        }
+    };
+    let digits_only = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    match text.parse::<u128>() {
+        Ok(rate) if digits_only => Ok(rate),
+        _ => Err(RateDefect::BadValue { model: model.to_string(), field, value: text }),
+    }
 }
 
 /// Why a backend configuration could not be turned into a registry. Every arm is a boot-time
@@ -219,6 +480,10 @@ pub enum BackendError {
          rate."
     )]
     ZeroCost { id: String },
+
+    /// A `rates` object that does not validate. The defect names the model and field.
+    #[error("backend {}: {defect}", legible(.id))]
+    BadRates { id: String, defect: RateDefect },
 }
 
 /// The registry of backends a gateway serves from.
@@ -265,6 +530,10 @@ pub struct Backend {
     /// routing never looks at it. `None` is refused at boot only when the cost-plus rate is
     /// selected (see [`crate::config::require_backend_costs`]).
     pub cost: Option<u128>,
+    /// The operator's declared per-model token rates, empty if none were declared. Read by token
+    /// pricing once it exists (#31); until then any declared rate is refused at boot as inert (see
+    /// [`crate::config::refuse_inert_rates`]).
+    pub rates: ModelRates,
     upstream: Arc<dyn Upstream>,
 }
 
@@ -301,6 +570,7 @@ impl std::fmt::Debug for Backend {
             .field("precedence", &self.precedence)
             .field("has_key", &self.has_key)
             .field("cost", &self.cost)
+            .field("rates", &self.rates)
             .finish_non_exhaustive()
     }
 }
@@ -345,6 +615,9 @@ impl Backends {
                 // The single-backend `OBOLUS_UPSTREAM_COST` path attaches its cost after the fact
                 // (see `main`), and the cost-plus rate refuses a costless backend at boot.
                 cost: None,
+                // No rates either: the single-backend `OBOLUS_MODEL_RATES` path attaches them
+                // after the fact, like the cost (`with_sole_rates`).
+                rates: ModelRates::new(),
                 upstream,
             }],
         }
@@ -356,6 +629,15 @@ impl Backends {
     pub fn with_sole_cost(mut self, cost: u128) -> Self {
         if let Some(sole) = self.entries.first_mut() {
             sole.cost = Some(cost);
+        }
+        self
+    }
+
+    /// Set the sole backend's token rates — the single-backend (`OBOLUS_MODEL_RATES`) path, the
+    /// rates twin of [`with_sole_cost`](Self::with_sole_cost), with the same one-entry caveat.
+    pub fn with_sole_rates(mut self, rates: ModelRates) -> Self {
+        if let Some(sole) = self.entries.first_mut() {
+            sole.rates = rates;
         }
         self
     }
@@ -425,6 +707,7 @@ impl Backend {
             precedence,
             has_key: false,
             cost: None,
+            rates: ModelRates::new(),
             upstream,
         }
     }
@@ -432,6 +715,12 @@ impl Backend {
     /// Attach a declared cost to a test backend, for exercising the per-backend cost-plus rate.
     pub fn with_cost(mut self, cost: u128) -> Self {
         self.cost = Some(cost);
+        self
+    }
+
+    /// Attach declared token rates to a test backend.
+    pub fn with_rates(mut self, rates: ModelRates) -> Self {
+        self.rates = rates;
         self
     }
 
@@ -534,7 +823,7 @@ fn build_backend<R>(
 where
     R: Fn(&str) -> std::io::Result<Vec<u8>>,
 {
-    let BackendEntry { id, kind, base_url, key_file, models, precedence, cost } = entry;
+    let BackendEntry { id, kind, base_url, key_file, models, precedence, cost, rates } = entry;
 
     if id.trim().is_empty() {
         return Err(BackendError::EmptyId);
@@ -556,6 +845,14 @@ where
             Ok(0) => return Err(BackendError::ZeroCost { id }),
             Ok(cost) => Some(cost),
             Err(_) => return Err(BackendError::BadCost { id, value: raw }),
+        },
+    };
+    // After `models` is checked, because the typo guard compares against it.
+    let rates = match rates {
+        None => ModelRates::new(),
+        Some(raw) => match parse_rates(raw, &models) {
+            Ok(rates) => rates,
+            Err(defect) => return Err(BackendError::BadRates { id, defect }),
         },
     };
 
@@ -593,6 +890,7 @@ where
         precedence,
         has_key,
         cost,
+        rates,
         upstream,
     })
 }
@@ -977,5 +1275,237 @@ mod tests {
         let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h","cost":"0"}]"#;
         let err = load_backends(raw, T, no_key).unwrap_err();
         assert!(matches!(&err, BackendError::ZeroCost { id } if id == "x"), "got {err:?}");
+    }
+
+    // --- per-model token rates (#31) ---
+
+    /// A one-backend file whose entry carries `rates` (a JSON fragment) and, if given, a `models`
+    /// list (another fragment).
+    fn with_rates(models: Option<&str>, rates: &str) -> String {
+        let models = models.map(|m| format!(r#","models":{m}"#)).unwrap_or_default();
+        format!(r#"[{{"id":"b","kind":"ollama","baseUrl":"http://h"{models},"rates":{rates}}}]"#)
+    }
+
+    /// The rate defect a file with this `rates` fragment is refused with.
+    fn rate_defect(models: Option<&str>, rates: &str) -> RateDefect {
+        match load_backends(&with_rates(models, rates), T, no_key) {
+            Err(BackendError::BadRates { id, defect }) => {
+                assert_eq!(id, "b", "the refusal names the backend");
+                defect
+            }
+            other => panic!("expected a rates refusal for {rates}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rates_are_parsed_onto_the_backend_per_model() {
+        let raw = with_rates(
+            Some(r#"["llama3","mistral"]"#),
+            r#"{"llama3":{"input":"3000000","output":"15000000"},"mistral":{"input":"0","output":"1"}}"#,
+        );
+        let registry = load_backends(&raw, T, no_key).unwrap();
+        let rates = &registry.backends()[0].rates;
+        assert_eq!(rates.len(), 2);
+        assert_eq!(rates["llama3"], TokenRate { input: 3_000_000, output: 15_000_000 });
+        assert_eq!(rates["mistral"], TokenRate { input: 0, output: 1 }, "one zero side is allowed");
+    }
+
+    #[test]
+    fn a_backend_without_rates_declares_none() {
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://h"}]"#;
+        assert!(load_backends(raw, T, no_key).unwrap().backends()[0].rates.is_empty());
+    }
+
+    #[test]
+    fn a_rate_up_to_u128_max_is_accepted_and_one_past_it_is_overflow() {
+        let max = u128::MAX.to_string();
+        let raw = with_rates(None, &format!(r#"{{"m":{{"input":"{max}","output":"1"}}}}"#));
+        assert_eq!(load_backends(&raw, T, no_key).unwrap().backends()[0].rates["m"].input, u128::MAX);
+
+        let past = "340282366920938463463374607431768211456"; // u128::MAX + 1
+        let defect = rate_defect(None, &format!(r#"{{"m":{{"input":"{past}","output":"1"}}}}"#));
+        assert!(matches!(&defect, RateDefect::BadValue { field: "input", .. }), "got {defect:?}");
+    }
+
+    #[test]
+    fn a_malformed_rate_value_is_refused_naming_the_model_and_field() {
+        // `+5` is the discriminating row: Rust's unsigned `parse` accepts a leading `+`.
+        for bad in ["+5", "-5", "1.5", "1e6", "1,000", " 5", "5 ", "", "0x10", "五"] {
+            let rates = format!(r#"{{"m":{{"input":"1","output":{}}}}}"#, serde_json::json!(bad));
+            let defect = rate_defect(None, &rates);
+            assert!(
+                matches!(&defect, RateDefect::BadValue { model, field: "output", value }
+                    if model == "m" && value == bad),
+                "{bad:?}: got {defect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rate_written_as_a_json_number_is_refused() {
+        // The same reason `cost` is a string: an atomic amount can exceed what a JSON number holds
+        // exactly. Every non-string shape is refused, naming what was found.
+        for (value, found) in [("3000000", "a number"), ("true", "a boolean"), ("null", "null"), ("[]", "an array")] {
+            let defect = rate_defect(None, &format!(r#"{{"m":{{"input":{value},"output":"1"}}}}"#));
+            assert_eq!(
+                defect,
+                RateDefect::NotAString { model: "m".into(), field: "input", found },
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_side_is_refused_naming_it() {
+        assert_eq!(
+            rate_defect(None, r#"{"m":{"input":"1"}}"#),
+            RateDefect::MissingField { model: "m".into(), field: "output" }
+        );
+        assert_eq!(
+            rate_defect(None, r#"{"m":{"output":"1"}}"#),
+            RateDefect::MissingField { model: "m".into(), field: "input" }
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_inside_a_rate_is_refused() {
+        assert_eq!(
+            rate_defect(None, r#"{"m":{"input":"1","output":"1","cached":"1"}}"#),
+            RateDefect::UnknownKey { model: "m".into(), key: "cached".into() }
+        );
+    }
+
+    #[test]
+    fn a_repeated_key_is_refused_rather_than_last_one_wins() {
+        // serde_json keeps the last of two equal keys, so either repeat would silently drop a rate.
+        assert_eq!(
+            rate_defect(None, r#"{"m":{"input":"1","output":"1"},"m":{"input":"2","output":"2"}}"#),
+            RateDefect::DuplicateModel { model: "m".into() }
+        );
+        assert_eq!(
+            rate_defect(None, r#"{"m":{"input":"1","input":"2","output":"1"}}"#),
+            RateDefect::DuplicateKey { model: "m".into(), key: "input".into() }
+        );
+    }
+
+    #[test]
+    fn a_rate_that_is_not_an_object_is_refused() {
+        assert_eq!(
+            rate_defect(None, r#"{"m":"3000000"}"#),
+            RateDefect::RateNotAnObject { model: "m".into(), found: "a string" }
+        );
+    }
+
+    #[test]
+    fn rates_that_are_not_an_object_are_refused() {
+        assert_eq!(rate_defect(None, r#"[]"#), RateDefect::NotAnObject { found: "an array" });
+        assert_eq!(rate_defect(None, r#""m""#), RateDefect::NotAnObject { found: "a string" });
+    }
+
+    #[test]
+    fn an_empty_rates_object_is_refused() {
+        assert_eq!(rate_defect(None, "{}"), RateDefect::Empty);
+    }
+
+    #[test]
+    fn an_empty_model_name_is_refused() {
+        for name in ["", "  "] {
+            let defect = rate_defect(None, &format!(r#"{{"{name}":{{"input":"1","output":"1"}}}}"#));
+            assert_eq!(defect, RateDefect::EmptyModel, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_rate_for_a_model_the_backend_does_not_serve_is_refused() {
+        // The typo guard: with a models list, a rate for a model that is not on it could never apply.
+        assert_eq!(
+            rate_defect(Some(r#"["llama3"]"#), r#"{"llama-3":{"input":"1","output":"1"}}"#),
+            RateDefect::UnservedModel { model: "llama-3".into() }
+        );
+    }
+
+    #[test]
+    fn a_catch_all_backend_accepts_a_rate_for_any_model() {
+        let raw = with_rates(None, r#"{"anything":{"input":"1","output":"2"}}"#);
+        assert!(load_backends(&raw, T, no_key).unwrap().backends()[0].rates.contains_key("anything"));
+    }
+
+    #[test]
+    fn case_variant_model_names_are_distinct_rates() {
+        // Routing matches `models` exactly, so `Llama3` and `llama3` are two models; each may carry
+        // its own rate.
+        let raw = with_rates(
+            Some(r#"["llama3","Llama3"]"#),
+            r#"{"llama3":{"input":"1","output":"1"},"Llama3":{"input":"2","output":"2"}}"#,
+        );
+        assert_eq!(load_backends(&raw, T, no_key).unwrap().backends()[0].rates.len(), 2);
+    }
+
+    #[test]
+    fn a_rate_whose_both_sides_are_zero_is_refused() {
+        // Every quote would be 0, and a zero-amount settle is unsupported (#67).
+        assert_eq!(
+            rate_defect(None, r#"{"m":{"input":"0","output":"0"}}"#),
+            RateDefect::BothZero { model: "m".into() }
+        );
+        // `00` is zero too.
+        assert_eq!(
+            rate_defect(None, r#"{"m":{"input":"00","output":"0"}}"#),
+            RateDefect::BothZero { model: "m".into() }
+        );
+    }
+
+    #[test]
+    fn a_rates_refusal_names_the_backend_model_and_field() {
+        let err = load_backends(&with_rates(None, r#"{"m":{"input":"1.5","output":"1"}}"#), T, no_key)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(r#"backend "b""#), "names the backend: {err}");
+        assert!(err.contains(r#"model "m""#), "names the model: {err}");
+        assert!(err.contains("input"), "names the field: {err}");
+        assert!(err.contains(r#""1.5""#), "quotes the value: {err}");
+    }
+
+    #[test]
+    fn a_hostile_model_name_in_a_rates_refusal_cannot_start_a_line() {
+        let forged = r#"m\nobolus: forged line"#; // JSON escapes: a newline and U+2028
+        for rates in [
+            format!(r#"{{"{forged}":{{"input":"x","output":"1"}}}}"#),
+            format!(r#"{{"m":{{"input":"1","output":"1","{forged}":"1"}}}}"#),
+        ] {
+            let message = load_backends(&with_rates(None, &rates), T, no_key).unwrap_err().to_string();
+            assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+            assert!(!message.contains('\u{2028}'), "a raw U+2028 reached the message: {message}");
+            assert!(message.contains(r#""m\nobolus: forged\u{2028}line""#), "quoted, escaped: {message}");
+        }
+        // And on the typo-guard path, where the name is checked against `models`.
+        let message =
+            load_backends(&with_rates(Some(r#"["m"]"#), &format!(r#"{{"{forged}":{{"input":"1","output":"1"}}}}"#)), T, no_key)
+                .unwrap_err()
+                .to_string();
+        assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+    }
+
+    #[test]
+    fn rates_text_parses_the_same_shape_for_the_single_backend() {
+        // The env-var door: the same object, validated by the same function, with no models list.
+        let rates = parse_rates_json(r#"{"m":{"input":"3000000","output":"15000000"}}"#, &[]).unwrap();
+        assert_eq!(rates["m"], TokenRate { input: 3_000_000, output: 15_000_000 });
+        assert_eq!(parse_rates_json("{}", &[]).unwrap_err(), RateDefect::Empty);
+        assert!(matches!(parse_rates_json("{not json", &[]).unwrap_err(), RateDefect::NotJson(_)));
+    }
+
+    #[test]
+    fn rates_text_that_is_not_json_cannot_start_a_line() {
+        let message = parse_rates_json("{\"m\n\u{2028}obolus: forged", &[]).unwrap_err().to_string();
+        assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+        assert!(!message.contains('\u{2028}'), "a raw U+2028 reached the message: {message}");
+    }
+
+    #[test]
+    fn the_sole_backend_takes_its_rates_after_the_fact() {
+        let rates = parse_rates_json(r#"{"m":{"input":"1","output":"2"}}"#, &[]).unwrap();
+        let registry = Backends::single_ollama("http://h", T).with_sole_rates(rates.clone());
+        assert_eq!(registry.backends()[0].rates, rates);
     }
 }

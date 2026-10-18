@@ -69,6 +69,7 @@ const OBOLUS_VARS: &[&str] = &[
     "OBOLUS_PRICING",
     "OBOLUS_UPSTREAM_COST",
     "OBOLUS_MARGIN_BPS",
+    "OBOLUS_MODEL_RATES",
     "OBOLUS_ALLOW_MAINNET",
     "OBOLUS_TOKEN_PUBKEY_FILE",
     "OBOLUS_TOKEN_KEYS",
@@ -782,6 +783,116 @@ fn the_backend_config_and_the_upstream_cost_at_once_refuse_to_start() {
 
     run.must_say("OBOLUS_UPSTREAM_COST");
     run.must_say("both set");
+    run.must_have_refused_during_startup();
+}
+
+// ---- per-model token rates (#31): validated, then refused as inert ----
+
+/// The inert-rates refusal's lead. Asserted present for valid rates and absent for malformed ones,
+/// so the two directions share one needle.
+const INERT_RATES: &str = "declare token rates";
+
+/// Needles for the two cost refusals that run just before the inert-rates one. Each orphan test
+/// asserts both absent, so it cannot pass on a cost refusal instead.
+const COST_REFUSALS: [&str; 2] = ["declare no cost", "declare a cost"];
+
+const VALID_RATES: &str = r#"{"llama3":{"input":"3000000","output":"15000000"}}"#;
+
+#[test]
+fn valid_rates_in_the_backends_file_are_refused_as_inert_under_every_rate() {
+    // Static: no backend may carry a cost, or the inert-cost refusal fires first.
+    let uncosted = temp_file(
+        "backends-rates-static.json",
+        &format!(r#"[{{"id":"rated","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"],"rates":{VALID_RATES}}}]"#),
+    );
+    // Cost-plus: every backend must carry a cost, or the missing-cost refusal fires first.
+    let costed = temp_file(
+        "backends-rates-cost-plus.json",
+        &format!(r#"[{{"id":"rated","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"],"cost":"1000","rates":{VALID_RATES}}}]"#),
+    );
+    for vars in [
+        vec![("OBOLUS_BACKENDS_FILE", uncosted.as_str())],
+        vec![
+            ("OBOLUS_BACKENDS_FILE", costed.as_str()),
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_MARGIN_BPS", "2500"),
+        ],
+    ] {
+        let run = run(&vars);
+        run.must_say(&format!(r#"{INERT_RATES}: "rated""#));
+        run.must_say("token pricing");
+        for needle in COST_REFUSALS {
+            run.must_not_say(needle);
+        }
+        run.must_have_refused_during_startup();
+        run.must_not_say(ADVERTISEMENT_LINE);
+    }
+}
+
+#[test]
+fn malformed_rates_in_the_backends_file_name_the_field_not_the_inert_refusal() {
+    let path = temp_file(
+        "backends-rates-bad.json",
+        r#"[{"id":"rated","kind":"ollama","baseUrl":"http://10.0.0.1","models":["llama3"],"rates":{"llama3":{"input":"3000000","output":3000000}}}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path)]);
+
+    run.must_say(r#"backend "rated""#);
+    run.must_say(r#"model "llama3": output must be a string"#);
+    run.must_not_say(INERT_RATES);
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn valid_model_rates_for_the_single_backend_are_refused_as_inert_under_every_rate() {
+    for vars in [
+        vec![("OBOLUS_MODEL_RATES", VALID_RATES)],
+        vec![
+            ("OBOLUS_MODEL_RATES", VALID_RATES),
+            ("OBOLUS_PRICING", "cost-plus"),
+            ("OBOLUS_UPSTREAM_COST", "1000"),
+            ("OBOLUS_MARGIN_BPS", "2500"),
+        ],
+    ] {
+        let run = run(&vars);
+        run.must_say(&format!(r#"{INERT_RATES}: "default""#));
+        for needle in COST_REFUSALS {
+            run.must_not_say(needle);
+        }
+        run.must_have_refused_during_startup();
+        run.must_not_say(ADVERTISEMENT_LINE);
+    }
+}
+
+#[test]
+fn malformed_model_rates_name_the_field_not_the_inert_refusal() {
+    let run = run(&[("OBOLUS_MODEL_RATES", r#"{"llama3":{"input":"+3","output":"1"}}"#)]);
+
+    run.must_say(r#"OBOLUS_MODEL_RATES: model "llama3": input "+3""#);
+    run.must_not_say(INERT_RATES);
+    run.must_have_refused_during_startup();
+    run.must_not_say(ADVERTISEMENT_LINE);
+}
+
+#[test]
+fn empty_model_rates_refuse_to_start() {
+    let run = run(&[("OBOLUS_MODEL_RATES", "")]);
+
+    run.must_say("OBOLUS_MODEL_RATES is set but empty");
+    run.must_have_refused_during_startup();
+}
+
+#[test]
+fn the_backend_config_and_the_model_rates_at_once_refuse_to_start() {
+    let path = temp_file(
+        "backends-rates-super.json",
+        r#"[{"id":"local","kind":"ollama","baseUrl":"http://127.0.0.1:11434"}]"#,
+    );
+    let run = run(&[("OBOLUS_BACKENDS_FILE", &path), ("OBOLUS_MODEL_RATES", VALID_RATES)]);
+
+    run.must_say("OBOLUS_BACKENDS_FILE and OBOLUS_MODEL_RATES are both set");
+    run.must_not_say(INERT_RATES);
     run.must_have_refused_during_startup();
 }
 

@@ -30,7 +30,8 @@ use obolus::arming::{
     check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
-    parse_accepts, parse_extra, require_backend_costs, select_max_output_tokens, select_pricing,
+    parse_accepts, parse_extra, refuse_inert_rates, require_backend_costs, select_max_output_tokens,
+    select_model_rates, select_pricing,
     select_promo, select_telemetry, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
     PricingChoice, SharedOffer, TelemetryChoice, EXTRA_VAR,
 };
@@ -228,6 +229,9 @@ async fn main() -> anyhow::Result<()> {
                      the file, or unset OBOLUS_UPSTREAM_COST."
                 );
             }
+            // The rates twin: OBOLUS_MODEL_RATES alongside the file is refused on presence, before
+            // the file is read. With the file set this can only return that refusal (or `None`).
+            select_model_rates(|k| std::env::var(k))?;
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("OBOLUS_BACKENDS_FILE {path:?}: {e}"))?;
             if raw.trim().is_empty() {
@@ -252,7 +256,13 @@ async fn main() -> anyhow::Result<()> {
                      TLS upstream if needed."
                 );
             }
-            Backends::single_ollama(&upstream_url, head_timeout)
+            // The single backend's token rates, validated here so a malformed value is reported
+            // before `refuse_inert_rates` below refuses valid ones as unread.
+            let backends = Backends::single_ollama(&upstream_url, head_timeout);
+            match select_model_rates(|k| std::env::var(k))? {
+                Some(rates) => backends.with_sole_rates(rates),
+                None => backends,
+            }
         }
     };
     // The registry the gateway routes over. Kept owned for now: the pricing block below may still
@@ -389,6 +399,9 @@ async fn main() -> anyhow::Result<()> {
     // naming the backends. `select_pricing` sees only the environment and `load_backends` only the
     // file — this is the one place that holds both.
     require_backend_costs(&backends, pricing)?;
+    // Declared token rates have validated by here (per entry, or `select_model_rates`), but no rate
+    // in this version reads them; refused as inert until token pricing lifts this (#31).
+    refuse_inert_rates(&backends, pricing)?;
     // Sealed now the rate is known and every cost is settled. Shared, so the banner below can read it.
     let backends = Arc::new(backends);
 

@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::arming::{escape_controls, legible};
-use crate::backends::Backends;
+use crate::backends::{parse_rates_json, Backends, ModelRates, RateDefect};
 use crate::gateway::DEFAULT_MAX_OUTPUT_TOKENS;
 use crate::x402::{
     validate_atomic_amount, PaymentRequirements, ResourceInfo, UnsupportedTransfer, SCHEME_EXACT,
@@ -500,6 +500,17 @@ pub enum PricingConfigError {
          would be silently ignored. Set OBOLUS_PRICING=cost-plus to use it, or remove the cost."
     )]
     InertBackendCost { ids: String },
+
+    /// A backend declares token rates, from the backends file or `OBOLUS_MODEL_RATES`. They
+    /// validated, but no rate in this version reads them, so they would sit inert. Raised by
+    /// [`refuse_inert_rates`].
+    #[error(
+        "these backends declare token rates: {ids}. The rates are valid, but they take effect \
+         only under token pricing, which this version of obolus does not have yet \
+         (https://github.com/geekinasuit/obolus/issues/31), so they would be silently ignored. \
+         Remove \"rates\" from OBOLUS_BACKENDS_FILE, or unset OBOLUS_MODEL_RATES."
+    )]
+    InertRates { ids: String },
 }
 
 /// Turn the pricing environment into a [`PricingChoice`], or refuse.
@@ -628,6 +639,99 @@ pub fn require_backend_costs(
             }
         }
     }
+}
+
+/// Refuse declared token rates that no selected rate would read.
+///
+/// Rates are validated where they are declared — per entry in
+/// [`crate::backends::load_backends`], or by [`select_model_rates`] for the single backend — so a
+/// malformed one has already been refused, with its specific defect, before this runs. What is
+/// left is the rule the boot path holds throughout: configuration that cannot take effect refuses
+/// rather than being silently dropped.
+///
+/// **This is the one place token pricing lifts.** No [`PricingChoice`] reads rates today, so every
+/// arm below refuses them. The match is exhaustive on purpose: adding a token-pricing variant does
+/// not compile until it is given an arm here, and that arm is where rates become live (#31).
+pub fn refuse_inert_rates(
+    backends: &Backends,
+    pricing: PricingChoice,
+) -> Result<(), PricingConfigError> {
+    match pricing {
+        PricingChoice::Static | PricingChoice::CostPlus { .. } => {
+            let rated = backends
+                .backends()
+                .iter()
+                .filter(|b| !b.rates.is_empty())
+                // Quoted and escaped, as in `require_backend_costs` (#16).
+                .map(|b| legible(&b.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if rated.is_empty() {
+                Ok(())
+            } else {
+                Err(PricingConfigError::InertRates { ids: rated })
+            }
+        }
+    }
+}
+
+/// The single backend's token rates, as a JSON object: the env twin of a per-entry `"rates"` in
+/// `OBOLUS_BACKENDS_FILE`, attached to the sole backend the way `OBOLUS_UPSTREAM_COST` is.
+pub const MODEL_RATES_VAR: &str = "OBOLUS_MODEL_RATES";
+
+/// Why `OBOLUS_MODEL_RATES` could not be read. Each is a boot refusal.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ModelRatesConfigError {
+    /// Set alongside a backends file, where each entry declares its own rates, so the variable
+    /// would sit inert. The rates twin of the `OBOLUS_UPSTREAM_COST` refusal in `main`.
+    #[error(
+        "OBOLUS_BACKENDS_FILE and OBOLUS_MODEL_RATES are both set. OBOLUS_MODEL_RATES is the \
+         single-backend rates; with a config file each backend declares its own per-entry \
+         \"rates\", so the variable would sit inert. Set the rates per entry in the file, or unset \
+         OBOLUS_MODEL_RATES."
+    )]
+    AlongsideBackendsFile,
+
+    /// Set but empty: an unexpanded `${VAR}` or an `EnvironmentFile` line ending in `=`.
+    #[error(
+        "OBOLUS_MODEL_RATES is set but empty: it reached this process carrying nothing — an \
+         unexpanded ${{VAR}} or an EnvironmentFile line ending in `=`. Unset it, or give it a JSON \
+         object of {{\"<model>\": {{\"input\": \"<atomic>\", \"output\": \"<atomic>\"}}}} rates."
+    )]
+    Empty,
+
+    /// Not valid Unicode. `std::env::var` reports this as an error, which read carelessly is
+    /// indistinguishable from unset — that is, silently ignored.
+    #[error("OBOLUS_MODEL_RATES is not valid UTF-8; it must be a JSON object")]
+    NotUnicode,
+
+    /// The value does not validate. The defect names the model and field.
+    #[error("OBOLUS_MODEL_RATES: {0}")]
+    Bad(RateDefect),
+}
+
+/// Read `OBOLUS_MODEL_RATES` for the single backend, or refuse. `None` when unset.
+///
+/// `get` is `std::env::var` in `main`, injected so each refusal is testable without mutating
+/// process environment. A catch-all backend has no `models` list, so a rate for any model name is
+/// accepted; the remaining rules are those of a per-entry `"rates"`
+/// ([`crate::backends::parse_rates_json`]). Presence of `OBOLUS_BACKENDS_FILE` is read with
+/// `is_ok`, the same test `main` uses to choose the file path.
+pub fn select_model_rates<F: Fn(&str) -> Result<String, std::env::VarError>>(
+    get: F,
+) -> Result<Option<ModelRates>, ModelRatesConfigError> {
+    let raw = match get(MODEL_RATES_VAR) {
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(ModelRatesConfigError::NotUnicode),
+        Ok(raw) => raw,
+    };
+    if get("OBOLUS_BACKENDS_FILE").is_ok() {
+        return Err(ModelRatesConfigError::AlongsideBackendsFile);
+    }
+    if raw.trim().is_empty() {
+        return Err(ModelRatesConfigError::Empty);
+    }
+    parse_rates_json(&raw, &[]).map(Some).map_err(ModelRatesConfigError::Bad)
 }
 
 /// A promotional discount an operator configured, ready for `main` to wrap the base determiner with.
@@ -1536,6 +1640,127 @@ mod tests {
             assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
             assert!(message.contains(r#""a\nobolus: listening on"#), "quoted, escaped: {message}");
         }
+    }
+
+    // --- token rates: the OBOLUS_MODEL_RATES door and the inert-rates refusal (#31) ---
+
+    use crate::backends::{RateDefect, TokenRate};
+    use std::env::VarError;
+
+    fn var_env<'a>(
+        pairs: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&str) -> Result<String, VarError> + 'a {
+        move |k| {
+            pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string()).ok_or(VarError::NotPresent)
+        }
+    }
+
+    const GOOD_RATES: &str = r#"{"llama3":{"input":"3000000","output":"15000000"}}"#;
+
+    #[test]
+    fn unset_model_rates_are_none() {
+        assert_eq!(select_model_rates(var_env(&[])), Ok(None));
+    }
+
+    #[test]
+    fn model_rates_parse_for_the_single_backend() {
+        let rates = select_model_rates(var_env(&[(MODEL_RATES_VAR, GOOD_RATES)])).unwrap().unwrap();
+        assert_eq!(rates["llama3"], TokenRate { input: 3_000_000, output: 15_000_000 });
+    }
+
+    #[test]
+    fn malformed_model_rates_are_refused_with_the_defect() {
+        let err = select_model_rates(var_env(&[(MODEL_RATES_VAR, r#"{"m":{"input":"+5","output":"1"}}"#)]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, ModelRatesConfigError::Bad(RateDefect::BadValue { field: "input", .. })),
+            "got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.starts_with("OBOLUS_MODEL_RATES: "), "names the variable: {message}");
+        assert!(message.contains(r#"model "m""#), "names the model: {message}");
+    }
+
+    #[test]
+    fn model_rates_that_are_not_json_are_refused() {
+        let err = select_model_rates(var_env(&[(MODEL_RATES_VAR, "llama3=3")])).unwrap_err();
+        assert!(matches!(&err, ModelRatesConfigError::Bad(RateDefect::NotJson(_))), "got {err:?}");
+    }
+
+    #[test]
+    fn set_but_empty_model_rates_are_refused() {
+        for empty in ["", "  "] {
+            assert_eq!(
+                select_model_rates(var_env(&[(MODEL_RATES_VAR, empty)])),
+                Err(ModelRatesConfigError::Empty),
+                "{empty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_rates_that_are_not_unicode_are_refused_not_ignored() {
+        let get = |k: &str| match k {
+            MODEL_RATES_VAR => Err(VarError::NotUnicode(std::ffi::OsString::from("x"))),
+            _ => Err(VarError::NotPresent),
+        };
+        assert_eq!(select_model_rates(get), Err(ModelRatesConfigError::NotUnicode));
+    }
+
+    #[test]
+    fn model_rates_alongside_a_backends_file_are_refused() {
+        // The file declares rates per entry, so the single-backend variable would sit inert.
+        // Refused on presence, before its own value is looked at.
+        for value in [GOOD_RATES, "not json", ""] {
+            assert_eq!(
+                select_model_rates(var_env(&[(MODEL_RATES_VAR, value), ("OBOLUS_BACKENDS_FILE", "/b.json")])),
+                Err(ModelRatesConfigError::AlongsideBackendsFile),
+                "{value:?}"
+            );
+        }
+        let message = ModelRatesConfigError::AlongsideBackendsFile.to_string();
+        assert!(message.contains("both set"), "{message}");
+    }
+
+    fn backend_rated(id: &str) -> Backend {
+        let upstream: Arc<dyn Upstream> = Arc::new(FakeUpstream::streaming());
+        let rates = [(id.to_string(), TokenRate { input: 1, output: 2 })].into_iter().collect();
+        Backend::for_test(id, vec![id], None, upstream).with_rates(rates)
+    }
+
+    #[test]
+    fn rates_under_every_current_rate_are_refused_as_inert_naming_the_backend() {
+        // No rate in this version reads token rates, so any declared rate would sit unread.
+        let backends = Backends::from_parts(vec![backend_costing("plain", None), backend_rated("rated")]);
+        for pricing in [
+            PricingChoice::Static,
+            PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None },
+        ] {
+            let err = refuse_inert_rates(&backends, pricing).unwrap_err();
+            assert_eq!(err, PricingConfigError::InertRates { ids: r#""rated""#.to_string() }, "{pricing:?}");
+            let message = err.to_string();
+            assert!(message.contains("token pricing"), "{message}");
+            assert!(message.contains("https://github.com/geekinasuit/obolus/issues/31"), "{message}");
+        }
+    }
+
+    #[test]
+    fn no_rates_is_not_an_inert_rates_refusal() {
+        let backends = Backends::from_parts(vec![backend_costing("a", None), backend_costing("b", Some(1))]);
+        for pricing in [
+            PricingChoice::Static,
+            PricingChoice::CostPlus { margin_bps: 2500, upstream_cost: None },
+        ] {
+            assert_eq!(refuse_inert_rates(&backends, pricing), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_backend_id_in_an_inert_rates_refusal_cannot_start_a_line() {
+        let backends = Backends::from_parts(vec![backend_rated("a\nobolus: listening on")]);
+        let message = refuse_inert_rates(&backends, PricingChoice::Static).unwrap_err().to_string();
+        assert!(!message.contains('\n'), "a raw newline reached the message:\n{message}");
+        assert!(message.contains(r#""a\nobolus: listening on""#), "quoted, escaped: {message}");
     }
 
     // The boot instant these promo tests place windows relative to. Fixed, so every refusal —
