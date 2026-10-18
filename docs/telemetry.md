@@ -75,7 +75,9 @@ that cannot be read — is not recorded; none of those reach pricing, payment, o
 ```mermaid
 flowchart TB
   req(["request"]) -.->|"client disconnects<br/>before a response"| abandoned["abandoned"]
-  req --> route{"route model<br/>to a backend"}
+  req --> keys{"top-level key that<br/>folds to model or<br/>max_tokens but isn't it?"}
+  keys -->|"yes"| ambiguous["ambiguous_key"]
+  keys --> route{"route model<br/>to a backend"}
   route -->|"no backend"| unroutable["unroutable"]
   route --> token{"honoured<br/>bearer token?"}
   token -->|"yes"| tfwd{"forward"}
@@ -100,6 +102,14 @@ flowchart TB
   settle -->|"unavailable"| s_unavail["settle_unavailable"]
   settle -->|"success"| settled["settled"]
 ```
+
+`ambiguous_key` is a body with a top-level key such as `MODEL` or `Max_Tokens`: one that a
+case-insensitive JSON reader, like the Go decoder behind Ollama, would take for `model` or
+`max_tokens`, while an exact reader ignores it. It is refused with a `400` before routing, like
+`unroutable`, so it has no access path or backend and is never charged. It is a separate outcome
+because the request may well have named a model a backend serves: what it says is that the body
+used a key readers disagree on, not that it asked for a model nobody serves
+([#122](https://github.com/geekinasuit/obolus/issues/122)). The refused key is not recorded.
 
 ## Cost and revenue
 
@@ -172,12 +182,12 @@ disagree.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `v` | integer | Line format version, currently `1`. Bumped when a field changes meaning or is removed. Adding a field does not bump it, so ignore keys you do not know. |
+| `v` | integer | Line format version, currently `1`. Bumped when a field changes meaning or is removed. Adding a field, or a new value of an enumerated field such as `outcome`, does not bump it, so ignore keys you do not know and handle values you do not know. |
 | `kind` | string | `"request"`. |
 | `ts_ms` | integer | Unix milliseconds when the event was recorded, stamped once by the gateway rather than by each sink. |
-| `outcome` | string | One of the outcomes above. |
-| `access` | string \| null | `"payment"` or `"token"`; `null` only for `unroutable`, which is decided first. |
-| `backend` | string \| null | The routed backend's id; `null` when unroutable. |
+| `outcome` | string | One of the outcomes above. New outcomes can be added without a version bump. |
+| `access` | string \| null | `"payment"` or `"token"`; `null` only for `unroutable` and `ambiguous_key`, which are decided first. |
+| `backend` | string \| null | The routed backend's id; `null` for `unroutable` and `ambiguous_key`. |
 | `model` | string \| null | The model the request named, cut to at most 256 bytes; `null` if it named none. |
 | `offers` | array | Every option quoted to this request, at its determined price. Empty off the payment path. |
 | `paid` | object \| null | The offered option the payment matched, once one did. |
