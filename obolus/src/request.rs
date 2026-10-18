@@ -530,6 +530,14 @@ mod tests {
             // Near misses that no reader folds to `max_tokens` are just other keys.
             (object(&[("model", r#""m""#), ("max_tokenss", "9")]), Some("m"), Absent, false),
             (object(&[("model", r#""m""#), ("max-tokens", "9")]), Some("m"), Absent, false),
+            // A case variant stays `Invalid` when the parse fails after it: here on a key holding
+            // a raw 0xff byte.
+            (
+                bytes(&[br#"{"model":"m","max_tokens":5,"MAX_TOKENS":100000,"a"#, &[0xFF_u8], br#"":1}"#]),
+                None,
+                Invalid,
+                false,
+            ),
         ];
         let folded: Vec<(Vec<u8>, Option<&'static str>, MaxTokens, bool)> = fold_variants()
             .iter()
