@@ -434,6 +434,12 @@ impl Backend {
         self.cost = Some(cost);
         self
     }
+
+    /// Give a test backend another wire protocol, for rules that depend on the backend's kind.
+    pub fn with_kind(mut self, kind: Kind) -> Self {
+        self.kind = kind;
+        self
+    }
 }
 
 /// Parse a backend-config JSON array, resolve each key reference through `read_key`, and construct

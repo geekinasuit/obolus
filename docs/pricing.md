@@ -80,11 +80,20 @@ Three properties are load-bearing:
   input, quickly and without blocking; the fallible cases fail *closed* (see below), never by
   unwrapping into the hot path.
 
-The determiner is called **once per advertised requirement**, on **every request except the token
-bypass** — the bypass returns before pricing is ever consulted, but an unpaid request that gets a
-402 is priced, because the challenge has to state the amount. It already receives the routed
+The determiner is called **once per advertised requirement**, on **every paying-path request that
+passes routing and the output cap**, paid or not — the token bypass returns before pricing is ever
+consulted, and a request refused earlier (unroutable, an ambiguous key, or the output cap below) is
+never priced, but an unpaid request that gets a 402 is priced, because the challenge has to state
+the amount, and a paid one is priced because its settlement charges that quote. It already receives the routed
 `backend` and the request's `model`, so per-backend and per-model policies have the context they
 need without any further plumbing.
+
+A request is priced only once it has passed the output cap (`OBOLUS_MAX_OUTPUT_TOKENS`). Every
+request a determiner sees was read in full and carries a `max_tokens` from 1 to the cap, and on an
+`openai-compat` backend carries no `max_completion_tokens`, no `best_of`, and no `n` other than 1
+(Ollama has none of those fields). So, per backend kind, it asks for one completion of at most the
+cap, which bounds the worst-case output a quote must cover. Pricing by that bound is later work
+([#31](https://github.com/geekinasuit/obolus/issues/31)).
 
 ## Rate structures
 

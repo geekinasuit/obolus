@@ -9,12 +9,15 @@
 //! to [`Gateway::new`](crate::gateway::Gateway::new), so it holds for every way of building a
 //! gateway rather than only for the config paths that remember to de-duplicate.
 
+use std::num::NonZeroU64;
+
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::arming::{escape_controls, legible};
 use crate::backends::Backends;
+use crate::gateway::DEFAULT_MAX_OUTPUT_TOKENS;
 use crate::x402::{
     validate_atomic_amount, PaymentRequirements, ResourceInfo, UnsupportedTransfer, SCHEME_EXACT,
 };
@@ -802,9 +805,94 @@ pub fn select_telemetry<F: Fn(&str) -> Option<String>>(
     }
 }
 
+/// The most output tokens a paid request may ask for: an upper bound on its `max_tokens` (#31).
+/// Unset is [`DEFAULT_MAX_OUTPUT_TOKENS`].
+pub const MAX_OUTPUT_TOKENS_VAR: &str = "OBOLUS_MAX_OUTPUT_TOKENS";
+
+/// Why the output cap was refused. Each is a boot refusal: a cap that arrived as nothing, or as
+/// something that is not a count of tokens, must not quietly become the default.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OutputCapConfigError {
+    /// Set to an empty or whitespace-only value — an unexpanded `${VAR}`, or an `EnvironmentFile`
+    /// line ending in `=`.
+    #[error(
+        "OBOLUS_MAX_OUTPUT_TOKENS is set but empty, so it reached this process carrying nothing. \
+         Unset it to take the default ({default}), or set it to the most output tokens a paid \
+         request may ask for in max_tokens.",
+        default = DEFAULT_MAX_OUTPUT_TOKENS
+    )]
+    Empty,
+    /// Zero. A cap of 0 tokens would refuse every paid request that asks for any output at all.
+    #[error(
+        "OBOLUS_MAX_OUTPUT_TOKENS must be greater than 0: it is the most output tokens a paid \
+         request may ask for in max_tokens, and a cap of 0 sells no output."
+    )]
+    Zero,
+    /// Not a whole number.
+    #[error(
+        "OBOLUS_MAX_OUTPUT_TOKENS {value:?} is not a positive whole number of tokens (no sign, \
+         decimals, separators, or exponent)."
+    )]
+    NotANumber { value: String },
+}
+
+/// Read the output cap. Unset is [`DEFAULT_MAX_OUTPUT_TOKENS`]; set-but-empty, zero, and anything
+/// that is not a whole number are refused rather than read as the default. `get` is injected as in
+/// [`select_telemetry`].
+pub fn select_max_output_tokens<F: Fn(&str) -> Option<String>>(
+    get: F,
+) -> Result<NonZeroU64, OutputCapConfigError> {
+    let Some(raw) = get(MAX_OUTPUT_TOKENS_VAR) else {
+        return Ok(DEFAULT_MAX_OUTPUT_TOKENS);
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(OutputCapConfigError::Empty);
+    }
+    // Digits only: `u64::from_str` would also take a leading `+`.
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(OutputCapConfigError::NotANumber { value: raw });
+    }
+    match value.parse::<u64>() {
+        Ok(n) => NonZeroU64::new(n).ok_or(OutputCapConfigError::Zero),
+        Err(_) => Err(OutputCapConfigError::NotANumber { value: raw }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cap_env(value: Option<&str>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |key| (key == MAX_OUTPUT_TOKENS_VAR).then(|| value.map(str::to_string)).flatten()
+    }
+
+    #[test]
+    fn an_unset_output_cap_is_4096() {
+        assert_eq!(select_max_output_tokens(cap_env(None)).map(NonZeroU64::get), Ok(4096));
+    }
+
+    #[test]
+    fn an_output_cap_can_be_set() {
+        assert_eq!(select_max_output_tokens(cap_env(Some("8"))).map(NonZeroU64::get), Ok(8));
+        assert_eq!(select_max_output_tokens(cap_env(Some(" 100 "))).map(NonZeroU64::get), Ok(100));
+    }
+
+    #[test]
+    fn an_output_cap_of_zero_junk_or_nothing_is_refused() {
+        assert_eq!(select_max_output_tokens(cap_env(Some("0"))), Err(OutputCapConfigError::Zero));
+        assert_eq!(select_max_output_tokens(cap_env(Some("000"))), Err(OutputCapConfigError::Zero));
+        for empty in ["", "   "] {
+            let err = select_max_output_tokens(cap_env(Some(empty))).unwrap_err();
+            assert_eq!(err, OutputCapConfigError::Empty);
+            assert!(err.to_string().contains("set but empty"), "{err}");
+        }
+        for junk in ["abc", "-1", "+5", "1.5", "1e3", "4_096", "18446744073709551616"] {
+            let err = select_max_output_tokens(cap_env(Some(junk))).unwrap_err();
+            assert_eq!(err, OutputCapConfigError::NotANumber { value: junk.to_string() }, "{junk}");
+            assert!(err.to_string().contains(MAX_OUTPUT_TOKENS_VAR), "{err}");
+        }
+    }
 
     fn telemetry_env(value: Option<&str>) -> impl Fn(&str) -> Option<String> + '_ {
         move |key| (key == TELEMETRY_VAR).then(|| value.map(str::to_string)).flatten()

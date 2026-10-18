@@ -56,6 +56,7 @@ const OBOLUS_VARS: &[&str] = &[
     "OBOLUS_MAX_TIMEOUT_SECS",
     "OBOLUS_UPSTREAM_URL",
     "OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS",
+    "OBOLUS_MAX_OUTPUT_TOKENS",
     "OBOLUS_BACKENDS_FILE",
     "OBOLUS_RESOURCE",
     "OBOLUS_DESCRIPTION",
@@ -1926,10 +1927,14 @@ fn serve_live(vars: &[(&str, &str)]) -> Live {
 
 /// POST an unpaid completion request and return the raw HTTP response.
 fn post_unpaid(addr: &str) -> String {
+    post_unpaid_body(addr, r#"{"model":"test","max_tokens":256,"messages":[]}"#)
+}
+
+/// POST an unpaid completion request carrying `body`, and return the raw HTTP response.
+fn post_unpaid_body(addr: &str, body: &str) -> String {
     use std::io::{Read as _, Write as _};
     let mut stream = std::net::TcpStream::connect(addr).expect("connect to the server");
     stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
-    let body = r#"{"model":"test","messages":[]}"#;
     write!(
         stream,
         "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
@@ -1998,6 +2003,62 @@ fn with_telemetry_off_the_running_binary_writes_nothing_to_stdout() {
     // A line, were one written, arrives within milliseconds of the response; a second is ample.
     let line = live.next_stdout_line(std::time::Duration::from_secs(1));
     assert_eq!(line, None, "telemetry is off, yet stdout carried a line");
+}
+
+// ---- the output cap (#31) ----
+
+#[test]
+fn an_unset_output_cap_is_4096_and_the_banner_says_so() {
+    let run = run(&[]);
+    run.must_have_got_past_startup();
+    run.must_say("obolus: output cap 4096 tokens");
+}
+
+#[test]
+fn a_configured_output_cap_is_the_one_the_banner_names() {
+    let run = run(&[("OBOLUS_MAX_OUTPUT_TOKENS", "8")]);
+    run.must_have_got_past_startup();
+    run.must_say("obolus: output cap 8 tokens");
+}
+
+#[test]
+fn an_output_cap_of_zero_junk_or_nothing_refuses_to_start() {
+    for (value, because) in [
+        ("0", "OBOLUS_MAX_OUTPUT_TOKENS must be greater than 0"),
+        ("lots", "is not a positive whole number of tokens"),
+        ("-5", "is not a positive whole number of tokens"),
+        ("", "OBOLUS_MAX_OUTPUT_TOKENS is set but empty"),
+        ("  ", "OBOLUS_MAX_OUTPUT_TOKENS is set but empty"),
+    ] {
+        let run = run(&[("OBOLUS_MAX_OUTPUT_TOKENS", value)]);
+        run.must_say(BAILED);
+        run.must_say(because);
+        run.must_have_refused_during_startup();
+    }
+}
+
+#[test]
+fn the_running_binary_enforces_the_configured_output_cap() {
+    // The wiring from the variable to the gateway, which no library test can see: `main` is
+    // compiled by no test target.
+    let live = serve_live(&[("OBOLUS_MAX_OUTPUT_TOKENS", "8")]);
+    let over = post_unpaid_body(&live.addr, r#"{"model":"test","max_tokens":9,"messages":[]}"#);
+    assert!(over.starts_with("HTTP/1.1 400"), "expected a refusal; got:\n{over}");
+    assert!(over.contains("at most 8"), "{over}");
+    let at = post_unpaid_body(&live.addr, r#"{"model":"test","max_tokens":8,"messages":[]}"#);
+    assert!(at.starts_with("HTTP/1.1 402"), "expected a challenge; got:\n{at}");
+}
+
+#[test]
+fn the_running_binary_refuses_a_request_without_max_tokens() {
+    let live = serve_live(&[]);
+    let response = post_unpaid_body(&live.addr, r#"{"model":"test","messages":[]}"#);
+    assert!(response.starts_with("HTTP/1.1 400"), "expected a refusal; got:\n{response}");
+    assert!(response.contains("max_tokens is required"), "{response}");
+    let line = live
+        .next_stdout_line(std::time::Duration::from_secs(10))
+        .expect("no telemetry line on stdout");
+    assert!(line.contains(r#""outcome":"output_cap_refused""#), "{line}");
 }
 
 #[test]

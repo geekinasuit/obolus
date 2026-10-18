@@ -51,8 +51,8 @@ use std::sync::Arc;
 use obolus::arming::{check_arming, legible, PLACEHOLDER_NETWORK};
 use obolus::backends::{Backends, Kind};
 use obolus::config::{
-    parse_accepts, parse_extra, superseded_single_chain_vars, validated_option, EntryDefect,
-    SharedOffer, EXTRA_VAR,
+    parse_accepts, parse_extra, select_max_output_tokens, superseded_single_chain_vars,
+    validated_option, EntryDefect, SharedOffer, EXTRA_VAR,
 };
 use obolus::gateway::{router, Access, Gateway};
 use obolus::upstream::{OllamaUpstream, Upstream};
@@ -106,6 +106,10 @@ WHERE IT LISTENS, AND WHAT IS BEHIND IT
     OBOLUS_UPSTREAM_URL           http:// origin of a real model; unset serves a canned response
     OBOLUS_RESOURCE               resource id in the challenge (default: this address)
     OBOLUS_DESCRIPTION            human description in the challenge
+    OBOLUS_MAX_OUTPUT_TOKENS      the largest max_tokens a paid request may carry (default 4096),
+                                  as `obolus` enforces it: a paid request with no max_tokens, an
+                                  unusable one, 0, or one above this is refused with a 400, as is
+                                  a body that cannot be read in full
 
 WHAT IT CHARGES — two mutually exclusive doors, the same ones `obolus` offers
     OBOLUS_ACCEPTS                JSON array of payment options; supersedes the five below, and
@@ -228,6 +232,9 @@ async fn main() -> anyhow::Result<()> {
 
     let addr: SocketAddr = env_or("OBOLUS_ADDR", DEFAULT_ADDR)?.parse()?;
     let dev = config::from_env(|key| std::env::var(key).ok())?;
+    // The same output cap `obolus` enforces, through the same door, so a client that works against
+    // one works against the other.
+    let max_output_tokens = select_max_output_tokens(|key| std::env::var(key).ok())?;
     // The domain is read from each option's advertised `extra` now. A variable that used to set it
     // and silently no longer does would verify under something other than what its operator wrote,
     // so it is refused, set or set-but-empty alike.
@@ -534,8 +541,14 @@ async fn main() -> anyhow::Result<()> {
         shared.resource_info(),
         armed_requirements,
     )
-    .map_err(|e| anyhow::anyhow!("payment options: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("payment options: {e}"))?
+    .with_max_output_tokens(max_output_tokens);
 
+    eprintln!(
+        "obolus-devseller: output cap {cap} tokens: a paid request must set max_tokens to at most \
+         {cap}, or it is refused with a 400 before it is quoted",
+        cap = gateway.max_output_tokens()
+    );
     eprintln!("obolus-devseller: advertising {} payment option(s):", requirements.len());
     // Operator values quoted and escaped, as the gateway prints them (#16).
     for r in &requirements {

@@ -84,7 +84,9 @@ flowchart TB
   tfwd -->|"error"| t_unavail["upstream_unavailable"]
   tfwd -->|"non-2xx"| t_refused["upstream_refused"]
   tfwd -->|"2xx"| served["served"]
-  token -->|"no"| hdr{"PAYMENT-SIGNATURE<br/>present?"}
+  token -->|"no"| cap{"body read in full,<br/>output bounded within<br/>the output cap?"}
+  cap -->|"no"| capped["output_cap_refused"]
+  cap --> hdr{"PAYMENT-SIGNATURE<br/>present?"}
   hdr -->|"no"| required["payment_required"]
   hdr -->|"undecodable"| malformed["payment_malformed"]
   hdr --> match{"matches an offered<br/>option, method and flow,<br/>no server-owned extension field?"}
@@ -110,6 +112,14 @@ case-insensitive JSON reader, like the Go decoder behind Ollama, would take for 
 because the request may well have named a model a backend serves: what it says is that the body
 used a key readers disagree on, not that it asked for a model nobody serves
 ([#122](https://github.com/geekinasuit/obolus/issues/122)). The refused key is not recorded.
+
+`output_cap_refused` is a paid request that does not bound its output within the gateway's cap
+(`OBOLUS_MAX_OUTPUT_TOKENS`): its body could not be read in full, it has no `max_tokens`, one that
+is not a positive integer, or one above the cap, or, on an `openai-compat` backend, it carries
+`max_completion_tokens`, `best_of`, or an `n` other than 1, which the backend might honour to
+generate more ([#31](https://github.com/geekinasuit/obolus/issues/31)). It is refused with a `400` on the
+paying path, after routing and before pricing, so it has `access: "payment"` and a backend but no
+offers, and is never charged. A bearer-token request is not capped and never ends here.
 
 ## Cost and revenue
 
@@ -189,7 +199,7 @@ disagree.
 | `access` | string \| null | `"payment"` or `"token"`; `null` only for `unroutable` and `ambiguous_key`, which are decided first. |
 | `backend` | string \| null | The routed backend's id; `null` for `unroutable` and `ambiguous_key`. |
 | `model` | string \| null | The model the request named, cut to at most 256 bytes; `null` if it named none. |
-| `offers` | array | Every option quoted to this request, at its determined price. Empty off the payment path. |
+| `offers` | array | Every option quoted to this request, at its determined price. Empty off the payment path, and on `output_cap_refused`, which is refused before anything is quoted. |
 | `paid` | object \| null | The offered option the payment matched, once one did. |
 | `upstream_invoked` | bool | Whether the upstream was called. |
 | `upstream_status` | integer \| null | The upstream's response status, when it produced one. |

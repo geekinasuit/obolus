@@ -30,8 +30,8 @@ use obolus::arming::{
     check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
-    parse_accepts, parse_extra, require_backend_costs, select_pricing, select_promo,
-    select_telemetry, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
+    parse_accepts, parse_extra, require_backend_costs, select_max_output_tokens, select_pricing,
+    select_promo, select_telemetry, superseded_single_chain_vars, validated_option, EntryDefect, EntryField,
     PricingChoice, SharedOffer, TelemetryChoice, EXTRA_VAR,
 };
 use obolus::backends::{load_backends, Backends};
@@ -366,6 +366,11 @@ async fn main() -> anyhow::Result<()> {
     // else can refuse.
     let telemetry = select_telemetry(|k| std::env::var(k).ok())?;
 
+    // The output cap (#31): the largest `max_tokens` a paid request may carry. Read here with the
+    // other refusable doors, so a cap of 0, junk, or set-but-empty stops the process before the
+    // banner.
+    let max_output_tokens = select_max_output_tokens(|k| std::env::var(k).ok())?;
+
     // Land the single-backend cost on the sole backend, and check the whole registry against the
     // rate — both before the `Arc` seal, the arming guard, and the banner, for the same reason
     // `select_pricing` sits here: a pricing configuration this process will refuse must never first
@@ -462,7 +467,8 @@ async fn main() -> anyhow::Result<()> {
         None => base,
         Some(p) => Arc::new(Promotional::new(p.discount_bps, p.start, p.end, base)),
     };
-    let gateway = gateway.with_price_determiner(determiner);
+    let gateway =
+        gateway.with_price_determiner(determiner).with_max_output_tokens(max_output_tokens);
 
     // The bearer-token path and the access surface it joins, here — after the arming guard and
     // `Gateway::new`, before the first posture line below — so that every configuration refusal this
@@ -637,6 +643,12 @@ async fn main() -> anyhow::Result<()> {
          request's upstream must send its response head within {} s of arrival, or the request \
          fails uncharged, leaving {SETTLE_RESERVE_SECS} s to settle",
         max_timeout_seconds - SETTLE_RESERVE_SECS
+    );
+    // Off the routed `Access`, like the token and telemetry lines below.
+    eprintln!(
+        "obolus: output cap {cap} tokens: a paid request must set max_tokens to at most {cap}, or it \
+         is refused with a 400 before it is quoted; bearer-token requests are not capped",
+        cap = access.max_output_tokens()
     );
     // Off the constructed registry, not the configuration that built it, so the line describes what
     // was actually wired. One line per backend the router can reach; the "keyed"/"keyless" note says
