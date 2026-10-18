@@ -230,7 +230,8 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             // The rates twin: OBOLUS_MODEL_RATES alongside the file is refused on presence, before
-            // the file is read. With the file set this can only return that refusal (or `None`).
+            // the file is read. With the file set this can only return a refusal
+            // (alongside the file, or not UTF-8) or `None`.
             select_model_rates(|k| std::env::var(k))?;
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| anyhow::anyhow!("OBOLUS_BACKENDS_FILE {path:?}: {e}"))?;

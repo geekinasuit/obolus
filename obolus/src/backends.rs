@@ -371,7 +371,8 @@ pub enum BackendError {
     /// an unrecognised `kind`.
     #[error(
         "backend config must be a JSON array of \
-         {{\"id\",\"kind\",\"baseUrl\", optional \"keyFile\"/\"models\"/\"precedence\"}} objects: {0}"
+         {{\"id\",\"kind\",\"baseUrl\", optional \"keyFile\"/\"models\"/\"precedence\"/\"cost\"/\"rates\"}} \
+         objects: {0}"
     )]
     Malformed(String),
 
@@ -1468,7 +1469,10 @@ mod tests {
 
     #[test]
     fn a_hostile_model_name_in_a_rates_refusal_cannot_start_a_line() {
-        let forged = r#"m\nobolus: forged line"#; // JSON escapes: a newline and U+2028
+        // JSON text, not decoded characters: the backslash-n escape and the backslash-u-2028 escape,
+        // which the JSON parser decodes to a newline and U+2028. Built from fragments so the string
+        // carries the six-character escape and the source never holds a raw (invisible) U+2028.
+        let forged = concat!(r"m\nobolus: forged", r"\", "u2028line");
         for rates in [
             format!(r#"{{"{forged}":{{"input":"x","output":"1"}}}}"#),
             format!(r#"{{"m":{{"input":"1","output":"1","{forged}":"1"}}}}"#),
