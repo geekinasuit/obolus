@@ -693,7 +693,7 @@ async fn serve<F: Facilitator>(
     // Route before anything else. An unroutable request is refused here — before the token check
     // and before any payment — so it is never charged (Obolus has no refund path), and both the
     // recognised-caller path and the paying path forward to the same backend the model resolves to.
-    // Read once, from a copy: the bytes forwarded below are the client's originals.
+    // Parsed from a copy: the bytes forwarded below are the client's originals.
     let request = RequestShape::parse(&body);
     trace.model = request.model().map(str::to_owned);
     let backend = match access.gateway.backends.route(request.model()) {

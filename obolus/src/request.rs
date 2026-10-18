@@ -1,14 +1,19 @@
 //! What the gateway reads out of a completion request body.
 //!
-//! The body is read once, into a [`RequestShape`], and only ever *read*: the bytes forwarded
-//! upstream are always the client's originals, never a re-serialization of this.
+//! The body is read in one pass into a [`RequestShape`] — a second read of `model` alone happens
+//! only when a `max_tokens` value cannot be decoded (see [`RequestShape::parse`]) — and is only
+//! ever *read*: the bytes forwarded upstream are always the client's originals, never a
+//! re-serialization of this.
 //!
 //! The read is tolerant by construction. `model` decides routing, so nothing else in the body may
 //! be able to change what `model` reads as: a malformed `max_tokens` is recorded as malformed, not
-//! allowed to fail the parse that `model` comes out of.
+//! allowed to fail the parse that `model` comes out of. And `max_tokens` will decide what a request
+//! may be charged for, so once the read reaches a `max_tokens` key nothing else in the body can
+//! make it read as absent (see [`MaxTokens`] for exactly what that does and does not cover).
 
-use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use std::fmt;
 
 /// The parts of a request body the gateway acts on: the `model` it routes and prices by, and the
 /// output-token limit the client asked for.
@@ -20,25 +25,31 @@ pub struct RequestShape {
 }
 
 /// The request's `max_tokens` field, kept distinct in all three ways it can arrive.
+///
+/// **Invariant:** this is never [`MaxTokens::Absent`] for a body that has a top-level `max_tokens`
+/// key the read reached. Once the key is seen the answer is [`MaxTokens::Limit`] or
+/// [`MaxTokens::Invalid`], even when its value cannot be read or the document fails to parse
+/// further on. `Absent` means only that the key is not there, or that the read failed before
+/// reaching it.
+///
+/// The second case is narrower than it sounds — a wrong-typed or repeated `model` does not stop the
+/// read — but it is not empty, and a more lenient reader may still find a limit there. `serde_json`
+/// stops at an invalid UTF-8 byte or a lone surrogate escape in a top-level key, or in the `model`
+/// string; Go's `encoding/json`, which Ollama uses, substitutes U+FFFD and carries on. So such a
+/// byte placed *before* `max_tokens` reads here as `Absent` while Ollama honours the limit.
+///
+/// A key given more than once takes its last value, as Go's `encoding/json` (which Ollama uses)
+/// and `serde_json`'s own maps do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaxTokens {
-    /// The body has no `max_tokens` key (or is not a JSON object at all).
+    /// The body has no top-level `max_tokens` key, or failed to parse before one.
     Absent,
     /// A non-negative integer that fits a `u64`.
     Limit(u64),
     /// Present, but not a non-negative integer that fits a `u64`: a string, a float, a negative
-    /// number, `null`, an out-of-range integer, or any other JSON value.
+    /// number, `null`, an out-of-range integer, any other JSON value, or a value that could not be
+    /// read at all.
     Invalid,
-}
-
-/// The routing read. Exactly the `model` field and nothing else, so that only `model` itself can
-/// make it fail: a body that is not a JSON object, a `model` that is not a string, or a `model` key
-/// given twice all read as no model. `#[serde(default)]` so an omitted `model` is `None` rather than
-/// a failure. Token fields are deliberately not here — see [`RequestShape::parse`].
-#[derive(Deserialize)]
-struct ModelField {
-    #[serde(default)]
-    model: Option<String>,
 }
 
 impl RequestShape {
@@ -46,21 +57,29 @@ impl RequestShape {
     /// [`MaxTokens::Absent`]), and a `max_tokens` that is there but unusable reads as
     /// [`MaxTokens::Invalid`].
     ///
-    /// Two independent reads of the one body, so neither can spoil the other. `model` comes from
-    /// a struct holding only `model`, whose failure modes are `model`'s own. The token fields come from a generic
-    /// JSON object, where every value is accepted as-is and judged afterwards; deserializing them
-    /// into typed fields beside `model` would let a `"max_tokens": "abc"`, or a `max_tokens` key
-    /// given twice, fail the whole read and silently unroute the request.
+    /// One pass over the top-level object, by a hand-written visitor that builds no document tree.
+    /// It reads `model` exactly as a struct holding only `model` reads it — so a non-string or
+    /// `null` model, a `model` key given twice, a body that is not an object, trailing bytes, and a
+    /// leading byte-order mark all read as no model, as routing always has — and skips every other
+    /// value with the same tolerant skip, so no other field can fail the read. A wrong-typed or
+    /// repeated `model` reads as no model without ending the pass. `max_tokens` is judged as it is
+    /// read, and `max_completion_tokens` is only noted as present.
+    ///
+    /// The one place the pass reads more strictly than a skip is the `max_tokens` value itself: a
+    /// string there is decoded, so an invalid UTF-8 byte or a lone surrogate inside it, or a number
+    /// too large for an `f64`, fails the pass where a skip would not. That case reads as
+    /// [`MaxTokens::Invalid`], and `model` is then read again on its own, so that a broken
+    /// `max_tokens` still cannot change routing.
     pub fn parse(body: &[u8]) -> Self {
-        let model = serde_json::from_slice::<ModelField>(body).ok().and_then(|parsed| parsed.model);
-        let object = serde_json::from_slice::<Map<String, Value>>(body).ok();
-        let max_tokens = match object.as_ref().and_then(|o| o.get("max_tokens")) {
-            None => MaxTokens::Absent,
-            Some(value) => value.as_u64().map_or(MaxTokens::Invalid, MaxTokens::Limit),
+        let mut scan = Scan::default();
+        let mut reader = serde_json::Deserializer::from_slice(body);
+        let read = TopLevel(&mut scan).deserialize(&mut reader).and_then(|()| reader.end());
+        let model = match read {
+            Ok(()) => scan.model,
+            Err(_) if scan.in_max_tokens => model_only(body),
+            Err(_) => None,
         };
-        let max_completion_tokens =
-            object.as_ref().is_some_and(|o| o.contains_key("max_completion_tokens"));
-        Self { model, max_tokens, max_completion_tokens }
+        Self { model, max_tokens: scan.max_tokens, max_completion_tokens: scan.max_completion_tokens }
     }
 
     /// The `model` the request names, or `None` when it named none — including when the body is not
@@ -75,10 +94,238 @@ impl RequestShape {
         self.max_tokens
     }
 
-    /// Whether the body has a `max_completion_tokens` key at all. Only presence is recorded: the
-    /// value is not read, because Ollama ignores the field, so it limits nothing.
+    /// Whether the body has a top-level `max_completion_tokens` key at all. Only presence is
+    /// recorded, never the value. Whether the field limits output depends on the backend: Ollama
+    /// 0.34.4 was measured to ignore it, while an OpenAI-compatible server may honour it. What to
+    /// do about a request limited only through it is the caller's decision, per backend kind.
     pub fn has_max_completion_tokens(&self) -> bool {
         self.max_completion_tokens
+    }
+}
+
+/// `model` read on its own, as a struct holding only `model` reads it. The fallback for a pass that
+/// failed inside a `max_tokens` value (see [`RequestShape::parse`]): there, only this read can say
+/// what `model` would have been.
+fn model_only(body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ModelField {
+        #[serde(default)]
+        model: Option<String>,
+    }
+    serde_json::from_slice::<ModelField>(body).ok().and_then(|parsed| parsed.model)
+}
+
+/// What the pass has found so far. Kept outside the visitor so that what was seen before a parse
+/// error survives it — which is how a `max_tokens` key seen before a later failure still counts.
+struct Scan {
+    model: Option<String>,
+    max_tokens: MaxTokens,
+    max_completion_tokens: bool,
+    /// Set while a `max_tokens` value is being read, and cleared once it has been: still set after
+    /// an error means the error was inside that value.
+    in_max_tokens: bool,
+}
+
+impl Default for Scan {
+    fn default() -> Self {
+        Self { model: None, max_tokens: MaxTokens::Absent, max_completion_tokens: false, in_max_tokens: false }
+    }
+}
+
+/// The top-level keys the pass acts on. Any other key is `Other`, and its value is skipped.
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum Key {
+    Model,
+    MaxTokens,
+    MaxCompletionTokens,
+    #[serde(other)]
+    Other,
+}
+
+/// The pass over the top-level value. Mirrors what `#[derive(Deserialize)]` generates for a struct
+/// whose one field is `#[serde(default)] model: Option<String>`, so `model` reads identically: an
+/// object is read key by key, and an array is read positionally, its first element as `model`.
+struct TopLevel<'s>(&'s mut Scan);
+
+impl<'de> DeserializeSeed<'de> for TopLevel<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_struct("ModelField", &["model"], self)
+    }
+}
+
+impl<'de> Visitor<'de> for TopLevel<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        self.0.model = seq.next_element::<Option<String>>()?.flatten();
+        Ok(())
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        // A `model` key given twice, or a `model` that is neither a string nor `null`, fails a
+        // derived struct's read outright, so it reads as no model. Here it only *poisons* `model`
+        // and the pass carries on, so a `max_tokens` after it is still seen.
+        let mut model_seen = false;
+        let mut poisoned = false;
+        while let Some(key) = map.next_key::<Key>()? {
+            match key {
+                Key::Model if model_seen => {
+                    poisoned = true;
+                    map.next_value::<IgnoredAny>()?;
+                }
+                Key::Model => {
+                    model_seen = true;
+                    match map.next_value::<ModelValue>()? {
+                        ModelValue::Named(model) => self.0.model = Some(model),
+                        ModelValue::Null => {}
+                        ModelValue::NotAString => poisoned = true,
+                    }
+                }
+                Key::MaxTokens => {
+                    // Recorded before the value is read, so a value that fails to read still
+                    // leaves the key counted.
+                    self.0.max_tokens = MaxTokens::Invalid;
+                    self.0.in_max_tokens = true;
+                    self.0.max_tokens = map.next_value::<Judged>()?.0;
+                    self.0.in_max_tokens = false;
+                }
+                Key::MaxCompletionTokens => {
+                    self.0.max_completion_tokens = true;
+                    map.next_value::<IgnoredAny>()?;
+                }
+                Key::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        if poisoned {
+            self.0.model = None;
+        }
+        Ok(())
+    }
+}
+
+/// A `model` value, read as `Option<String>` reads it but without failing on a wrong type: a
+/// string names a model, `null` names none, and anything else is skipped and reported, for the
+/// caller to treat as the failure a derived read would have been.
+enum ModelValue {
+    Named(String),
+    Null,
+    NotAString,
+}
+
+impl<'de> Deserialize<'de> for ModelValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ModelValueVisitor)
+    }
+}
+
+struct ModelValueVisitor;
+
+impl<'de> Visitor<'de> for ModelValueVisitor {
+    type Value = ModelValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_str<E>(self, model: &str) -> Result<ModelValue, E> {
+        Ok(ModelValue::Named(model.to_owned()))
+    }
+
+    fn visit_string<E>(self, model: String) -> Result<ModelValue, E> {
+        Ok(ModelValue::Named(model))
+    }
+
+    fn visit_unit<E>(self) -> Result<ModelValue, E> {
+        Ok(ModelValue::Null)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<ModelValue, E> {
+        Ok(ModelValue::NotAString)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<ModelValue, E> {
+        Ok(ModelValue::NotAString)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<ModelValue, E> {
+        Ok(ModelValue::NotAString)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<ModelValue, E> {
+        Ok(ModelValue::NotAString)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ModelValue, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(ModelValue::NotAString)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ModelValue, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(ModelValue::NotAString)
+    }
+}
+
+/// A `max_tokens` value, judged as it is read: any JSON value is accepted, and only a non-negative
+/// integer that fits a `u64` is a [`MaxTokens::Limit`].
+struct Judged(MaxTokens);
+
+impl<'de> Deserialize<'de> for Judged {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(Judge).map(Judged)
+    }
+}
+
+struct Judge;
+
+impl<'de> Visitor<'de> for Judge {
+    type Value = MaxTokens;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<MaxTokens, E> {
+        Ok(MaxTokens::Limit(n))
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<MaxTokens, E> {
+        Ok(u64::try_from(n).map_or(MaxTokens::Invalid, MaxTokens::Limit))
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<MaxTokens, E> {
+        Ok(MaxTokens::Invalid)
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<MaxTokens, E> {
+        Ok(MaxTokens::Invalid)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<MaxTokens, E> {
+        Ok(MaxTokens::Invalid)
+    }
+
+    fn visit_unit<E>(self) -> Result<MaxTokens, E> {
+        Ok(MaxTokens::Invalid)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<MaxTokens, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(MaxTokens::Invalid)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<MaxTokens, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(MaxTokens::Invalid)
     }
 }
 
@@ -86,62 +333,150 @@ impl RequestShape {
 mod tests {
     use super::*;
 
+    /// The routing read as it stood before this module: the oracle `model` is held to on every
+    /// body, so the pass can never route a request differently from it.
+    fn old_model_read(body: &[u8]) -> Option<String> {
+        #[derive(Deserialize)]
+        struct ModelField {
+            #[serde(default)]
+            model: Option<String>,
+        }
+        serde_json::from_slice::<ModelField>(body).ok().and_then(|parsed| parsed.model)
+    }
+
+    fn bytes(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
     /// `(body, model, max_tokens, max_completion_tokens present)`.
-    type Case = (&'static str, Option<&'static str>, MaxTokens, bool);
+    fn cases() -> Vec<(Vec<u8>, Option<&'static str>, MaxTokens, bool)> {
+        use MaxTokens::{Absent, Invalid, Limit};
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        let deep = deep.as_bytes();
+        let text: Vec<(&str, Option<&'static str>, MaxTokens, bool)> = vec![
+            (r#"{"model":"m"}"#, Some("m"), Absent, false),
+            (r#"{"model":"m","max_tokens":256}"#, Some("m"), Limit(256), false),
+            (r#"{"model":"m","max_tokens":0}"#, Some("m"), Limit(0), false),
+            (r#"{"model":"m","max_tokens":"abc"}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":"256"}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":1.5}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":256.0}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":-1}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":null}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":true}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":[1]}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":{"n":1}}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":18446744073709551616}"#, Some("m"), Invalid, false),
+            // A key given twice takes its last value.
+            (r#"{"model":"m","max_tokens":1,"max_tokens":2}"#, Some("m"), Limit(2), false),
+            (r#"{"model":"m","max_tokens":1,"max_tokens":"x"}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":"x","max_tokens":3}"#, Some("m"), Limit(3), false),
+            (r#"{"model":"m","max_completion_tokens":64}"#, Some("m"), Absent, true),
+            (r#"{"model":"m","max_completion_tokens":"x"}"#, Some("m"), Absent, true),
+            (r#"{"model":"m","max_completion_tokens":null}"#, Some("m"), Absent, true),
+            (r#"{"model":"m","max_tokens":32,"max_completion_tokens":64}"#, Some("m"), Limit(32), true),
+            // Keys are compared after unescaping, as every JSON reader does.
+            (r#"{"model":"m","max_tokens":7}"#, Some("m"), Limit(7), false),
+            // A nested `max_tokens` is not the request's.
+            (r#"{"model":"m","options":{"max_tokens":9}}"#, Some("m"), Absent, false),
+            (r#"{}"#, None, Absent, false),
+            (r#"{"messages":[]}"#, None, Absent, false),
+            (r#"{"max_tokens":8}"#, None, Limit(8), false),
+            // `model`'s own failure modes read as no model, exactly as routing always has, but do
+            // not hide a `max_tokens` on either side of them.
+            (r#"{"model":5,"max_tokens":8}"#, None, Limit(8), false),
+            (r#"{"max_tokens":8,"model":5}"#, None, Limit(8), false),
+            (r#"{"model":true,"max_tokens":8}"#, None, Limit(8), false),
+            (r#"{"model":["m"],"max_tokens":8}"#, None, Limit(8), false),
+            (r#"{"model":{"m":1},"max_tokens":8}"#, None, Limit(8), false),
+            (r#"{"model":null}"#, None, Absent, false),
+            (r#"{"model":null,"max_tokens":8}"#, None, Limit(8), false),
+            (r#"{"model":"a","model":"b"}"#, None, Absent, false),
+            (r#"{"model":"a","model":"b","max_tokens":5000}"#, None, Limit(5000), false),
+            (r#"{"model":null,"model":"b","max_tokens":5000}"#, None, Limit(5000), false),
+            (r#"{"model":"a","max_tokens":5,"model":"b"}"#, None, Limit(5), false),
+            (r#"{"model":"m"} x"#, None, Absent, false),
+            (r#"{"model":"m","max_tokens":5} x"#, None, Limit(5), false),
+            (r#"{"model":"m","max_tokens":5000,"#, None, Limit(5000), false),
+            ("not json", None, Absent, false),
+            ("", None, Absent, false),
+            (r#""model""#, None, Absent, false),
+            // An array reads positionally, as a derived struct reads it: its first element is the
+            // model. Odd, but it is what routing has always done, so it is kept.
+            (r#"["m"]"#, Some("m"), Absent, false),
+            (r#"[]"#, None, Absent, false),
+            (r#"["m","extra"]"#, None, Absent, false),
+            (r#"[{"model":"m","max_tokens":8}]"#, None, Absent, false),
+            // A value the strict read of `max_tokens` rejects but a skip accepts: `Invalid`, and
+            // `model` still read.
+            (r#"{"model":"m","max_tokens":"\ud800"}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":1e400}"#, Some("m"), Invalid, false),
+            (r#"{"model":"m","max_tokens":"\ud800""#, None, Invalid, false),
+            // A lone surrogate elsewhere does not hide `max_tokens`, before it or after.
+            (r#"{"model":"m","max_tokens":5000,"messages":[{"content":"\ud800"}]}"#, Some("m"), Limit(5000), false),
+            (r#"{"messages":[{"content":"\ud800"}],"model":"m","max_tokens":5000}"#, Some("m"), Limit(5000), false),
+            // Known residuals (see `MaxTokens`): a lone surrogate in a top-level key or in the
+            // `model` string stops serde_json, so a `max_tokens` after it is not reached, where Go
+            // would substitute U+FFFD and carry on. `model` still matches the old read.
+            (r#"{"\ud800":1,"model":"m","max_tokens":5000}"#, None, Absent, false),
+            (r#"{"model":"\ud800","max_tokens":5000}"#, None, Absent, false),
+        ];
+        let u64_max = format!(r#"{{"model":"m","max_tokens":{}}}"#, u64::MAX);
+        let built: Vec<(Vec<u8>, Option<&'static str>, MaxTokens, bool)> = vec![
+            (u64_max.into_bytes(), Some("m"), Limit(u64::MAX), false),
+            // Arrays nested past serde_json's document-tree depth limit, before and after the key.
+            (bytes(&[br#"{"model":"m","max_tokens":5000,"x":"#, deep, b"}"]), Some("m"), Limit(5000), false),
+            (bytes(&[br#"{"x":"#, deep, br#","model":"m","max_tokens":5000}"#]), Some("m"), Limit(5000), false),
+            (bytes(&[br#"{"model":"m","max_tokens":"#, deep, b"}"]), Some("m"), Invalid, false),
+            // A raw byte that is not UTF-8 inside a string, before and after the key.
+            (
+                bytes(&[br#"{"model":"m","max_tokens":5000,"messages":[{"content":"a"#, b"\xff", br#"b"}]}"#]),
+                Some("m"),
+                Limit(5000),
+                false,
+            ),
+            (
+                bytes(&[br#"{"messages":[{"content":"a"#, b"\xff", br#"b"}],"model":"m","max_tokens":5000}"#]),
+                Some("m"),
+                Limit(5000),
+                false,
+            ),
+            (bytes(&[br#"{"model":"m","max_tokens":"a"#, b"\xff", br#"b"}"#]), Some("m"), Invalid, false),
+            // Known residuals, as above, for a raw invalid UTF-8 byte.
+            (bytes(&[br#"{"a"#, b"\xff", br#"":1,"model":"m","max_tokens":5000}"#]), None, Absent, false),
+            (bytes(&[br#"{"model":"a"#, b"\xff", br#"","max_tokens":5000}"#]), None, Absent, false),
+            // A leading byte-order mark is not JSON.
+            (bytes(&[b"\xef\xbb\xbf", br#"{"model":"m","max_tokens":5}"#]), None, Absent, false),
+        ];
+        text.into_iter()
+            .map(|(body, model, max, mct)| (body.as_bytes().to_vec(), model, max, mct))
+            .chain(built)
+            .collect()
+    }
 
     #[test]
     fn parses_every_body_shape() {
-        let u64_max = format!(r#"{{"model":"m","max_tokens":{}}}"#, u64::MAX);
-        let u64_max_plus_one = r#"{"model":"m","max_tokens":18446744073709551616}"#;
-        let cases: Vec<(String, Option<&str>, MaxTokens, bool)> = [
-            (r#"{"model":"m"}"#, Some("m"), MaxTokens::Absent, false),
-            (r#"{"model":"m","max_tokens":256}"#, Some("m"), MaxTokens::Limit(256), false),
-            (r#"{"model":"m","max_tokens":0}"#, Some("m"), MaxTokens::Limit(0), false),
-            (r#"{"model":"m","max_tokens":"abc"}"#, Some("m"), MaxTokens::Invalid, false),
-            (r#"{"model":"m","max_tokens":"256"}"#, Some("m"), MaxTokens::Invalid, false),
-            (r#"{"model":"m","max_tokens":1.5}"#, Some("m"), MaxTokens::Invalid, false),
-            (r#"{"model":"m","max_tokens":256.0}"#, Some("m"), MaxTokens::Invalid, false),
-            (r#"{"model":"m","max_tokens":-1}"#, Some("m"), MaxTokens::Invalid, false),
-            (r#"{"model":"m","max_tokens":null}"#, Some("m"), MaxTokens::Invalid, false),
-            (r#"{"model":"m","max_tokens":[1]}"#, Some("m"), MaxTokens::Invalid, false),
-            (u64_max_plus_one, Some("m"), MaxTokens::Invalid, false),
-            // A key given twice: the routing read is untouched, and the last value wins, as in
-            // serde_json's map (and Go's encoding/json, which Ollama uses).
-            (r#"{"model":"m","max_tokens":1,"max_tokens":2}"#, Some("m"), MaxTokens::Limit(2), false),
-            (r#"{"model":"m","max_completion_tokens":64}"#, Some("m"), MaxTokens::Absent, true),
-            (r#"{"model":"m","max_completion_tokens":"x"}"#, Some("m"), MaxTokens::Absent, true),
-            (r#"{"model":"m","max_completion_tokens":null}"#, Some("m"), MaxTokens::Absent, true),
-            (
-                r#"{"model":"m","max_tokens":32,"max_completion_tokens":64}"#,
-                Some("m"),
-                MaxTokens::Limit(32),
-                true,
-            ),
-            (r#"{}"#, None, MaxTokens::Absent, false),
-            (r#"{"messages":[]}"#, None, MaxTokens::Absent, false),
-            (r#"{"max_tokens":8}"#, None, MaxTokens::Limit(8), false),
-            // `model`'s own failure modes still read as no model, exactly as routing always has.
-            (r#"{"model":5,"max_tokens":8}"#, None, MaxTokens::Limit(8), false),
-            (r#"{"model":null}"#, None, MaxTokens::Absent, false),
-            (r#"{"model":"a","model":"b"}"#, None, MaxTokens::Absent, false),
-            ("not json", None, MaxTokens::Absent, false),
-            ("", None, MaxTokens::Absent, false),
-            (r#"[{"model":"m","max_tokens":8}]"#, None, MaxTokens::Absent, false),
-            (r#""model""#, None, MaxTokens::Absent, false),
-        ]
-        .into_iter()
-        .map(|(body, model, max, mct): Case| (body.to_string(), model, max, mct))
-        .chain([(u64_max, Some("m"), MaxTokens::Limit(u64::MAX), false)])
-        .collect();
-
-        for (body, model, max_tokens, max_completion_tokens) in cases {
-            let shape = RequestShape::parse(body.as_bytes());
-            assert_eq!(shape.model(), model, "model of {body}");
-            assert_eq!(shape.max_tokens(), max_tokens, "max_tokens of {body}");
+        for (body, model, max_tokens, max_completion_tokens) in cases() {
+            let shown = String::from_utf8_lossy(&body);
+            let shape = RequestShape::parse(&body);
+            assert_eq!(shape.model(), model, "model of {shown}");
+            assert_eq!(shape.max_tokens(), max_tokens, "max_tokens of {shown}");
             assert_eq!(
                 shape.has_max_completion_tokens(),
                 max_completion_tokens,
-                "max_completion_tokens presence of {body}"
+                "max_completion_tokens presence of {shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_reads_as_the_old_routing_read_did_on_every_body() {
+        for (body, _, _, _) in cases() {
+            let shown = String::from_utf8_lossy(&body);
+            assert_eq!(
+                RequestShape::parse(&body).model(),
+                old_model_read(&body).as_deref(),
+                "model of {shown}"
             );
         }
     }
