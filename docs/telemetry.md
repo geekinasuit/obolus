@@ -86,7 +86,9 @@ flowchart TB
   tfwd -->|"2xx"| served["served"]
   token -->|"no"| cap{"body read in full,<br/>output bounded within<br/>the output cap?"}
   cap -->|"no"| capped["output_cap_refused"]
-  cap --> hdr{"PAYMENT-SIGNATURE<br/>present?"}
+  cap --> rated{"token pricing:<br/>model has a rate<br/>on its backend?"}
+  rated -->|"no"| unpriced["unpriced_model"]
+  rated --> hdr{"PAYMENT-SIGNATURE<br/>present?"}
   hdr -->|"no"| required["payment_required"]
   hdr -->|"undecodable"| malformed["payment_malformed"]
   hdr --> match{"matches an offered<br/>option, method and flow,<br/>no server-owned extension field?"}
@@ -121,6 +123,12 @@ generate more ([#31](https://github.com/geekinasuit/obolus/issues/31)). It is re
 paying path, after routing and before pricing, so it has `access: "payment"` and a backend but no
 offers, and is never charged. A bearer-token request is not capped and never ends here.
 
+`unpriced_model` occurs only under token pricing (`OBOLUS_PRICING=token`): a paid request that
+passed the output cap but names a model its backend has no token rate for, or names no model at
+all ([#31](https://github.com/geekinasuit/obolus/issues/31)). It is refused with a `400` after the
+cap and before pricing, so like `output_cap_refused` it has `access: "payment"` and a backend but
+no offers, and is never charged. A bearer-token request is not priced and never ends here.
+
 ## Cost and revenue
 
 These two fields are derived from the outcome and whether the upstream was called. The gateway
@@ -145,9 +153,9 @@ The details that matter:
   declared cost, since the model may have kept working, and a run of these means the window
   (`OBOLUS_MAX_TIMEOUT_SECS`) is short for the model behind it. When it is `false`, verify alone
   used up the window; the event carries `"0"`, and a run of these points at a slow facilitator.
-- **An unknown cost is `null`, never `"0"`.** Under the static rate no backend declares a cost, so
-  every served request records `cost: null`. A zero would read as free. Revenue-versus-cost is
-  computable only under the cost-plus rate, where every backend is required to declare a cost.
+- **An unknown cost is `null`, never `"0"`.** Under the static and token rates no backend declares a
+  cost, so every served request records `cost: null`. A zero would read as free. Revenue-versus-cost
+  is computable only under the cost-plus rate, where every backend is required to declare a cost.
 - **Revenue is the price charged,** the quoted amount of the option the payment matched. The
   settlement receipt carries no amount of its own. The gateway checks that the option the client
   names carries the quoted amount, but never opens the signed authorization, so it never checks the
@@ -187,7 +195,14 @@ The example below is a copy of the line the test `the_json_line_matches_the_docu
 disagree.
 
 ```json
-{"v":1,"kind":"request","ts_ms":1700000000000,"outcome":"settled","access":"payment","backend":"local","model":"llama3","offers":[{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"}],"paid":{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"},"upstream_invoked":true,"upstream_status":200,"cost":"800","revenue":"1000","transaction":"0xTEST-TX"}
+{"v":1,"kind":"request","ts_ms":1700000000000,"outcome":"settled","access":"payment","backend":"local","model":"llama3","offers":[{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"}],"paid":{"scheme":"exact","network":"test-network","asset":"0xTEST-ASSET","amount":"1000"},"upstream_invoked":true,"upstream_status":200,"cost":"800","revenue":"1000","transaction":"0xTEST-TX","quote_input_tokens":null,"quote_max_tokens":null}
+```
+
+Under token pricing the last two keys carry the quote's inputs instead, as
+`a_token_priced_line_carries_the_quote_inputs` pins:
+
+```json
+…,"quote_input_tokens":512,"quote_max_tokens":1000}
 ```
 
 | Key | Type | Meaning |
@@ -199,13 +214,15 @@ disagree.
 | `access` | string \| null | `"payment"` or `"token"`; `null` only for `unroutable` and `ambiguous_key`, which are decided first. |
 | `backend` | string \| null | The routed backend's id; `null` for `unroutable` and `ambiguous_key`. |
 | `model` | string \| null | The model the request named, cut to at most 256 bytes; `null` if it named none. |
-| `offers` | array | Every option quoted to this request, at its determined price. Empty off the payment path, and on `output_cap_refused`, which is refused before anything is quoted. |
+| `offers` | array | Every option quoted to this request, at its determined price. Empty off the payment path, and on `output_cap_refused` and `unpriced_model`, which are refused before anything is quoted. |
 | `paid` | object \| null | The offered option the payment matched, once one did. |
 | `upstream_invoked` | bool | Whether the upstream was called. |
 | `upstream_status` | integer \| null | The upstream's response status, when it produced one. |
 | `cost` | string \| null | See [Cost and revenue](#cost-and-revenue). |
 | `revenue` | string \| null | See [Cost and revenue](#cost-and-revenue). |
 | `transaction` | string \| null | The settlement transaction, on `settled` when the facilitator reported one. |
+| `quote_input_tokens` | integer \| null | Under token pricing, the input-token estimate the quote was computed from: the request body's length in bytes divided by 4, rounded up (see [pricing](pricing.md)). `null` under any other rate, off the payment path, and on an outcome refused before pricing. Added within version `1`. |
+| `quote_max_tokens` | integer \| null | Under token pricing, the request's `max_tokens`, at which the quote prices output. `null` exactly when `quote_input_tokens` is. Added within version `1`. Together the two say what a token quote assumed, the ground a finer output price and an overpayment remedy would be measured against ([#120](https://github.com/geekinasuit/obolus/issues/120)). |
 
 Every key is always present on a request line, `null` where it does not apply, so a consumer reads
 a fixed set of keys. Every amount is a decimal string of atomic units, the same shape as x402's

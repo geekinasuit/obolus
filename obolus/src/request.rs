@@ -27,6 +27,7 @@ pub struct RequestShape {
     n_other_than_one: bool,
     best_of: bool,
     read_in_full: bool,
+    body_len: usize,
 }
 
 /// A top-level key that folds to `model` or `max_tokens` without being exactly that key:
@@ -138,7 +139,14 @@ impl RequestShape {
             n_other_than_one,
             best_of: scan.best_of,
             read_in_full,
+            body_len: body.len(),
         }
+    }
+
+    /// The length of the whole request body in bytes, as received: the bytes forwarded upstream.
+    /// Token pricing estimates the prompt's size from it (see [`crate::pricing::TokenPrice`]).
+    pub fn body_len(&self) -> usize {
+        self.body_len
     }
 
     /// Whether the top-level value was read through to its end without error, trailing bytes
@@ -992,6 +1000,14 @@ mod tests {
                 old_model_read(&body).as_deref(),
                 "model of {shown}"
             );
+        }
+    }
+
+    #[test]
+    fn body_len_is_the_whole_body_whatever_it_holds() {
+        // Every byte counts, read or not: whitespace, an unreadable tail, a body that is not JSON.
+        for body in [&b""[..], b"{}", b"  {\"model\":\"m\"}  ", b"{\"model\":\"m\"} trailing", b"\xff\xfe"] {
+            assert_eq!(RequestShape::parse(body).body_len(), body.len(), "{body:?}");
         }
     }
 }

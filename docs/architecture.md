@@ -183,7 +183,7 @@ The seams, and what rides behind each:
 |---|---|---|---|
 | Fulfillment | `Facilitator` | Is this payment good, and settle it | delegating (HTTP), test fake |
 | Upstream | `Upstream` | Serve the inference | Ollama / OpenAI-compatible, test fake |
-| Pricing | `PriceDeterminer` | What does this request cost | static, cost-plus (config-selectable; cost-plus is per-backend, single-chain); flat (a library rate, not yet wired to config) |
+| Pricing | `PriceDeterminer` | What does this request cost | static, cost-plus, token (config-selectable; cost-plus is per-backend and token per-model, both single-chain); flat (a library rate, not yet wired to config) |
 | Telemetry | `Telemetry` | What happened to this request | JSON lines on stdout (the binary's default), off (config-selectable); no-op (a library `Gateway`'s default), test fake |
 
 A planned seam named by the vision but not yet built: feature-flags/kill-switch (per-backend
@@ -290,10 +290,10 @@ These hold today; each is easy to break while improving something nearby.
 The near-term milestone is "someone can run this for money": the object-safe backend seam,
 structured multi-backend config, model-identity routing, the pricing seam, and minimal
 revenue/cost telemetry — all still stateless. The subsystem currently growing is **pricing**:
-per-backend cost-plus and a time-bounded promotional discount over it have landed (each backend
-declares its own cost, the margin stays gateway-wide, and a promotion is a percentage off during a
-window), on the seam and registry already described; a genuinely free rate and cross-asset
-(multi-chain) cost-plus are the remaining steps. See [`pricing.md`](pricing.md) for that design.
+per-backend cost-plus, per-model token pricing, and a time-bounded promotional discount over either
+have landed (each backend declares its own cost or token rates, the margin stays gateway-wide, and
+a promotion is a percentage off during a window), on the seam and registry already described; a genuinely free rate and cross-asset
+(multi-chain) cost-plus and token pricing are the remaining steps. See [`pricing.md`](pricing.md) for that design.
 Telemetry records one event per request and writes it as a JSON line on stdout; OpenTelemetry,
 Kafka, and database transports are later work — see [`telemetry.md`](telemetry.md).
 

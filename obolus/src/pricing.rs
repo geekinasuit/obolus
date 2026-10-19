@@ -19,10 +19,11 @@
 //!   cannot compute a quote no conforming client could pay; there is no revalidation step to forget.
 //!
 //! The default determiner, [`StaticPrice`], reproduces the pre-seam gateway exactly. The concrete
-//! rate structures the vision names are built on top of this trait; [`FlatPrice`] is the first.
+//! rate structures the vision names are built on top of this trait: [`FlatPrice`], [`CostPlus`],
+//! [`TokenPrice`], and the [`Promotional`] modifier over any of them.
 
-use crate::backends::Backend;
-use crate::request::RequestShape;
+use crate::backends::{Backend, TokenRate};
+use crate::request::{MaxTokens, RequestShape};
 use crate::x402::PaymentRequirements;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -155,6 +156,72 @@ impl PriceDeterminer for CostPlus {
     }
 }
 
+/// How many request-body bytes count as one input token in [`estimated_input_tokens`].
+pub const BYTES_PER_INPUT_TOKEN: u64 = 4;
+
+/// The token count a [`TokenRate`] is quoted per: rates are atomic units per million tokens.
+const TOKENS_PER_RATE: u128 = 1_000_000;
+
+/// The input-token estimate token pricing quotes on: the whole request body's length in bytes,
+/// divided by [`BYTES_PER_INPUT_TOKEN`] and rounded up. The whole body, not just the prompt text:
+/// it is what the gateway forwards, and reading the prompt out of it would mean parsing a format
+/// the gateway otherwise never interprets. Telemetry records this same number (#120).
+pub fn estimated_input_tokens(body_len: usize) -> u64 {
+    // `usize` fits a `u64` on every platform this builds for; saturate rather than assume it.
+    u64::try_from(body_len).unwrap_or(u64::MAX).div_ceil(BYTES_PER_INPUT_TOKEN)
+}
+
+/// The token-priced quote: `ceil((input_tokens × input + max_tokens × output) / 1_000_000)` atomic
+/// units. `None` when any step overflows a `u128`, which the caller turns into an unpayable quote.
+/// Rounded up, so a fraction of an atomic unit is charged as a whole one rather than given away.
+pub fn token_quote(input_tokens: u64, max_tokens: u64, rate: TokenRate) -> Option<u128> {
+    let input = rate.input.checked_mul(u128::from(input_tokens))?;
+    let output = rate.output.checked_mul(u128::from(max_tokens))?;
+    Some(input.checked_add(output)?.div_ceil(TOKENS_PER_RATE))
+}
+
+/// The rate token pricing applies to this request: the routed backend's rate for the model the
+/// request names, matched exactly. `None` for a model the backend has no rate for, and for a
+/// request naming no model (one a catch-all took). The gateway refuses such a request before
+/// pricing it; this is the one definition both that check and [`TokenPrice`] use.
+pub fn model_rate(request: &RequestShape, backend: &Backend) -> Option<TokenRate> {
+    request.model().and_then(|model| backend.rates.get(model)).copied()
+}
+
+/// Token pricing: quote each request from its model's declared per-million-token rates on the
+/// routed backend, by [`token_quote`] over [`estimated_input_tokens`] and the request's
+/// `max_tokens`.
+///
+/// The rates are the client's price: nothing is marked up, and the config door refuses a cost or
+/// a margin alongside this rate. The output is priced at the most the request asked for, not what
+/// it generated, because the price is quoted before anything is generated; a request that stops
+/// early pays for the tokens it did not use (#120).
+///
+/// Every input to the quote is fixed by the request bytes, the routed backend and the boot
+/// configuration, so a paid retry of the same body is quoted the same amount its challenge was.
+///
+/// Fails closed, so `quote` is total and never gives work away: an overflow, a model with no rate,
+/// a `max_tokens` that is not a [`MaxTokens::Limit`], or a computed zero all quote `u128::MAX`,
+/// which no client can pay. The gateway refuses the second and third before pricing, and the
+/// config door's rules make the fourth unreachable (see [`crate::config::require_backend_rates`]
+/// and the output cap), so on a configured gateway only an overflow reaches a sentinel. Zero in
+/// particular is never quoted: a zero-amount settle is not supported (#67).
+pub struct TokenPrice;
+
+impl PriceDeterminer for TokenPrice {
+    fn quote(&self, ctx: PriceContext<'_>) -> u128 {
+        let (Some(rate), MaxTokens::Limit(max_tokens)) =
+            (model_rate(ctx.request, ctx.backend), ctx.request.max_tokens())
+        else {
+            return u128::MAX;
+        };
+        match token_quote(estimated_input_tokens(ctx.request.body_len()), max_tokens, rate) {
+            Some(quote) if quote > 0 => quote,
+            _ => u128::MAX,
+        }
+    }
+}
+
 /// A time-bounded promotional discount layered over a base rate.
 ///
 /// A promotion is a percentage off for a while: during the `[start, end)` window (Unix seconds,
@@ -165,7 +232,8 @@ impl PriceDeterminer for CostPlus {
 /// asset-agnostic, so the same promo is correct across payment options whose assets have different
 /// decimals — where one fixed atomic number would mean two different real prices — and it composes
 /// over any base rate. So `promotional` is a *modifier*, not a rate of its own: `OBOLUS_PRICING`
-/// still selects the base (`static` or `cost-plus`) and the promo wraps whatever that produced.
+/// still selects the base (`static`, `cost-plus` or `token`) and the promo wraps whatever that
+/// produced.
 ///
 /// The discounted quote is `base * (10000 - discount_bps) / 10000`, floored to whole atomic units —
 /// the same direction as the [`CostPlus`] markup floor, rounding toward the payer by under one unit.
@@ -480,5 +548,131 @@ mod tests {
         let open = Promotional::new(2500, 0, u64::MAX, flat(1000));
         assert_eq!(ended.quote(ctx(&backend, &requirement("1"))), 1000);
         assert_eq!(open.quote(ctx(&backend, &requirement("1"))), 750);
+    }
+
+    // ---- token pricing ----
+
+    /// USDC's $3 per million input tokens and $15 per million output tokens.
+    const USDC_3_15: TokenRate = TokenRate { input: 3_000_000, output: 15_000_000 };
+
+    /// A backend serving `a-model` at `rate`.
+    fn rated(rate: TokenRate) -> Backend {
+        backend().with_rates([("a-model".to_string(), rate)].into_iter().collect())
+    }
+
+    /// A request for `a-model` asking for `max_tokens`, padded with spaces to exactly `len` bytes.
+    fn sized(len: usize, max_tokens: u64) -> RequestShape {
+        let head = format!(r#"{{"model":"a-model","max_tokens":{max_tokens}}}"#);
+        assert!(head.len() <= len, "{len} bytes is too short for {head}");
+        RequestShape::parse(format!("{head}{}", " ".repeat(len - head.len())).as_bytes())
+    }
+
+    fn token_quote_of(request: &RequestShape, backend: &Backend) -> u128 {
+        TokenPrice.quote(PriceContext { request, backend, requirement: &requirement("1") })
+    }
+
+    #[test]
+    fn token_price_quotes_the_worked_example() {
+        // The worked example in docs/pricing.md. A 2 KB body (2048 bytes) estimates
+        // 2048 / 4 = 512 input tokens. Input: 512 × 3_000_000 = 1_536_000_000. Output: 1000 ×
+        // 15_000_000 = 15_000_000_000. Sum 16_536_000_000, divided by 1_000_000 = 16_536 atomic
+        // units, which is $0.016536 in USDC.
+        assert_eq!(token_quote_of(&sized(2048, 1000), &rated(USDC_3_15)), 16_536);
+    }
+
+    #[test]
+    fn the_input_estimate_rounds_a_partial_token_up() {
+        assert_eq!(estimated_input_tokens(0), 0);
+        assert_eq!(estimated_input_tokens(4), 1);
+        assert_eq!(estimated_input_tokens(5), 2);
+        assert_eq!(estimated_input_tokens(2048), 512);
+    }
+
+    #[test]
+    fn token_price_rounds_a_partial_atomic_unit_up() {
+        // 1 input token × 1_000_001 = 1_000_001, one over a million: 1.000001 units, charged as 2.
+        let rate = TokenRate { input: 1_000_001, output: 0 };
+        assert_eq!(token_quote(1, 1, rate), Some(2));
+        // A rate far below one unit per token still charges one whole unit, never zero:
+        // 2 × 1 + 1 × 1 = 3 millionths of a unit.
+        assert_eq!(token_quote(2, 1, TokenRate { input: 1, output: 1 }), Some(1));
+    }
+
+    #[test]
+    fn token_price_with_a_zero_input_rate_charges_only_output() {
+        // 1000 × 15_000_000 / 1_000_000 = 15_000, whatever the body's size.
+        let rate = TokenRate { input: 0, output: 15_000_000 };
+        assert_eq!(token_quote_of(&sized(2048, 1000), &rated(rate)), 15_000);
+        assert_eq!(token_quote_of(&sized(64, 1000), &rated(rate)), 15_000);
+    }
+
+    #[test]
+    fn token_price_with_a_zero_output_rate_charges_only_input() {
+        // 512 × 3_000_000 / 1_000_000 = 1_536, whatever max_tokens is.
+        let rate = TokenRate { input: 3_000_000, output: 0 };
+        assert_eq!(token_quote_of(&sized(2048, 1000), &rated(rate)), 1_536);
+        assert_eq!(token_quote_of(&sized(2048, 1), &rated(rate)), 1_536);
+    }
+
+    #[test]
+    fn token_price_fails_closed_on_overflow() {
+        // A huge rate: any product past u128::MAX is unpayable, never wrapped to a small number.
+        let huge = TokenRate { input: u128::MAX, output: 0 };
+        assert_eq!(token_quote(2, 1, huge), None);
+        assert_eq!(token_quote_of(&sized(64, 1), &rated(huge)), u128::MAX);
+        // A huge body against a large rate: u64::MAX tokens × 2^65 is past 2^128.
+        let large = TokenRate { input: 1 << 65, output: 0 };
+        assert_eq!(token_quote(u64::MAX, 1, large), None);
+        // At the edge: u64::MAX × (2^64 + 1) is exactly u128::MAX, which fits; one more output
+        // atomic unit on top overflows the sum.
+        let edge = TokenRate { input: u128::MAX / u128::from(u64::MAX), output: 0 };
+        assert_eq!(token_quote(u64::MAX, 1, edge), Some(u128::MAX.div_ceil(1_000_000)));
+        assert_eq!(token_quote(u64::MAX, 1, TokenRate { output: 1, ..edge }), None);
+        // A huge output rate overflows on the output side alone.
+        assert_eq!(token_quote(0, 2, TokenRate { input: 0, output: u128::MAX }), None);
+    }
+
+    #[test]
+    fn token_price_fails_closed_on_a_model_without_a_rate() {
+        // Unreachable past the gateway's check, which refuses such a request before pricing it.
+        let other = backend().with_rates([("other".to_string(), USDC_3_15)].into_iter().collect());
+        assert_eq!(token_quote_of(&sized(64, 1), &other), u128::MAX);
+        let no_model = RequestShape::parse(br#"{"max_tokens":1}"#);
+        assert_eq!(token_quote_of(&no_model, &rated(USDC_3_15)), u128::MAX);
+    }
+
+    #[test]
+    fn token_price_fails_closed_without_a_usable_max_tokens() {
+        // Unreachable past the output cap, which refuses these before pricing.
+        for body in [&br#"{"model":"a-model"}"#[..], br#"{"model":"a-model","max_tokens":"9"}"#] {
+            assert_eq!(token_quote_of(&RequestShape::parse(body), &rated(USDC_3_15)), u128::MAX);
+        }
+    }
+
+    #[test]
+    fn token_price_never_quotes_zero() {
+        // Zero only comes from all-zero inputs, which the config door and the output cap rule out
+        // (a both-zero rate is refused, max_tokens is at least 1). Reached anyway, it fails closed.
+        let zero = TokenRate { input: 0, output: 0 };
+        assert_eq!(token_quote(512, 1000, zero), Some(0));
+        assert_eq!(token_quote_of(&sized(2048, 1000), &rated(zero)), u128::MAX);
+    }
+
+    #[test]
+    fn promotional_composes_over_token_price() {
+        // 16_536 (the worked example), 25% off inside the window = 12_402; untouched outside.
+        let backend = rated(USDC_3_15);
+        let request = sized(2048, 1000);
+        let at = |now| promo_at(now, 2500, 100, 200, Arc::new(TokenPrice));
+        let quote = |promo: Promotional| {
+            promo.quote(PriceContext { request: &request, backend: &backend, requirement: &requirement("1") })
+        };
+        assert_eq!(quote(at(150)), 12_402);
+        assert_eq!(quote(at(250)), 16_536);
+        // The clamp still applies: a 1-unit token quote 99.99% off is 1, not 0.
+        let tiny = rated(TokenRate { input: 1, output: 1 });
+        let deep = promo_at(150, 9999, 100, 200, Arc::new(TokenPrice));
+        let small = sized(64, 1);
+        assert_eq!(deep.quote(PriceContext { request: &small, backend: &tiny, requirement: &requirement("1") }), 1);
     }
 }

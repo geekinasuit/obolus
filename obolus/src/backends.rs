@@ -110,9 +110,9 @@ struct BackendEntry {
 }
 
 /// One model's token rates, in the advertised asset's atomic units **per million tokens** — for
-/// USDC (6 decimals), `3_000_000` is $3 per million. Read by token pricing (#31); no rate in this
-/// version reads it, so a configured rate is refused at boot as inert (see
-/// [`crate::config::refuse_inert_rates`]).
+/// USDC (6 decimals), `3_000_000` is $3 per million. Read only by token pricing
+/// ([`crate::pricing::TokenPrice`], #31); under any other rate a configured rate is refused at boot
+/// as inert (see [`crate::config::require_backend_rates`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenRate {
     /// Per million prompt tokens.
@@ -532,8 +532,8 @@ pub struct Backend {
     /// selected (see [`crate::config::require_backend_costs`]).
     pub cost: Option<u128>,
     /// The operator's declared per-model token rates, empty if none were declared. Read by token
-    /// pricing once it exists (#31); until then any declared rate is refused at boot as inert (see
-    /// [`crate::config::refuse_inert_rates`]).
+    /// pricing (#31), which requires every backend to declare some; under any other rate a declared
+    /// rate is refused at boot as inert (see [`crate::config::require_backend_rates`]).
     pub rates: ModelRates,
     upstream: Arc<dyn Upstream>,
 }
