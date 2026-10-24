@@ -123,6 +123,11 @@ pub enum ConfigError {
     #[error("OBOLUS_ACCEPTS entry for network {network:?}: {defect}")]
     MissingTokenDomain { network: String, defect: EntryDefect },
 
+    /// A Solana `exact` entry does not carry the facilitator fee payer in its `extra`. See
+    /// [`EntryDefect::MissingFeePayer`].
+    #[error("OBOLUS_ACCEPTS entry for network {network:?}: {defect}")]
+    MissingFeePayer { network: String, defect: EntryDefect },
+
     /// An entry's `extra` names a transfer method or payment flow this gateway does not run. See
     /// [`EntryDefect::UnsupportedTransfer`].
     #[error("OBOLUS_ACCEPTS entry for network {network:?}: {defect}")]
@@ -140,6 +145,9 @@ impl ConfigError {
             EntryDefect::BadAmount(detail) => ConfigError::BadAmount { network, detail },
             defect @ EntryDefect::MissingTokenDomain { .. } => {
                 ConfigError::MissingTokenDomain { network, defect }
+            }
+            defect @ EntryDefect::MissingFeePayer => {
+                ConfigError::MissingFeePayer { network, defect }
             }
             defect @ EntryDefect::UnsupportedTransfer { .. } => {
                 ConfigError::UnsupportedTransfer { network, defect }
@@ -213,6 +221,16 @@ pub enum EntryDefect {
     )]
     MissingTokenDomain { key: &'static str },
 
+    /// An `exact` option on a Solana network whose `extra` lacks the facilitator fee payer
+    /// `feePayer`, or holds one that is not a non-empty string. x402's Solana `exact` scheme
+    /// requires `feePayer` so clients can construct and co-sign the transaction; without it
+    /// no Solana client can pay at all.
+    #[error(
+        "an exact option on a Solana network must carry the facilitator fee payer in its extra, as \
+         a non-empty string \"feePayer\"; extra.feePayer is missing or not a non-empty string"
+    )]
+    MissingFeePayer,
+
     /// `extra` names a transfer method or payment flow — core spec §6.1's reserved keys — that this
     /// gateway does not run. See [`PaymentRequirements::unsupported_transfer`] for the policy.
     #[error("extra.{key} = {value} is not supported here: {supported}")]
@@ -223,6 +241,10 @@ pub enum EntryDefect {
 /// networks `exact`'s default transfer method, EIP-3009, needs the token's EIP-712 domain in
 /// `extra`.
 const EVM_NAMESPACE: &str = "eip155:";
+
+/// The CAIP-2 namespace of Solana chains. Under `exact`, Solana clients need the facilitator's
+/// fee-paying account (`feePayer`) in `extra` to construct and sign the transaction.
+const SOLANA_NAMESPACE: &str = "solana:";
 
 /// Build one advertised payment option, applying the validation **both** configuration forms owe.
 ///
@@ -263,6 +285,16 @@ pub fn validated_option(
             if !usable {
                 return Err(EntryDefect::MissingTokenDomain { key });
             }
+        }
+    }
+    if network.starts_with(SOLANA_NAMESPACE) {
+        let usable = extra
+            .as_ref()
+            .and_then(|extra| extra.get("feePayer"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !usable {
+            return Err(EntryDefect::MissingFeePayer);
         }
     }
     let option = PaymentRequirements {
@@ -1303,13 +1335,49 @@ mod tests {
 
     #[test]
     fn a_non_evm_option_needs_no_token_domain() {
-        // Solana's `exact` has no EIP-712 domain, and the placeholder network is no chain at all.
-        for network in ["solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "test-network-not-a-real-caip2"]
-        {
+        // Custom non-EVM schemes need no token domain.
+        let raw = r#"[{"network":"test-network-not-a-real-caip2","asset":"a","payTo":"p","amount":"1"}]"#;
+        assert!(parse_accepts(raw, &shared()).is_ok());
+
+        // Solana needs no token domain (name/version), but carries feePayer.
+        let solana = r#"[{"network":"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1","asset":"a","payTo":"p","amount":"1","extra":{"feePayer":"FEE-PAYER"}}]"#;
+        assert!(parse_accepts(solana, &shared()).is_ok());
+    }
+
+    #[test]
+    fn a_solana_option_carrying_fee_payer_is_accepted() {
+        let solana = r#"[{"network":"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1","asset":"a","payTo":"p","amount":"1","extra":{"feePayer":"FEE-PAYER-ADDRESS"}}]"#;
+        let options = parse_accepts(solana, &shared()).unwrap();
+        assert_eq!(options[0].extra, Some(serde_json::json!({ "feePayer": "FEE-PAYER-ADDRESS" })));
+    }
+
+    #[test]
+    fn a_solana_option_without_fee_payer_is_rejected() {
+        for extra in [
+            None,
+            Some(r#"{}"#),
+            Some(r#"{"other":"field"}"#),
+            Some(r#"{"feePayer":""}"#),
+            Some(r#"{"feePayer":"   "}"#),
+            Some(r#"{"feePayer":123}"#),
+            Some(r#"{"feePayer":null}"#),
+        ] {
+            let extra_str = extra.map(|e| format!(r#","extra":{e}"#)).unwrap_or_default();
             let raw = format!(
-                r#"[{{"network":"{network}","asset":"a","payTo":"p","amount":"1"}}]"#
+                r#"[{{"network":"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1","asset":"a","payTo":"p","amount":"1"{extra_str}}}]"#
             );
-            assert!(parse_accepts(&raw, &shared()).is_ok(), "{network}");
+            let err = parse_accepts(&raw, &shared()).unwrap_err();
+            assert_eq!(
+                err,
+                ConfigError::MissingFeePayer {
+                    network: "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1".to_string(),
+                    defect: EntryDefect::MissingFeePayer,
+                },
+                "extra: {extra:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("extra.feePayer"), "{message}");
+            assert!(message.contains("solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"), "{message}");
         }
     }
 
@@ -1323,7 +1391,7 @@ mod tests {
         .unwrap();
         assert_eq!(options[0].extra.as_ref().unwrap()["assetTransferMethod"], "eip3009");
 
-        let solana = r#"[{"network":"solana:test-genesis-not-real","asset":"a","payTo":"p","amount":"1","extra":{"assetTransferMethod":"default"}}]"#;
+        let solana = r#"[{"network":"solana:test-genesis-not-real","asset":"a","payTo":"p","amount":"1","extra":{"assetTransferMethod":"default","feePayer":"FEE-PAYER"}}]"#;
         assert!(parse_accepts(solana, &shared()).is_ok());
     }
 

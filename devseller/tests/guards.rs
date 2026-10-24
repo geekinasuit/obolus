@@ -927,6 +927,7 @@ fn the_placeholder_recipient_refuses_on_a_network_whose_shape_cannot_be_checked(
         ("OBOLUS_NETWORK", SOLANA_DEVNET),
         ("OBOLUS_ASSET", "SOLANA-TEST-ASSET-NOT-REAL"),
         ("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO),
+        ("OBOLUS_EXTRA", r#"{"feePayer":"TEST-FEE-PAYER-NOT-REAL"}"#),
         ("OBOLUS_DEV_VERIFY", "accept"),
     ]);
 
@@ -973,6 +974,7 @@ fn a_non_evm_testnet_is_not_refused_for_its_recipient_shape() {
         ("OBOLUS_NETWORK", SOLANA_DEVNET),
         ("OBOLUS_ASSET", "SOLANA-TEST-ASSET-NOT-REAL"),
         ("OBOLUS_PAY_TO", "SOLANA-TEST-PAY-TO-NOT-REAL"),
+        ("OBOLUS_EXTRA", r#"{"feePayer":"TEST-FEE-PAYER-NOT-REAL"}"#),
         ("OBOLUS_DEV_VERIFY", "accept"),
     ]);
 
