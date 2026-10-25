@@ -339,7 +339,7 @@ reference client refuses to sign without them. Obolus requires both, as non-empt
 `eip155:` entry, and refuses to start without them. Whether the values are *right* for the token
 contract is not something Obolus can check; a wrong domain boots and fails at the facilitator.
 
-The Solana entry above carries `extra.feePayer`, the facilitator's fee-paying account: x402's Solana `exact` client requires it to build and sign transactions, and Obolus enforces it at startup on every `solana:` entry, refusing to boot without it.
+The Solana entry above carries `extra.feePayer`, the facilitator's fee-paying account: x402's Solana `exact` client requires it to build and sign transactions, and Obolus enforces it at startup on every `solana:` entry, refusing to boot without a valid 32-byte base58 public key.
 
 Two `extra` keys are reserved by the x402 spec rather than passed through as scheme data:
 `assetTransferMethod` (how value moves) and `paymentFlow` (when settlement happens). Obolus advertises

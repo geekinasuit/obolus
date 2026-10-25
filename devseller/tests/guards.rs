@@ -927,7 +927,7 @@ fn the_placeholder_recipient_refuses_on_a_network_whose_shape_cannot_be_checked(
         ("OBOLUS_NETWORK", SOLANA_DEVNET),
         ("OBOLUS_ASSET", "SOLANA-TEST-ASSET-NOT-REAL"),
         ("OBOLUS_PAY_TO", PLACEHOLDER_PAY_TO),
-        ("OBOLUS_EXTRA", r#"{"feePayer":"TEST-FEE-PAYER-NOT-REAL"}"#),
+        ("OBOLUS_EXTRA", r#"{"feePayer":"2qi849TBq72XMpsp8PjR4YfegDEzc7BRFZaarwQ2tKgL"}"#),
         ("OBOLUS_DEV_VERIFY", "accept"),
     ]);
 
@@ -974,12 +974,27 @@ fn a_non_evm_testnet_is_not_refused_for_its_recipient_shape() {
         ("OBOLUS_NETWORK", SOLANA_DEVNET),
         ("OBOLUS_ASSET", "SOLANA-TEST-ASSET-NOT-REAL"),
         ("OBOLUS_PAY_TO", "SOLANA-TEST-PAY-TO-NOT-REAL"),
-        ("OBOLUS_EXTRA", r#"{"feePayer":"TEST-FEE-PAYER-NOT-REAL"}"#),
+        ("OBOLUS_EXTRA", r#"{"feePayer":"2qi849TBq72XMpsp8PjR4YfegDEzc7BRFZaarwQ2tKgL"}"#),
         ("OBOLUS_DEV_VERIFY", "accept"),
     ]);
 
     run.must_have_got_past_startup();
     run.must_not_say("cannot use advertised payTo");
+}
+
+/// A Solana option whose extra.feePayer is not a valid 32-byte base58 public key is refused at startup.
+#[test]
+fn a_solana_option_with_invalid_fee_payer_refuses_at_startup() {
+    let run = exec(&[
+        ("OBOLUS_NETWORK", SOLANA_DEVNET),
+        ("OBOLUS_ASSET", "SOLANA-TEST-ASSET-NOT-REAL"),
+        ("OBOLUS_PAY_TO", "SOLANA-TEST-PAY-TO-NOT-REAL"),
+        ("OBOLUS_EXTRA", r#"{"feePayer":"TEST-FEE-PAYER-NOT-REAL"}"#),
+        ("OBOLUS_DEV_VERIFY", "accept"),
+    ]);
+
+    run.must_say("OBOLUS_NETWORK names a Solana chain, so OBOLUS_EXTRA must carry the fee payer");
+    run.must_have_refused_during_startup();
 }
 
 /// An upstream URL the client cannot speak to is refused at startup, not at the first request.
