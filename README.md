@@ -324,7 +324,8 @@ to a JSON array with one object per chain:
 [
   {"network": "eip155:84532", "asset": "0x…usdc", "payTo": "0x…you", "amount": "1000",
    "extra": {"name": "USDC", "version": "2"}},
-  {"network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "asset": "…usdc-mint", "payTo": "…you", "amount": "1000"}
+  {"network": "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1", "asset": "…usdc-mint", "payTo": "…you", "amount": "1000",
+   "extra": {"feePayer": "…facilitator-fee-payer"}}
 ]
 ```
 
@@ -338,9 +339,7 @@ reference client refuses to sign without them. Obolus requires both, as non-empt
 `eip155:` entry, and refuses to start without them. Whether the values are *right* for the token
 contract is not something Obolus can check; a wrong domain boots and fails at the facilitator.
 
-The Solana entry above is not payable as written: x402's Solana `exact` client also needs
-`extra.feePayer`, the facilitator's fee-paying account, which Obolus neither fills in nor requires yet
-([#81](https://github.com/geekinasuit/obolus/issues/81)).
+The Solana entry above carries `extra.feePayer`, the facilitator's fee-paying account: x402's Solana `exact` client requires it to build and sign transactions, and Obolus enforces it at startup on every `solana:` entry, refusing to boot without a valid 32-byte base58 public key.
 
 Two `extra` keys are reserved by the x402 spec rather than passed through as scheme data:
 `assetTransferMethod` (how value moves) and `paymentFlow` (when settlement happens). Obolus advertises
