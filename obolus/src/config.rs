@@ -293,7 +293,7 @@ pub fn validated_option(
             .as_ref()
             .and_then(|extra| extra.get("feePayer"))
             .and_then(Value::as_str)
-            .is_some_and(|value| is_valid_solana_pubkey(value.trim()));
+            .is_some_and(|value| is_valid_solana_pubkey(value));
         if !usable {
             return Err(EntryDefect::MissingFeePayer);
         }
@@ -1379,7 +1379,7 @@ mod tests {
         }
     }
 
-    const VALID_SOLANA_FEE_PAYER: &str = "2qi849TBq72XMpsp8PjR4YfegDEzc7BRFZaarwQ2tKgL";
+    const VALID_SOLANA_FEE_PAYER: &str = "4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vigw";
 
     #[test]
     fn a_non_evm_option_needs_no_token_domain() {
@@ -1417,11 +1417,13 @@ mod tests {
             Some(r#"{"feePayer":"TEST-FEE-PAYER-NOT-REAL"}"#),
             // Base58 but wrong length: 24 bytes (genesis hash) instead of 32
             Some(r#"{"feePayer":"EtWTRABZaYq6iMfeYKouRu166VU2xqa1"}"#),
+            // Padded whitespace
+            Some(r#"{"feePayer":" 4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vigw "}"#),
             // Ambiguous/invalid base58 characters
-            Some(r#"{"feePayer":"2qi849TBq72XMpsp8PjR4YfegDEzc7BRFZaarwQ2tKg0"}"#),
-            Some(r#"{"feePayer":"2qi849TBq72XMpsp8PjR4YfegDEzc7BRFZaarwQ2tKgO"}"#),
-            Some(r#"{"feePayer":"2qi849TBq72XMpsp8PjR4YfegDEzc7BRFZaarwQ2tKgI"}"#),
-            Some(r#"{"feePayer":"2qi849TBq72XMpsp8PjR4YfegDEzc7BRFZaarwQ2tKgl"}"#),
+            Some(r#"{"feePayer":"4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vig0"}"#),
+            Some(r#"{"feePayer":"4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4VigO"}"#),
+            Some(r#"{"feePayer":"4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4VigI"}"#),
+            Some(r#"{"feePayer":"4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vigl"}"#),
         ] {
             let extra_str = extra.map(|e| format!(r#","extra":{e}"#)).unwrap_or_default();
             let raw = format!(
