@@ -129,6 +129,9 @@ fn single_chain_defect(defect: EntryDefect) -> anyhow::Error {
         EntryDefect::MissingTokenDomain { .. } => {
             anyhow::anyhow!("OBOLUS_NETWORK names an EVM chain, so OBOLUS_EXTRA must carry the token domain: {defect}")
         }
+        EntryDefect::MissingFeePayer => {
+            anyhow::anyhow!("OBOLUS_NETWORK names a Solana chain, so OBOLUS_EXTRA must carry the fee payer: {defect}")
+        }
         EntryDefect::UnsupportedTransfer { .. } => anyhow::anyhow!("OBOLUS_EXTRA: {defect}"),
     }
 }

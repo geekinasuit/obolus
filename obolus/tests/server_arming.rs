@@ -220,7 +220,8 @@ const ACCEPTS_MAINNET_HIDDEN_AMONG_TESTNETS: &str = r#"[
     {"extra":{"name":"TEST-TOKEN-NOT-REAL","version":"1"},"network":"eip155:8453","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
      "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"},
     {"network":"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1","asset":"0xTEST-ASSET-ADDRESS-NOT-REAL",
-     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000"}
+     "payTo":"0xTEST-PAY-TO-ADDRESS-NOT-REAL","amount":"1000",
+     "extra":{"feePayer":"4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vigw"}}
 ]"#;
 
 /// A genuine Base mainnet entry — exactly what `OBOLUS_ALLOW_MAINNET` exists for — *plus*

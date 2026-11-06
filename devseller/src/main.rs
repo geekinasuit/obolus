@@ -303,6 +303,9 @@ async fn main() -> anyhow::Result<()> {
             EntryDefect::MissingTokenDomain { .. } => anyhow::anyhow!(
                 "OBOLUS_NETWORK names an EVM chain, so OBOLUS_EXTRA must carry the token domain: {e}"
             ),
+            EntryDefect::MissingFeePayer => anyhow::anyhow!(
+                "OBOLUS_NETWORK names a Solana chain, so OBOLUS_EXTRA must carry the fee payer: {e}"
+            ),
             EntryDefect::UnsupportedTransfer { .. } => anyhow::anyhow!("OBOLUS_EXTRA: {e}"),
             e => anyhow::anyhow!("payment configuration: {e}"),
         })?],
