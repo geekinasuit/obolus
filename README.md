@@ -34,6 +34,22 @@ The payment payload is **opaque** to Phase A: we decode the envelope (the versio
 option the client says it `accepted`) and forward the inner authorization untouched. That boundary is what lets this ship
 without crypto, and A1's types are built to preserve it.
 
+## Roadmap
+
+Work comes in milestones: packages of demonstrable work, each ending in a demo. The direction is in
+the [vision](docs/vision.md) and the detail in the [roadmap](docs/roadmap.md); the roadmap is
+proposed, and milestones after 4 are tentative.
+
+| Milestone | Demo | Status |
+|---|---|---|
+| 0 Foundation | Standalone repo, both builds in CI, release binaries | Complete |
+| 1 A real 402 in front of a real model | A testnet payment through a third-party facilitator buys an Ollama answer | Demo held; closes with 3 |
+| 2 Someone can run this for money | Several backends, routed by model, priced per backend or model, with per-request revenue (and cost, under cost-plus) | Built; demo review pending |
+| 3 The live check runs itself | After each merge and weekly, CI pays the gateway a real testnet payment through an `https://` facilitator, no proxy | Next |
+| 4 Deployable by someone else | A newcomer follows the README from a release binary to a paid round trip | Proposed |
+| 5 Honest prices | Clients list prices before paying; telemetry shows quote beside actual usage and cost | Tentative |
+| 6 The operator's console | Change prices, kill a backend, read revenue against cost, without a restart | Tentative |
+
 ## Layout
 
 | File | What lives there |
@@ -50,7 +66,8 @@ without crypto, and A1's types are built to preserve it.
 | `docs/pricing.md` | **Pricing design:** how a request's price is decided — the cost-vs-quote denomination frame, the rate structures, the config, and the granularity decision |
 | `docs/telemetry.md` | **Telemetry design:** the one event recorded per request, how its cost and revenue are derived, and the line format an operator's tooling reads |
 | `docs/exposure.md` | **Exposing it:** terminating TLS in front of the gateway (reverse proxy, `tailscale serve`), the wider bind and what it costs, and the development seller's open-proxy refusal |
-| `docs/vision.md` | Product vision and the settled design directions the seams are built to honor |
+| `docs/vision.md` | Product vision: the decisions the seams are built to honor, what is deferred, and the open questions |
+| `docs/roadmap.md` | The order of work, in milestones that each end in a demo |
 
 ## Build and test
 
