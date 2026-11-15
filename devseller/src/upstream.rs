@@ -15,7 +15,7 @@ use std::pin::Pin;
 
 use axum::body::{Body, Bytes};
 use axum::http::StatusCode;
-use obolus::arming::legible;
+use obolus::arming::RedactedUrl;
 use obolus::upstream::{Upstream, UpstreamError, UpstreamResponse};
 
 /// The canned completion. Shaped like an OpenAI-compatible non-streaming response, because a
@@ -49,10 +49,11 @@ impl Upstream for CannedUpstream {
 /// Keyed on the configured URL rather than on the upstream value itself: `main` builds the canned
 /// upstream exactly when no `OBOLUS_UPSTREAM_URL` is set, so the presence of a URL *is* the
 /// distinction, and a `dyn Upstream` could not be matched on anyway. The URL is rendered through
-/// [`legible`], as the gateway renders its own, so a newline in it cannot start a banner line.
+/// [`RedactedUrl`], as the gateway renders its own: anything that could be a credential is dropped,
+/// and a newline in what is kept cannot start a banner line.
 pub fn describe(url: Option<&str>) -> String {
     match url {
-        Some(url) => format!("real inference proxied to {}", legible(url)),
+        Some(url) => format!("real inference proxied to {}", RedactedUrl::new(url)),
         None => "a canned response — NO model is contacted and nothing is inferred".to_string(),
     }
 }
@@ -98,6 +99,14 @@ mod tests {
         let real = describe(Some("http://127.0.0.1:11434"));
         assert!(real.contains("11434"), "got: {real}");
         assert!(!real.contains("NO model"), "got: {real}");
+    }
+
+    #[test]
+    fn the_banner_does_not_print_a_credential_in_the_upstream_url() {
+        assert_eq!(
+            describe(Some("http://key:s3cret@127.0.0.1:11434?apiKey=s3cret")),
+            r#"real inference proxied to "http://127.0.0.1:11434" (userinfo, query not shown)"#
+        );
     }
 
     #[test]

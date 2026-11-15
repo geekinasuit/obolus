@@ -48,7 +48,7 @@ mod verify;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use obolus::arming::{check_arming, legible, PLACEHOLDER_NETWORK};
+use obolus::arming::{check_arming, legible, RedactedUrl, PLACEHOLDER_NETWORK};
 use obolus::backends::{Backends, Kind};
 use obolus::config::{
     parse_accepts, parse_extra, select_max_output_tokens, superseded_single_chain_vars,
@@ -257,8 +257,9 @@ async fn main() -> anyhow::Result<()> {
         Some(url) => {
             if !url.to_ascii_lowercase().starts_with("http://") {
                 anyhow::bail!(
-                    "OBOLUS_UPSTREAM_URL must be an http:// origin (got {url:?}): the upstream \
-                     client speaks plain HTTP only. Unset it to serve a canned response instead."
+                    "OBOLUS_UPSTREAM_URL must be an http:// origin (got {}): the upstream \
+                     client speaks plain HTTP only. Unset it to serve a canned response instead.",
+                    RedactedUrl::new(url)
                 );
             }
             Arc::new(OllamaUpstream::new(url))

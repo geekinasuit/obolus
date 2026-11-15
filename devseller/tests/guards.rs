@@ -998,6 +998,15 @@ fn an_upstream_url_that_is_not_plain_http_refuses_to_start() {
     run.must_have_refused_during_startup();
 }
 
+#[test]
+fn a_refused_upstream_url_does_not_print_its_credential() {
+    let run = run(&[("OBOLUS_UPSTREAM_URL", "https://key:s3cret@api.example/v1?apiKey=s3cret")]);
+
+    run.must_have_refused_during_startup();
+    run.must_not_say("s3cret");
+    run.must_say(r#""https://api.example/v1" (userinfo, query not shown)"#);
+}
+
 /// The hazard publishing this binary creates: accept-mode plus a real upstream is an
 /// unauthenticated open proxy to somebody's inference endpoint, on whatever address reaches it.
 #[test]
