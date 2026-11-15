@@ -139,8 +139,10 @@ chose ([#120](https://github.com/geekinasuit/obolus/issues/120)); reconciling a 
 facilitator reports as pending ([#75](https://github.com/geekinasuit/obolus/issues/75)); and more
 than one payment option per network ([#76](https://github.com/geekinasuit/obolus/issues/76)).
 
-Design talks carried for Milestone 6: the configuration and secrets surface, telemetry transport,
-and shared state for horizontal scale (vision questions 4–6).
+Design talks carried for Milestone 6: the configuration and secrets surface
+([#137](https://github.com/geekinasuit/obolus/issues/137)), telemetry transport
+([#136](https://github.com/geekinasuit/obolus/issues/136)), and shared state for horizontal scale
+([#138](https://github.com/geekinasuit/obolus/issues/138)) — vision questions 4–6.
 
 ## Milestone 6 — The operator's console (tentative)
 
