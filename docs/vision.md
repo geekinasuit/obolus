@@ -162,7 +162,8 @@ The design is in [`pricing.md`](pricing.md).
   every backend to declare a cost. Under the static and token rates the cost is recorded as unknown,
   so a token-priced channel shows what it earned but not whether it made money. Closing that gap is
   *(open)*, and part of [#120](https://github.com/geekinasuit/obolus/issues/120).
-- **The transport behind the seam** — OpenTelemetry, a message topic, a database — is *(open)*.
+- **The transport behind the seam** — OpenTelemetry, a message topic, a database — is *(open)*,
+  [#136](https://github.com/geekinasuit/obolus/issues/136).
 - **Recording the upstream's reported usage** beside the quote is the first step of
   [#120](https://github.com/geekinasuit/obolus/issues/120) *(inference)*.
 
@@ -186,8 +187,9 @@ The design is in [`pricing.md`](pricing.md).
 - **Horizontal scale is a design target:** the gateway should stand up as scale-out nodes, with
   shared state kept outside the process.
 - **How an operator declares configuration and secrets** — most of the "easy to set up" promise —
-  is *(open)*.
-- **What shared state horizontal scale needs, and where it lives,** is *(open)*.
+  is *(open)*, [#137](https://github.com/geekinasuit/obolus/issues/137).
+- **What shared state horizontal scale needs, and where it lives,** is *(open)*,
+  [#138](https://github.com/geekinasuit/obolus/issues/138).
 
 ## The client-testing fake
 
@@ -253,7 +255,9 @@ Each open question is, or should be, an issue; the issue is linked at the end of
    [#120](https://github.com/geekinasuit/obolus/issues/120).
 3. **Bitcoin Lightning:** what serving on Lightning implies for the design —
    [#80](https://github.com/geekinasuit/obolus/issues/80).
-4. **Telemetry transport** behind the seam — no issue yet.
-5. **Configuration and secrets surface** for operators — no issue yet.
+4. **Telemetry transport** behind the seam —
+   [#136](https://github.com/geekinasuit/obolus/issues/136).
+5. **Configuration and secrets surface** for operators —
+   [#137](https://github.com/geekinasuit/obolus/issues/137).
 6. **Shared state for horizontal scale:** what is shared (stats, flags, in-flight payments) and
-   where it lives — no issue yet.
+   where it lives — [#138](https://github.com/geekinasuit/obolus/issues/138).
