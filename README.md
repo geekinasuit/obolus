@@ -174,6 +174,7 @@ configured:
 - **Verification cannot be turned off.** The certificate chain and the host name are always checked.
   There is no setting to skip either, and none to add a CA.
 - TLS 1.2 and 1.3 only, with ring as the crypto library.
+- **No revocation checking** (no CRL, no OCSP): a revoked certificate is accepted until it expires.
 
 A facilitator whose certificate fails these checks is never sent a request: the paid request is
 answered with a 502, and the log line names the reason (for example an unknown issuer, or a

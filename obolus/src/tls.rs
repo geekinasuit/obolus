@@ -12,6 +12,8 @@
 //! * **The crypto is ring**, chosen explicitly rather than through rustls's process-wide default.
 //!   `jsonwebtoken` already builds ring, and the default provider (aws-lc-rs) is a C build.
 //! * **TLS 1.2 and 1.3**, rustls's safe defaults; nothing older is offered.
+//! * **No revocation checking.** No CRL is supplied and rustls does no OCSP, so a revoked but
+//!   otherwise valid certificate is accepted until it expires.
 //!
 //! This is outbound only. The gateway still serves plain HTTP and holds no private key; inbound TLS
 //! is terminated in front of it (see `docs/exposure.md`).

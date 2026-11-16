@@ -1111,7 +1111,20 @@ mod delegated_tests {
         // the loopback the mock listens on, so this needs no network.
         let (detail, reached) = refused_detail(&["facilitator.example"], "localhost").await;
         assert!(detail.contains("not valid for name"), "the cause should name the mismatch: {detail}");
+        // The name checked is the one dialled, not the address it resolved to.
+        assert!(detail.contains("localhost"), "the cause should name the dialled host: {detail}");
         assert!(!reached, "no request may cross a refused handshake");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_the_dialled_dns_name_is_accepted() {
+        // The positive side of the test above: the same dial, a certificate that names it.
+        let ca = TestCa::new();
+        let (base, _captured) =
+            serve_tls(&ca, &["localhost"], "localhost", Canned::ok(SPEC_VERIFY_SUCCESS), unused())
+                .await;
+        let facilitator = DelegatedFacilitator::with_connector(base, ca.connector()).unwrap();
+        assert_eq!(facilitator.verify(&payment(), &requirements()).await, Ok(()));
     }
 
     #[tokio::test]
