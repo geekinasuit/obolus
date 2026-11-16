@@ -249,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
             if !upstream_url.to_ascii_lowercase().starts_with("http://") {
                 anyhow::bail!(
                     "OBOLUS_UPSTREAM_URL must be an http:// origin (got {}): the \
-                     upstream client speaks plain HTTP only (no TLS is wired), so an https:// or \
+                     upstream client speaks plain HTTP only (TLS to backends is #144), so an https:// or \
                      schemeless URL cannot reach the model. Put a local http proxy in front of a \
                      TLS upstream if needed.",
                     RedactedUrl::new(&upstream_url)

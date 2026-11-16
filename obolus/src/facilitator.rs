@@ -445,17 +445,27 @@ fn our_fault(reason: Option<&str>) -> Option<&'static str> {
 /// an unknown certificate issuer, a name the certificate does not cover, a refused connection — is
 /// in the causes, so without them every TLS failure reads the same. The causes come from the TLS
 /// and socket layers, and a certificate's names are the remote's to choose, so they are quoted
-/// rather than printed raw. None of them carries the request URL.
+/// rather than printed raw, and each is cut at [`MAX_CAUSE_LEN`] characters: a certificate for
+/// another name lists every name it presents. None of them carries the request URL.
 fn with_causes(error: &(dyn std::error::Error + 'static)) -> String {
     let mut text = error.to_string();
     let mut cause = error.source();
     while let Some(next) = cause {
+        let whole = next.to_string();
+        let mut shown: String = whole.chars().take(MAX_CAUSE_LEN).collect();
+        if shown.len() < whole.len() {
+            shown.push_str("[cut]");
+        }
         text.push_str(": ");
-        text.push_str(&legible(&next.to_string()));
+        text.push_str(&legible(&shown));
         cause = next.source();
     }
     text
 }
+
+/// The longest single cause [`with_causes`] logs, in characters. Long enough for any rustls or
+/// socket message about a certificate with a handful of names.
+const MAX_CAUSE_LEN: usize = 300;
 
 /// A [`Facilitator`] that delegates `verify` and `settle` to a third-party x402 facilitator over
 /// HTTP.
@@ -997,12 +1007,14 @@ mod delegated_tests {
         }
     }
 
-    /// Serve the mock facilitator over TLS on the loopback, presenting a certificate `ca` signs for
-    /// `names`. Returns the `https://127.0.0.1:<port>/facilitator` base and the capture log; a
-    /// request whose handshake fails never reaches the log.
+    /// Serve the mock facilitator over TLS on 127.0.0.1, presenting a certificate `ca` signs for
+    /// `names`. Returns the `https://<host>:<port>/facilitator` base, `host` being how the client
+    /// names the server (an IP literal, or `localhost` to go through DNS-name matching), and the
+    /// capture log; a request whose handshake fails never reaches the log.
     async fn serve_tls(
         ca: &TestCa,
         names: &[&str],
+        host: &str,
         verify: Canned,
         settle: Canned,
     ) -> (String, Arc<Mutex<Vec<(&'static str, Value)>>>) {
@@ -1025,7 +1037,7 @@ mod delegated_tests {
                 });
             }
         });
-        (format!("https://{addr}/facilitator"), captured)
+        (format!("https://{host}:{}/facilitator", addr.port()), captured)
     }
 
     #[tokio::test]
@@ -1034,6 +1046,7 @@ mod delegated_tests {
         let (base, captured) = serve_tls(
             &ca,
             &["127.0.0.1"],
+            "127.0.0.1",
             Canned::ok(SPEC_VERIFY_SUCCESS),
             Canned::ok(SPEC_SETTLE_SUCCESS),
         )
@@ -1053,7 +1066,8 @@ mod delegated_tests {
         // client that skipped verification would reach the mock and get `isValid: true`.
         let ca = TestCa::new();
         let (base, captured) =
-            serve_tls(&ca, &["127.0.0.1"], Canned::ok(SPEC_VERIFY_SUCCESS), unused()).await;
+            serve_tls(&ca, &["127.0.0.1"], "127.0.0.1", Canned::ok(SPEC_VERIFY_SUCCESS), unused())
+                .await;
 
         let err = DelegatedFacilitator::new(base)
             .unwrap()
@@ -1066,47 +1080,75 @@ mod delegated_tests {
         assert!(captured.lock().unwrap().is_empty(), "no request may cross a refused handshake");
     }
 
-    #[tokio::test]
-    async fn a_certificate_for_another_host_is_refused() {
-        // Trusted issuer, wrong name: the certificate covers facilitator.example, and the client
-        // dialled 127.0.0.1. Checking only the chain would accept it.
+    /// Verify against a server whose trusted certificate covers `names`, dialled as `host`, and
+    /// return the failure detail plus whether any request reached the server.
+    async fn refused_detail(names: &[&str], host: &str) -> (String, bool) {
         let ca = TestCa::new();
         let (base, captured) =
-            serve_tls(&ca, &["facilitator.example"], Canned::ok(SPEC_VERIFY_SUCCESS), unused())
-                .await;
-
+            serve_tls(&ca, names, host, Canned::ok(SPEC_VERIFY_SUCCESS), unused()).await;
         let err = DelegatedFacilitator::with_connector(base, ca.connector())
             .unwrap()
             .verify(&payment(), &requirements())
             .await
             .unwrap_err();
-
         let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
+        let reached = !captured.lock().unwrap().is_empty();
+        (detail, reached)
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_another_host_is_refused() {
+        // Trusted issuer, wrong name: the certificate covers facilitator.example, and the client
+        // dialled 127.0.0.1. Checking only the chain would accept it.
+        let (detail, reached) = refused_detail(&["facilitator.example"], "127.0.0.1").await;
         assert!(detail.contains("not valid for name"), "the cause should name the mismatch: {detail}");
-        assert!(captured.lock().unwrap().is_empty(), "no request may cross a refused handshake");
+        assert!(!reached, "no request may cross a refused handshake");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_another_dns_name_is_refused() {
+        // The production shape: a DNS name dialled, DNS names presented. `localhost` resolves to
+        // the loopback the mock listens on, so this needs no network.
+        let (detail, reached) = refused_detail(&["facilitator.example"], "localhost").await;
+        assert!(detail.contains("not valid for name"), "the cause should name the mismatch: {detail}");
+        assert!(!reached, "no request may cross a refused handshake");
+    }
+
+    #[tokio::test]
+    async fn a_long_certificate_error_is_cut_in_the_log() {
+        // A wrong-name error lists every name the certificate presents, and those are chosen by
+        // whoever presents it. Forty long names must not all reach the log.
+        let names: Vec<String> = (0..40).map(|i| format!("{}{i}.example", "n".repeat(50))).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (detail, _) = refused_detail(&names, "127.0.0.1").await;
+        assert!(detail.contains("[cut]"), "{detail}");
+        assert!(detail.chars().count() < 1000, "{} chars: {detail}", detail.chars().count());
     }
 
     #[tokio::test]
     #[ignore = "reaches x402.org over the network; run by hand with --ignored"]
     async fn the_public_testnet_facilitator_answers_over_verified_tls() {
         // The synthetic fixture names no real network, so no money can move: the facilitator
-        // refuses it. What this checks is that the refusal arrives at all, which needs a handshake
-        // the compiled-in roots accept. A TLS failure is `Unavailable` with "could not reach".
+        // refuses it. What this checks is that an HTTP response arrives at all, which needs a
+        // handshake the compiled-in roots accept. A verdict either way means one arrived; so does an
+        // `Unavailable` that names the response's status. Anything else — a TLS failure, a
+        // timeout — fails.
         let result = DelegatedFacilitator::new("https://x402.org/facilitator")
             .unwrap()
             .verify(&payment(), &requirements())
             .await;
-        if let Err(FacilitatorError::Unavailable(detail)) = &result {
-            assert!(!detail.contains("could not reach"), "the handshake failed: {detail}");
-        }
         eprintln!("x402.org answered: {result:?}");
+        if let Err(FacilitatorError::Unavailable(detail)) = &result {
+            assert!(detail.contains("status"), "no HTTP response arrived: {detail}");
+        }
     }
 
     #[tokio::test]
     async fn a_refused_handshake_does_not_print_a_credential_in_the_url() {
         // The failure detail is logged. Nothing in it may come from the URL's userinfo or query.
         let ca = TestCa::new();
-        let (base, _captured) = serve_tls(&ca, &["127.0.0.1"], unused(), unused()).await;
+        let (base, _captured) =
+            serve_tls(&ca, &["127.0.0.1"], "127.0.0.1", unused(), unused()).await;
         let base = base.replacen("https://", "https://key:s3cret@", 1) + "?apiKey=s3cret";
 
         let err = DelegatedFacilitator::new(base)

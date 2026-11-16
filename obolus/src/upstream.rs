@@ -240,10 +240,9 @@ const DEFAULT_HEAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// the gateway has decided whether to charge. That timing is the whole point of the head/body
 /// split — see [`crate::gateway`].
 ///
-/// It speaks plain HTTP: Ollama is a local origin (`http://127.0.0.1:11434`). TLS is not wired
-/// here because no hermetic path needs it; a hosted OpenAI-compatible API behind HTTPS is reached
-/// the same way the facilitator is — through a local http→https proxy — because the connector,
-/// not this type, is where TLS would enter, and that is a separate, later concern.
+/// It speaks plain HTTP: Ollama is a local origin (`http://127.0.0.1:11434`). A hosted
+/// OpenAI-compatible API behind HTTPS is reached through a local http→https proxy until this
+/// client is built on the facilitator's TLS connector (`crate::tls`), which is #144.
 ///
 /// The type deliberately has no `Debug` derive: the bearer is a live credential, and a derived
 /// `Debug` is the usual way one leaks into a log line or a panic message.

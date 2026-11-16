@@ -11,7 +11,7 @@ base64 = "0.22"
 futures-util = "0.3"
 http-body-util = "0.1"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-# Outbound TLS to the facilitator (#35). Default features off on all three, so nothing pulls in
+# Outbound TLS to the facilitator (#35). Default features off on the two that have them, so nothing pulls in
 # aws-lc-rs (a C build) or the OS trust store: the crypto is ring, which jsonwebtoken already
 # builds, and the trust anchors are the compiled-in Mozilla set from webpki-roots. See `tls.rs`.
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"] }
