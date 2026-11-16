@@ -589,9 +589,13 @@ CDP         GET /v2/x402/discovery/resources?limit=&amp;offset=
         <div class="lbl">Live</div>
         <p>A bearer-token path exists alongside the 402 branch, fail-closed: anything not positively verified takes the payment branch.</p>
       </div>
+      <div class="st live">
+        <div class="lbl">Live</div>
+        <p>The gateway reaches an <code>https://</code> facilitator itself, trusting roots compiled into the binary; the round trip above predates this and went through a local proxy (<a href="https://github.com/geekinasuit/obolus/issues/35">#35</a>).</p>
+      </div>
       <div class="st gap">
         <div class="lbl">Worked around</div>
-        <p>The gateway reaches an <code>https://</code> facilitator itself, trusting roots compiled into the binary; the round trip above predates this and went through a local proxy (<a href="https://github.com/geekinasuit/obolus/issues/35">#35</a>). Backend origins are still <code>http://</code> only (<a href="https://github.com/geekinasuit/obolus/issues/144">#144</a>).</p>
+        <p>Backend origins are still <code>http://</code> only, so a hosted model served over <code>https://</code> needs a local proxy in front of it (<a href="https://github.com/geekinasuit/obolus/issues/144">#144</a>).</p>
       </div>
       <div class="st gap">
         <div class="lbl">Bounded</div>

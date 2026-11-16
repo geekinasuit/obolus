@@ -137,7 +137,7 @@ Configuration is by environment variable:
 | `OBOLUS_TELEMETRY` | `stdout` | **Where per-request telemetry goes.** Unset or `stdout` writes one JSON line per request to stdout, which carries nothing else (the banner and diagnostics go to stderr); `off` records nothing. Any other value is a startup error, so a typo cannot silently flip it. Every completion request writes a line, an unpaid 402 included, so the volume follows traffic you do not control: rotate or cap wherever stdout lands. The line format, and how to read revenue against cost from it, is in [`docs/telemetry.md`](docs/telemetry.md). |
 
 `OBOLUS_ADDR`, `OBOLUS_PRICE`, `OBOLUS_MAX_TIMEOUT_SECS`, `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS`, and
-`OBOLUS_MAX_OUTPUT_TOKENS` are validated at startup and abort a bad launch; `OBOLUS_FACILITATOR_URL` must be present and `http://`,
+`OBOLUS_MAX_OUTPUT_TOKENS` are validated at startup and abort a bad launch; `OBOLUS_FACILITATOR_URL` must be present and `https://` or `http://`,
 and `OBOLUS_UPSTREAM_URL` (which has a valid default) must also be `http://` if overridden — the
 upstream client speaks plain HTTP only, so an `https://` there fails fast rather than at request time.
 When `OBOLUS_BACKENDS_FILE` is set instead, each declared backend's `baseUrl` faces that same
