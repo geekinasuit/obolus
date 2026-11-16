@@ -14,7 +14,7 @@ gateway to bind a routable interface.
 
 This is **inbound** TLS: clients reaching the gateway. The gateway reaching an `https` facilitator is
 **outbound** TLS, a different direction with a different answer, covered in the README's
-[Reaching an https facilitator](../README.md#reaching-an-https-facilitator).
+[Facilitator TLS](../README.md#facilitator-tls).
 
 ## Whatever you put in front, set `OBOLUS_RESOURCE`
 

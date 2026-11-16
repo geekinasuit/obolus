@@ -19,12 +19,12 @@ use std::time::Duration;
 use axum::body::{Body, Bytes};
 use axum::http::{header::CONTENT_TYPE, Request, StatusCode};
 use http_body_util::Full;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 
-use crate::arming::RedactedUrl;
+use crate::arming::{legible, RedactedUrl};
+use crate::tls::{self, HttpsConnector};
 use crate::x402::{PaymentPayload, PaymentRequirements, SettlementReceipt, X402_VERSION};
 
 /// Why a facilitator did not complete a payment.
@@ -299,8 +299,8 @@ const DEFAULT_FACILITATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The longest facilitator-supplied reason we echo verbatim into a client-facing 402. A real
 /// closed-enum reason (`insufficient_funds`, …) is far shorter; anything longer is treated as
-/// untrustworthy and replaced with the generic, so a hostile or MITM'd facilitator on the
-/// (currently un-TLS'd) channel cannot reflect bulk content into our response body.
+/// untrustworthy and replaced with the generic, so a hostile facilitator, or anyone on a plain
+/// `http://` channel to one, cannot reflect bulk content into our response body.
 const MAX_REJECT_REASON_LEN: usize = 128;
 
 /// The longest facilitator-supplied transaction hash we echo into a refusal's receipt. An EVM hash
@@ -311,30 +311,17 @@ const MAX_TX_HASH_LEN: usize = 128;
 /// (`+/=`, `-_`) and Hedera's `account@seconds.nanos`. No space, quote, markup or control.
 const TX_ID_PUNCTUATION: &[u8] = b".@-_+/=";
 
-/// Why a [`DelegatedFacilitator`] could not be constructed. Both variants are base-URL problems
-/// caught at construction, where the cause is legible, rather than surfaced later as a connect-time
+/// Why a [`DelegatedFacilitator`] could not be constructed: a base-URL problem caught at
+/// construction, where the cause is legible, rather than surfaced later as a connect-time
 /// "facilitator unavailable" once the URL has reached config.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum DelegatedFacilitatorError {
-    /// The base URL is `https://`, but this crate has no outbound TLS client. An in-process client
-    /// is the second stage of #35; until then an https facilitator is reached through a proxy in
-    /// front of the process that accepts plain `http://` and speaks `https://` onward, and this
-    /// type speaks only plain HTTP (a loopback in tests; that proxy, or a local facilitator,
-    /// otherwise).
+    /// The base URL is neither `https://` nor `http://` (a schemeless or other-scheme base). We
+    /// build request URLs by string concatenation, so the scheme has to be explicit.
     ///
-    /// Carries the URL redacted: a refusal is printed, and a URL refused here is the likeliest one
-    /// to carry a hosted facilitator's key.
-    #[error(
-        "facilitator base URL {0} uses https, but this binary has no outbound TLS client; put a \
-         local proxy in front of it that accepts http:// and speaks https:// to the facilitator, \
-         and point this at the proxy's http:// address"
-    )]
-    TlsNotWired(RedactedUrl),
-
-    /// The base URL is not an `http://` endpoint (a schemeless or other-scheme base). We build
-    /// request URLs by string concatenation and speak only plain HTTP, so an explicit `http://`
-    /// base is required. Carries the URL redacted, like [`Self::TlsNotWired`].
-    #[error("facilitator base URL {0} is not an http:// endpoint")]
+    /// Carries the URL redacted: a refusal is printed, and the URL may carry a hosted facilitator's
+    /// key.
+    #[error("facilitator base URL {0} is not an https:// or http:// endpoint")]
     NotAnHttpBase(RedactedUrl),
 }
 
@@ -452,6 +439,24 @@ fn our_fault(reason: Option<&str>) -> Option<&'static str> {
     OUR_FAULT_REASONS.iter().copied().find(|&known| known == reason)
 }
 
+/// A client error and its causes, outermost first, the causes quoted through [`legible`].
+///
+/// The client's own message is only `client error (Connect)`. The reason an operator can act on —
+/// an unknown certificate issuer, a name the certificate does not cover, a refused connection — is
+/// in the causes, so without them every TLS failure reads the same. The causes come from the TLS
+/// and socket layers, and a certificate's names are the remote's to choose, so they are quoted
+/// rather than printed raw. None of them carries the request URL.
+fn with_causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        text.push_str(": ");
+        text.push_str(&legible(&next.to_string()));
+        cause = next.source();
+    }
+    text
+}
+
 /// A [`Facilitator`] that delegates `verify` and `settle` to a third-party x402 facilitator over
 /// HTTP.
 ///
@@ -473,11 +478,12 @@ fn our_fault(reason: Option<&str>) -> Option<&'static str> {
 ///   (`unsupported_scheme`, `unexpected_settle_error`, …) is [`Unavailable`](FacilitatorError::Unavailable) too, whatever 2xx
 ///   or 4xx it arrived on.
 ///
-/// It speaks plain HTTP only; see [`DelegatedFacilitatorError::TlsNotWired`].
+/// It speaks `https://`, verifying the facilitator's certificate against compiled-in roots (see
+/// `tls.rs` for the posture), or plain `http://` when the base URL says so.
 pub struct DelegatedFacilitator {
     verify_url: String,
     settle_url: String,
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: Client<HttpsConnector, Full<Bytes>>,
     timeout: Duration,
 }
 
@@ -499,17 +505,23 @@ impl DelegatedFacilitator {
     /// the origin. A trailing slash is trimmed so a hand-entered `…/facilitator/` does not become
     /// `…/facilitator//verify`.
     ///
-    /// Rejects an `https://` base — see [`DelegatedFacilitatorError::TlsNotWired`].
+    /// Refuses a base that is neither `https://` nor `http://` — see
+    /// [`DelegatedFacilitatorError::NotAnHttpBase`].
     pub fn new(base_url: impl Into<String>) -> Result<Self, DelegatedFacilitatorError> {
+        Self::with_connector(base_url, tls::connector())
+    }
+
+    /// [`new`](Self::new) over a given connector. Tests pass one that trusts a CA they minted.
+    fn with_connector(
+        base_url: impl Into<String>,
+        connector: HttpsConnector,
+    ) -> Result<Self, DelegatedFacilitatorError> {
         let base = base_url.into();
         let base = base.trim_end_matches('/');
-        // Allowlist the scheme case-insensitively. A case-sensitive `https://` denylist would wave
-        // through `HTTPS://…` and schemeless bases, defeating the guard.
+        // Allowlist the schemes case-insensitively: `HTTPS://…` is as good as `https://…`, and a
+        // schemeless base is refused here rather than producing a bad request URL later.
         let lowered = base.to_ascii_lowercase();
-        if lowered.starts_with("https://") {
-            return Err(DelegatedFacilitatorError::TlsNotWired(RedactedUrl::new(base)));
-        }
-        if !lowered.starts_with("http://") {
+        if !lowered.starts_with("https://") && !lowered.starts_with("http://") {
             return Err(DelegatedFacilitatorError::NotAnHttpBase(RedactedUrl::new(base)));
         }
         Ok(Self {
@@ -520,7 +532,7 @@ impl DelegatedFacilitator {
             // the retry so the failure surfaces as `Unavailable` instead (see #31).
             client: Client::builder(TokioExecutor::new())
                 .retry_canceled_requests(false)
-                .build_http::<Full<Bytes>>(),
+                .build::<_, Full<Bytes>>(connector),
             timeout: DEFAULT_FACILITATOR_TIMEOUT,
         })
     }
@@ -567,13 +579,14 @@ impl DelegatedFacilitator {
         // One deadline over the WHOLE round-trip — the request AND the body read. Wrapping only
         // `client.request` would bound the wait for the response *head* but leave the body read
         // unbounded, so a facilitator that sends headers and then stalls the body would wedge a
-        // settle forever (an indeterminate "may have charged" hang, and a trivial DoS lever over the
-        // deliberately-plaintext channel). The 64KB cap does not help — an untimed slow dribble
-        // stays under it.
+        // settle forever (an indeterminate "may have charged" hang, and a trivial DoS lever for a
+        // hostile facilitator or anyone on a plain-http channel to one). The 64KB cap does not help
+        // — an untimed slow dribble stays under it.
         let round_trip = async {
             let response = self.client.request(request).await.map_err(|e| {
                 FacilitatorError::Unavailable(format!(
-                    "could not reach facilitator /{endpoint}: {e}"
+                    "could not reach facilitator /{endpoint}: {}",
+                    with_causes(&e)
                 ))
             })?;
             let (parts, incoming) = response.into_parts();
@@ -915,6 +928,18 @@ mod delegated_tests {
         verify: Canned,
         settle: Canned,
     ) -> (String, Arc<Mutex<Vec<(&'static str, Value)>>>) {
+        let (app, captured) = mock_app(verify, settle);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/facilitator"), captured)
+    }
+
+    /// The mock facilitator's routes and its capture log, to be served over plain HTTP by
+    /// [`serve`] or over TLS by [`serve_tls`].
+    fn mock_app(verify: Canned, settle: Canned) -> (Router, Arc<Mutex<Vec<(&'static str, Value)>>>) {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let state = MockState {
             verify: Arc::new(verify),
@@ -925,12 +950,175 @@ mod delegated_tests {
             .route("/facilitator/verify", post(verify_handler))
             .route("/facilitator/settle", post(settle_handler))
             .with_state(state);
+        (app, captured)
+    }
+
+    // --- https ------------------------------------------------------------------------------------
+
+    /// A certificate authority minted for one test, and nothing else trusts it.
+    struct TestCa {
+        params: rcgen::CertificateParams,
+        key: rcgen::KeyPair,
+        der: rustls::pki_types::CertificateDer<'static>,
+    }
+
+    impl TestCa {
+        fn new() -> Self {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.distinguished_name.push(rcgen::DnType::CommonName, "obolus test CA");
+            let key = rcgen::KeyPair::generate().unwrap();
+            let der = params.self_signed(&key).unwrap().der().clone();
+            Self { params, key, der }
+        }
+
+        /// A connector that trusts this CA and nothing else.
+        fn connector(&self) -> HttpsConnector {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(self.der.clone()).unwrap();
+            tls::connector_trusting(roots)
+        }
+
+        /// A server certificate this CA signs, covering `names` (DNS names or IP literals).
+        fn server_config(&self, names: &[&str]) -> rustls::ServerConfig {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
+            let cert = rcgen::CertificateParams::new(names).unwrap().signed_by(&key, &issuer).unwrap();
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into());
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .unwrap()
+        }
+    }
+
+    /// Serve the mock facilitator over TLS on the loopback, presenting a certificate `ca` signs for
+    /// `names`. Returns the `https://127.0.0.1:<port>/facilitator` base and the capture log; a
+    /// request whose handshake fails never reaches the log.
+    async fn serve_tls(
+        ca: &TestCa,
+        names: &[&str],
+        verify: Canned,
+        settle: Canned,
+    ) -> (String, Arc<Mutex<Vec<(&'static str, Value)>>>) {
+        let (app, captured) = mock_app(verify, settle);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(ca.server_config(names)));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else { return };
+                let acceptor = acceptor.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    // A refused handshake is the point of some tests; it ends this connection only.
+                    let Ok(stream) = acceptor.accept(tcp).await else { return };
+                    let service = hyper_util::service::TowerToHyperService::new(app);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
         });
-        (format!("http://{addr}/facilitator"), captured)
+        (format!("https://{addr}/facilitator"), captured)
+    }
+
+    #[tokio::test]
+    async fn an_https_facilitator_is_verified_and_settled_over_a_trusted_certificate() {
+        let ca = TestCa::new();
+        let (base, captured) = serve_tls(
+            &ca,
+            &["127.0.0.1"],
+            Canned::ok(SPEC_VERIFY_SUCCESS),
+            Canned::ok(SPEC_SETTLE_SUCCESS),
+        )
+        .await;
+        let facilitator = DelegatedFacilitator::with_connector(base, ca.connector()).unwrap();
+
+        assert_eq!(facilitator.verify(&payment(), &requirements()).await, Ok(()));
+        let receipt = facilitator.settle(&payment(), &requirements()).await.unwrap();
+        assert!(receipt.success, "{receipt:?}");
+        let endpoints: Vec<_> = captured.lock().unwrap().iter().map(|(e, _)| *e).collect();
+        assert_eq!(endpoints, ["verify", "settle"]);
+    }
+
+    #[tokio::test]
+    async fn the_shipped_client_refuses_a_certificate_its_roots_do_not_vouch_for() {
+        // `new` is what main builds: the compiled-in roots, which know nothing of this test's CA. A
+        // client that skipped verification would reach the mock and get `isValid: true`.
+        let ca = TestCa::new();
+        let (base, captured) =
+            serve_tls(&ca, &["127.0.0.1"], Canned::ok(SPEC_VERIFY_SUCCESS), unused()).await;
+
+        let err = DelegatedFacilitator::new(base)
+            .unwrap()
+            .verify(&payment(), &requirements())
+            .await
+            .unwrap_err();
+
+        let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
+        assert!(detail.contains("UnknownIssuer"), "the cause should name the issuer: {detail}");
+        assert!(captured.lock().unwrap().is_empty(), "no request may cross a refused handshake");
+    }
+
+    #[tokio::test]
+    async fn a_certificate_for_another_host_is_refused() {
+        // Trusted issuer, wrong name: the certificate covers facilitator.example, and the client
+        // dialled 127.0.0.1. Checking only the chain would accept it.
+        let ca = TestCa::new();
+        let (base, captured) =
+            serve_tls(&ca, &["facilitator.example"], Canned::ok(SPEC_VERIFY_SUCCESS), unused())
+                .await;
+
+        let err = DelegatedFacilitator::with_connector(base, ca.connector())
+            .unwrap()
+            .verify(&payment(), &requirements())
+            .await
+            .unwrap_err();
+
+        let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
+        assert!(detail.contains("not valid for name"), "the cause should name the mismatch: {detail}");
+        assert!(captured.lock().unwrap().is_empty(), "no request may cross a refused handshake");
+    }
+
+    #[tokio::test]
+    #[ignore = "reaches x402.org over the network; run by hand with --ignored"]
+    async fn the_public_testnet_facilitator_answers_over_verified_tls() {
+        // The synthetic fixture names no real network, so no money can move: the facilitator
+        // refuses it. What this checks is that the refusal arrives at all, which needs a handshake
+        // the compiled-in roots accept. A TLS failure is `Unavailable` with "could not reach".
+        let result = DelegatedFacilitator::new("https://x402.org/facilitator")
+            .unwrap()
+            .verify(&payment(), &requirements())
+            .await;
+        if let Err(FacilitatorError::Unavailable(detail)) = &result {
+            assert!(!detail.contains("could not reach"), "the handshake failed: {detail}");
+        }
+        eprintln!("x402.org answered: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_handshake_does_not_print_a_credential_in_the_url() {
+        // The failure detail is logged. Nothing in it may come from the URL's userinfo or query.
+        let ca = TestCa::new();
+        let (base, _captured) = serve_tls(&ca, &["127.0.0.1"], unused(), unused()).await;
+        let base = base.replacen("https://", "https://key:s3cret@", 1) + "?apiKey=s3cret";
+
+        let err = DelegatedFacilitator::new(base)
+            .unwrap()
+            .verify(&payment(), &requirements())
+            .await
+            .unwrap_err();
+
+        let FacilitatorError::Unavailable(detail) = err else { panic!("got {err:?}") };
+        // The handshake is what failed, so the TLS layer's causes are in the detail.
+        assert!(detail.contains("UnknownIssuer"), "{detail}");
+        assert!(!detail.contains("s3cret"), "{detail}");
     }
 
     /// The canned response for the endpoint a test does not exercise. Deliberately not a valid
@@ -947,16 +1135,10 @@ mod delegated_tests {
     // --- construction ------------------------------------------------------------------------
 
     #[test]
-    fn new_rejects_an_https_base_because_no_tls_is_wired() {
-        let err = DelegatedFacilitator::new("https://x402.org/facilitator").unwrap_err();
-        assert!(matches!(err, DelegatedFacilitatorError::TlsNotWired(_)), "got {err:?}");
-        // The message names the remedy, not only the refusal: the input here is the public testnet
-        // facilitator, exactly the URL an operator reaches for first, so "use http://" alone reads
-        // as "unreachable". `server_arming` pins the same phrase on the binary's own output.
-        assert!(
-            err.to_string().contains("speaks https:// to the facilitator"),
-            "the https refusal should say how to reach an https facilitator; got: {err}"
-        );
+    fn new_accepts_the_public_testnet_facilitator() {
+        // The URL an operator reaches for first. Before #35 it was refused for want of TLS.
+        let f = DelegatedFacilitator::new("https://x402.org/facilitator").unwrap();
+        assert_eq!(f.settle_url, "https://x402.org/facilitator/settle");
     }
 
     #[tokio::test]
@@ -1346,12 +1528,17 @@ mod delegated_tests {
 
     // --- construction guards ---------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn new_rejects_an_uppercase_https_base() {
-        // The scheme allowlist is case-insensitive: HTTPS in any case is still TLS we have not wired.
-        let err =
-            DelegatedFacilitator::new("HTTPS://facilitator.example/facilitator").unwrap_err();
-        assert!(matches!(err, DelegatedFacilitatorError::TlsNotWired(_)), "got {err:?}");
+    #[test]
+    fn new_accepts_an_uppercase_scheme() {
+        // The scheme allowlist is case-insensitive, as URL schemes are.
+        DelegatedFacilitator::new("HTTPS://facilitator.example/facilitator").unwrap();
+        DelegatedFacilitator::new("HTTP://facilitator.example/facilitator").unwrap();
+    }
+
+    #[test]
+    fn new_rejects_another_scheme() {
+        let err = DelegatedFacilitator::new("ftp://facilitator.example/facilitator").unwrap_err();
+        assert!(matches!(err, DelegatedFacilitatorError::NotAnHttpBase(_)), "got {err:?}");
     }
 
     #[tokio::test]
@@ -1363,10 +1550,9 @@ mod delegated_tests {
 
     #[test]
     fn a_refused_base_does_not_print_its_credential() {
-        // An https base is the likeliest to carry a hosted facilitator's key, and it is refused today,
-        // so the refusal is where the key would reach the log.
+        // A refusal is printed, so it is where a key in a mistyped URL would reach the log.
         for base in [
-            "https://key:s3cret@facilitator.example/facilitator?apiKey=s3cret",
+            "ftp://key:s3cret@facilitator.example/facilitator?apiKey=s3cret",
             "key:s3cret@facilitator.example/facilitator?apiKey=s3cret",
         ] {
             let err = DelegatedFacilitator::new(base).unwrap_err();
