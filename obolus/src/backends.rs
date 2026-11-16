@@ -44,7 +44,7 @@ use std::time::Duration;
 use axum::http::HeaderValue;
 use serde::Deserialize;
 
-use crate::arming::{escape_controls, legible};
+use crate::arming::{escape_controls, legible, RedactedUrl};
 use crate::upstream::{OllamaUpstream, Upstream};
 
 /// The wire protocol a backend speaks. A closed set on purpose: an operator's `kind` string is
@@ -421,12 +421,14 @@ pub enum BackendError {
     EmptyId,
 
     /// A `baseUrl` that is not an `http://` origin. The upstream client speaks plain HTTP only.
+    /// Carries the URL redacted: this refusal is printed, and a hosted origin refused here is the
+    /// likeliest URL to carry a key.
     #[error(
-        "backend {id:?}: baseUrl must be an http:// origin (got {base_url:?}). The upstream client \
+        "backend {id:?}: baseUrl must be an http:// origin (got {base_url}). The upstream client \
          speaks plain HTTP only (no TLS is wired), so reach a TLS origin through a local http→https \
          proxy — the same pattern OBOLUS_FACILITATOR_URL uses."
     )]
-    BadBaseUrl { id: String, base_url: String },
+    BadBaseUrl { id: String, base_url: RedactedUrl },
 
     /// A `keyFile` on a `kind` that sends no credential. Flagged rather than ignored: an operator
     /// who set a key expects it to be used, and silently dropping it is the inert-config trap.
@@ -560,13 +562,14 @@ impl Backend {
 // `Debug` by hand, not derived: `Arc<dyn Upstream>` is not `Debug`, and — more to the point — the
 // upstream is where a resolved bearer lives, so it is deliberately left out. `finish_non_exhaustive`
 // prints the trailing `..` that says a field is hidden. What is shown is metadata only; the
-// credential cannot be reached through this impl.
+// credential cannot be reached through this impl, and the base URL is shown redacted in case an
+// operator wrote one into it.
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Backend")
             .field("id", &self.id)
             .field("kind", &self.kind)
-            .field("base_url", &self.base_url)
+            .field("base_url", &RedactedUrl::new(&self.base_url))
             .field("models", &self.models)
             .field("precedence", &self.precedence)
             .field("has_key", &self.has_key)
@@ -832,7 +835,7 @@ where
     // http:// only, for the reason main.rs rejects a non-http OBOLUS_UPSTREAM_URL: the client wires
     // no TLS, so an https:// origin would fail every request. Case-insensitive so `HTTP://` passes.
     if !base_url.to_ascii_lowercase().starts_with("http://") {
-        return Err(BackendError::BadBaseUrl { id, base_url });
+        return Err(BackendError::BadBaseUrl { id, base_url: RedactedUrl::new(&base_url) });
     }
     if models.iter().any(|m| m.trim().is_empty()) {
         return Err(BackendError::EmptyModelAlias { id });
@@ -1153,6 +1156,22 @@ mod tests {
         let err = load_backends(raw, T, no_key).unwrap_err();
         assert!(matches!(&err, BackendError::BadBaseUrl { .. }), "got {err:?}");
         assert!(err.to_string().contains("proxy"), "steers to the proxy pattern: {err}");
+    }
+
+    #[test]
+    fn a_refused_base_url_does_not_print_its_credential() {
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"https://key:s3cret@h.example/v1?apiKey=s3cret"}]"#;
+        let err = load_backends(raw, T, no_key).unwrap_err();
+        assert!(!err.to_string().contains("s3cret"), "{err}");
+        assert!(!format!("{err:?}").contains("s3cret"), "{err:?}");
+        assert!(err.to_string().contains(r#""https://h.example/v1""#), "still names the origin: {err}");
+    }
+
+    #[test]
+    fn a_backends_debug_does_not_print_a_credential_in_its_url() {
+        let raw = r#"[{"id":"x","kind":"ollama","baseUrl":"http://key:s3cret@h/?apiKey=s3cret"}]"#;
+        let backends = load_backends(raw, T, no_key).unwrap();
+        assert!(!format!("{backends:?}").contains("s3cret"), "{backends:?}");
     }
 
     #[test]

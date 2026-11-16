@@ -1439,6 +1439,33 @@ fn an_https_facilitator_url_refuses_and_names_the_tls_remedy() {
 }
 
 #[test]
+fn the_startup_lines_do_not_print_a_credential_in_a_url() {
+    // Both URLs are accepted, so startup runs through every banner line before the bind fails.
+    let run = run(&[
+        ("OBOLUS_FACILITATOR_URL", "http://key:s3cret@127.0.0.1:9/facilitator?apiKey=s3cret"),
+        ("OBOLUS_UPSTREAM_URL", "http://key:s3cret@127.0.0.1:11434?apiKey=s3cret"),
+    ]);
+
+    run.must_not_say("s3cret");
+    run.must_say(r#""http://127.0.0.1:9/facilitator" (userinfo, query not shown)"#);
+    run.must_say(r#""http://127.0.0.1:11434" (userinfo, query not shown)"#);
+}
+
+#[test]
+fn a_refused_url_does_not_print_its_credential() {
+    // An https URL is refused today, and it is the one likeliest to carry a hosted service's key.
+    let facilitator = run(&[("OBOLUS_FACILITATOR_URL", "https://key:s3cret@x402.org/facilitator")]);
+    facilitator.must_have_refused_during_startup();
+    facilitator.must_not_say("s3cret");
+    facilitator.must_say(r#""https://x402.org/facilitator" (userinfo not shown)"#);
+
+    let upstream = run(&[("OBOLUS_UPSTREAM_URL", "https://key:s3cret@api.example/v1")]);
+    upstream.must_have_refused_during_startup();
+    upstream.must_not_say("s3cret");
+    upstream.must_say(r#""https://api.example/v1" (userinfo not shown)"#);
+}
+
+#[test]
 fn an_empty_pay_to_variable_refuses_to_start() {
     // The asymmetry that convergence closed, stated as its own test because it is the one with
     // money attached: `parse_accepts` has always rejected an empty `payTo`, while the single-chain

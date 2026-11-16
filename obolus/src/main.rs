@@ -27,7 +27,7 @@ use obolus::access::{
     parse_token_keys, PublicKeyTokenVerifier, TokenKeyEntry, TokenPath, SINGLE_KEY_VAR,
 };
 use obolus::arming::{
-    check_arming, legible, parse_arming, undiagnosed, PINNED_ON, PLACEHOLDER_NETWORK,
+    check_arming, legible, parse_arming, undiagnosed, RedactedUrl, PINNED_ON, PLACEHOLDER_NETWORK,
 };
 use obolus::config::{
     parse_accepts, parse_extra, require_backend_costs, require_backend_rates, select_max_output_tokens,
@@ -251,10 +251,11 @@ async fn main() -> anyhow::Result<()> {
             // paid request while /health still reports OK.
             if !upstream_url.to_ascii_lowercase().starts_with("http://") {
                 anyhow::bail!(
-                    "OBOLUS_UPSTREAM_URL must be an http:// origin (got {upstream_url:?}): the \
+                    "OBOLUS_UPSTREAM_URL must be an http:// origin (got {}): the \
                      upstream client speaks plain HTTP only (no TLS is wired), so an https:// or \
                      schemeless URL cannot reach the model. Put a local http proxy in front of a \
-                     TLS upstream if needed."
+                     TLS upstream if needed.",
+                    RedactedUrl::new(&upstream_url)
                 );
             }
             // The single backend's token rates, validated here so a malformed value is reported
@@ -660,8 +661,10 @@ async fn main() -> anyhow::Result<()> {
          every caller unless a bearer-token line below says otherwise."
     );
     // Every operator-supplied value from here down goes through `legible`: quoted so its boundaries
-    // are visible, and escaped so a newline in it cannot print a line of its own (#16).
-    eprintln!("obolus: facilitator (verify/settle) -> {}", legible(&facilitator_url));
+    // are visible, and escaped so a newline in it cannot print a line of its own (#16). A URL goes
+    // through `RedactedUrl`, which does that and also drops anything that could be a credential
+    // (#15): these lines land in journald, container logs and CI output.
+    eprintln!("obolus: facilitator (verify/settle) -> {}", RedactedUrl::new(&facilitator_url));
     eprintln!(
         "obolus: payment window {max_timeout_seconds} s (advertised as maxTimeoutSeconds): a paid \
          request's upstream must send its response head within {} s of arrival, or the request \
@@ -711,7 +714,7 @@ async fn main() -> anyhow::Result<()> {
             "obolus: upstream (inference) -> backend {} kind {} at {} ({}, serves {}{}{})",
             legible(&backend.id),
             backend.kind,
-            legible(&backend.base_url),
+            RedactedUrl::new(&backend.base_url),
             if backend.has_key { "keyed" } else { "keyless" },
             models,
             cost,

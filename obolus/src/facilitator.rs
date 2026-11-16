@@ -24,6 +24,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
 
+use crate::arming::RedactedUrl;
 use crate::x402::{PaymentPayload, PaymentRequirements, SettlementReceipt, X402_VERSION};
 
 /// Why a facilitator did not complete a payment.
@@ -320,18 +321,21 @@ pub enum DelegatedFacilitatorError {
     /// front of the process that accepts plain `http://` and speaks `https://` onward, and this
     /// type speaks only plain HTTP (a loopback in tests; that proxy, or a local facilitator,
     /// otherwise).
+    ///
+    /// Carries the URL redacted: a refusal is printed, and a URL refused here is the likeliest one
+    /// to carry a hosted facilitator's key.
     #[error(
-        "facilitator base URL {0:?} uses https, but this binary has no outbound TLS client; put a \
+        "facilitator base URL {0} uses https, but this binary has no outbound TLS client; put a \
          local proxy in front of it that accepts http:// and speaks https:// to the facilitator, \
          and point this at the proxy's http:// address"
     )]
-    TlsNotWired(String),
+    TlsNotWired(RedactedUrl),
 
     /// The base URL is not an `http://` endpoint (a schemeless or other-scheme base). We build
     /// request URLs by string concatenation and speak only plain HTTP, so an explicit `http://`
-    /// base is required.
-    #[error("facilitator base URL {0:?} is not an http:// endpoint")]
-    NotAnHttpBase(String),
+    /// base is required. Carries the URL redacted, like [`Self::TlsNotWired`].
+    #[error("facilitator base URL {0} is not an http:// endpoint")]
+    NotAnHttpBase(RedactedUrl),
 }
 
 /// The body both `/verify` and `/settle` take. `paymentPayload` is the client's payment as received
@@ -470,12 +474,23 @@ fn our_fault(reason: Option<&str>) -> Option<&'static str> {
 ///   or 4xx it arrived on.
 ///
 /// It speaks plain HTTP only; see [`DelegatedFacilitatorError::TlsNotWired`].
-#[derive(Debug)]
 pub struct DelegatedFacilitator {
     verify_url: String,
     settle_url: String,
     client: Client<HttpConnector, Full<Bytes>>,
     timeout: Duration,
+}
+
+// `Debug` by hand, not derived: the endpoint URLs are kept as the operator wrote them, so they are
+// shown redacted here rather than printed whole by whoever formats this.
+impl std::fmt::Debug for DelegatedFacilitator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegatedFacilitator")
+            .field("verify_url", &RedactedUrl::new(&self.verify_url))
+            .field("settle_url", &RedactedUrl::new(&self.settle_url))
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DelegatedFacilitator {
@@ -492,10 +507,10 @@ impl DelegatedFacilitator {
         // through `HTTPS://…` and schemeless bases, defeating the guard.
         let lowered = base.to_ascii_lowercase();
         if lowered.starts_with("https://") {
-            return Err(DelegatedFacilitatorError::TlsNotWired(base.to_string()));
+            return Err(DelegatedFacilitatorError::TlsNotWired(RedactedUrl::new(base)));
         }
         if !lowered.starts_with("http://") {
-            return Err(DelegatedFacilitatorError::NotAnHttpBase(base.to_string()));
+            return Err(DelegatedFacilitatorError::NotAnHttpBase(RedactedUrl::new(base)));
         }
         Ok(Self {
             verify_url: format!("{base}/verify"),
@@ -1344,6 +1359,27 @@ mod delegated_tests {
         // A schemeless base would silently produce a bad request URL; caught at construction.
         let err = DelegatedFacilitator::new("facilitator.example/facilitator").unwrap_err();
         assert!(matches!(err, DelegatedFacilitatorError::NotAnHttpBase(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_refused_base_does_not_print_its_credential() {
+        // An https base is the likeliest to carry a hosted facilitator's key, and it is refused today,
+        // so the refusal is where the key would reach the log.
+        for base in [
+            "https://key:s3cret@facilitator.example/facilitator?apiKey=s3cret",
+            "key:s3cret@facilitator.example/facilitator?apiKey=s3cret",
+        ] {
+            let err = DelegatedFacilitator::new(base).unwrap_err();
+            assert!(!err.to_string().contains("s3cret"), "{err}");
+            assert!(!format!("{err:?}").contains("s3cret"), "{err:?}");
+            assert!(err.to_string().contains("facilitator.example/facilitator"), "{err}");
+        }
+    }
+
+    #[test]
+    fn debug_does_not_print_a_credential_in_the_url() {
+        let f = DelegatedFacilitator::new("http://u:s3cret@h:8402/facilitator?apiKey=s3cret").unwrap();
+        assert!(!format!("{f:?}").contains("s3cret"), "{f:?}");
     }
 
     // --- verdict classification by reason (#31 item 5) ------------------------------------------

@@ -168,10 +168,97 @@ fn is_placeholder_variant(network: &str) -> bool {
 ///
 /// Every operator-supplied value the startup output prints goes through this one function: the
 /// offender lists in the refusal here and the MAINNET ARMED banner, the per-option and per-backend
-/// lines, the facilitator URL and the bearer-token banner. So the format cannot be legible in one
-/// message and lying in the next.
+/// lines, the bearer-token banner, and every URL by way of [`RedactedUrl`]. So the format cannot be
+/// legible in one message and lying in the next.
 pub fn legible(value: &str) -> String {
     format!("\"{}\"", value.escape_default())
+}
+
+/// An operator-supplied URL with every part that could carry a credential removed: the userinfo
+/// (`user:pass@`), the query string and the fragment. What remains — scheme, host, port and path —
+/// names the endpoint, which is what a log line or a refusal needs.
+///
+/// Built only by [`RedactedUrl::new`], so a value of this type never holds those parts. That makes
+/// it the type to store in an error or print in a log line. Its `Display` renders the kept part
+/// through [`legible`] and then says which parts were removed, so a redacted URL is never mistaken
+/// for the whole one by an operator chasing a 401.
+///
+/// A password may itself hold `/`, `?` or `#`, so where the host part ends cannot be told from the
+/// text when an `@` appears after the first of them. Such a URL fails closed: only its scheme is
+/// kept, and the `Display` says why the rest is hidden.
+///
+/// The path is kept, because it is how a facilitator is told apart (`…/facilitator`). A provider
+/// that puts its key in the path (`…/v2/<key>`) is not covered: there is no telling such a segment
+/// from an ordinary one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactedUrl {
+    kept: String,
+    userinfo: bool,
+    query: bool,
+    fragment: bool,
+    /// An `@` past the host part's end: everything after the scheme was withheld.
+    ambiguous: bool,
+}
+
+impl RedactedUrl {
+    pub fn new(url: &str) -> Self {
+        // A scheme only if what precedes `://` could be one; otherwise a `://` inside a query of a
+        // schemeless value would be taken for the separator.
+        let (scheme, rest) = match url.split_once("://") {
+            Some((s, rest))
+                if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) =>
+            {
+                (Some(s), rest)
+            }
+            _ => (None, url),
+        };
+        let scheme_only = || match scheme {
+            Some(scheme) => format!("{scheme}://"),
+            None => String::new(),
+        };
+        // The authority runs to the first `/`, `?` or `#`; userinfo is whatever precedes its last
+        // `@`. An `@` after that point may be the end of a password holding one of those three, so
+        // nothing past the scheme is kept.
+        let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+        if tail.contains('@') {
+            return Self {
+                kept: scheme_only(),
+                userinfo: false,
+                query: false,
+                fragment: false,
+                ambiguous: true,
+            };
+        }
+        let (userinfo, host) = match authority.rsplit_once('@') {
+            Some((_, host)) => (true, host),
+            None => (false, authority),
+        };
+        let (path, after) = tail.split_at(tail.find(['?', '#']).unwrap_or(tail.len()));
+        let (query, fragment) = match after.split_once('#') {
+            Some((query, _)) => (!query.is_empty(), true),
+            None => (!after.is_empty(), false),
+        };
+        let kept = format!("{}{host}{path}", scheme_only());
+        Self { kept, userinfo, query, fragment, ambiguous: false }
+    }
+}
+
+impl std::fmt::Display for RedactedUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&legible(&self.kept))?;
+        if self.ambiguous {
+            return f.write_str(r#" (rest not shown: it has an "@" that may end a password)"#);
+        }
+        let removed: Vec<&str> =
+            [(self.userinfo, "userinfo"), (self.query, "query"), (self.fragment, "fragment")]
+                .into_iter()
+                .filter_map(|(present, name)| present.then_some(name))
+                .collect();
+        if !removed.is_empty() {
+            write!(f, " ({} not shown)", removed.join(", "))?;
+        }
+        Ok(())
+    }
 }
 
 /// Escape the characters in a *message* that can start a log line or rewrite one, and leave the rest
@@ -842,6 +929,87 @@ fn is_diagnosable(network: &str) -> bool {
 mod tests {
     use super::*;
     use crate::x402::SCHEME_EXACT;
+
+    fn shown(url: &str) -> String {
+        RedactedUrl::new(url).to_string()
+    }
+
+    #[test]
+    fn a_url_with_nothing_to_hide_is_shown_whole_and_unmarked() {
+        assert_eq!(shown("http://127.0.0.1:8404/facilitator"), r#""http://127.0.0.1:8404/facilitator""#);
+        assert_eq!(shown("http://h:8402"), r#""http://h:8402""#);
+    }
+
+    #[test]
+    fn userinfo_is_dropped_and_said_to_be() {
+        assert_eq!(shown("http://key@h:8402/f"), r#""http://h:8402/f" (userinfo not shown)"#);
+        assert_eq!(shown("http://key:s3cret@h:8402/f"), r#""http://h:8402/f" (userinfo not shown)"#);
+    }
+
+    #[test]
+    fn a_query_and_a_fragment_are_dropped_and_said_to_be() {
+        assert_eq!(shown("http://h/f?apiKey=s3cret"), r#""http://h/f" (query not shown)"#);
+        assert_eq!(shown("http://h/f#s3cret"), r#""http://h/f" (fragment not shown)"#);
+        assert_eq!(
+            shown("http://u:p@h/f?apiKey=s3cret#frag"),
+            r#""http://h/f" (userinfo, query, fragment not shown)"#
+        );
+        // A query with no path still ends the authority.
+        assert_eq!(shown("http://h?apiKey=s3cret"), r#""http://h" (query not shown)"#);
+    }
+
+    #[test]
+    fn an_at_sign_past_the_first_delimiter_hides_everything_after_the_scheme() {
+        // A password may hold `/`, `?` or `#` (a base64 key routinely holds `/`), so an `@` past
+        // the first of them may be the one that ends a password. Fail closed: show the scheme only.
+        const HIDDEN: &str = r#" (rest not shown: it has an "@" that may end a password)"#;
+        for (url, kept) in [
+            ("https://user:ab/cd+ef==@api.example.com/v1", "https://"),
+            ("https://user:pa?ss@h/f", "https://"),
+            ("https://user:pa#ss@h/f", "https://"),
+            // Over-redacted, but nothing leaks: an `@` in a path or query is not worth guessing at.
+            ("http://h/a@b", "http://"),
+            ("http://h/f?to=a@b", "http://"),
+            // A mistyped scheme is not a scheme, and its credential must not survive either.
+            ("http:/u:s3cret@h/f", ""),
+            ("https//u:s3cret@h/f", ""),
+        ] {
+            assert_eq!(shown(url), format!("{}{HIDDEN}", legible(kept)), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_schemeless_value_is_redacted_by_the_same_rule() {
+        assert_eq!(shown("key:s3cret@h/x"), r#""h/x" (userinfo not shown)"#);
+        // A `://` inside the query is not a scheme separator.
+        assert_eq!(shown("h/x?next=http://y"), r#""h/x" (query not shown)"#);
+    }
+
+    #[test]
+    fn scheme_case_ipv6_and_trailing_slash_are_kept_as_given() {
+        assert_eq!(shown("HTTP://u@H:1/"), r#""HTTP://H:1/" (userinfo not shown)"#);
+        assert_eq!(shown("http://u:p@[::1]:8402/f"), r#""http://[::1]:8402/f" (userinfo not shown)"#);
+    }
+
+    #[test]
+    fn what_is_shown_still_goes_through_legible() {
+        // A newline in the kept part cannot start a log line of its own (#16).
+        assert_eq!(shown("http://h/f\nobolus: x"), r#""http://h/f\nobolus: x""#);
+    }
+
+    #[test]
+    fn neither_rendering_carries_the_secret() {
+        for url in [
+            "http://key:s3cret@h/f?apiKey=s3cret#s3cret",
+            "https://key:s3/cret@h/f",
+            "https://key:s3?cret@h/f",
+            "http:/key:s3cret@h/f",
+        ] {
+            let r = RedactedUrl::new(url);
+            assert!(!r.to_string().contains("s3"), "{url}: {r}");
+            assert!(!format!("{r:?}").contains("s3"), "{url}: {r:?}");
+        }
+    }
 
     /// Only `network` matters to the guard; everything else is filler.
     fn req(network: &str) -> PaymentRequirements {
