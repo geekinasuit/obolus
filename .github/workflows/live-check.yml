@@ -1,0 +1,135 @@
+name: Live check
+
+# The live check: a gateway built from the commit under test is paid one real Base Sepolia payment
+# through the public x402.org facilitator, and the settlement is checked on chain. It moves about
+# 0.001 testnet USDC per run. ci/live-check/live-check.mjs does the work; this file only provides
+# the binary, the client and the payer.
+#
+# NOT a merge gate, and never run on a pull request. The gate in ci.yml is hermetic; this touches a
+# chain and a third-party service, and it holds a funded key. It runs after merges to main, weekly
+# so facilitator-side drift shows even when nothing merges, and on demand.
+#
+# Actions are pinned by commit, as in release.yml: the paying job holds a key.
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly, Wednesday 07:41 UTC: off the top of the hour, where GitHub drops scheduled runs under
+    # load, and on a different day from x402-staleness.yml.
+    - cron: '41 7 * * 3'
+  workflow_dispatch:
+    inputs:
+      break:
+        # `token-domain` advertises the wrong EIP-712 domain version for USDC, so the facilitator
+        # refuses the signature and nothing moves on chain. It exists to show that a broken payment
+        # path turns this run red.
+        description: Break the payment path on purpose
+        type: choice
+        options: [none, token-domain]
+        default: none
+
+# Read-only token, GitHub-hosted runners, as in ci.yml.
+permissions:
+  contents: read
+
+# One payment at a time. A run that is already paying is never cancelled — it could be cut off
+# between the facilitator settling and this job recording the transaction. GitHub keeps at most one
+# run waiting behind it, so a burst of merges checks the first and the newest, not every one.
+concurrency:
+  group: live-check
+  cancel-in-progress: false
+
+jobs:
+  # The gateway is compiled here, in a job with no environment and so no key: building runs every
+  # dependency's build script and proc-macro, which is code that should not run beside the key.
+  # What those compile into the binary is kept from the key at run time instead (see "Pay and
+  # check").
+  build:
+    name: Build the gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: cargo build --release --locked -p obolus
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: obolus-live-check
+          path: target/release/obolus
+          if-no-files-found: error
+          retention-days: 1
+
+  live-check:
+    name: Pay a real testnet payment through x402.org
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The payer key is a secret of this environment, and the environment admits only `main`, so no
+    # pull request and no other branch can read it. That rule lives in the repository's settings,
+    # where nothing in review can see it, so the job also refuses any ref but main itself. The payer
+    # and recipient addresses are the environment's variables.
+    if: github.ref == 'refs/heads/main'
+    environment: testnet-live-check
+    # `actions: read` for download-artifact, stated rather than relied on, as in release.yml.
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # Exact versions from the committed lockfile. `--ignore-scripts` because this job holds a
+      # funded key: a dependency's install script is code that would run beside it.
+      - name: Install the paying client
+        working-directory: ci/live-check
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Test the client's signing guard
+        working-directory: ci/live-check
+        run: npm test
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: obolus-live-check
+          path: ${{ runner.temp }}/bin
+
+      # Artifacts do not keep the executable bit. Installed outside the runner's home, root-owned
+      # and world-executable, because the gateway runs as `nobody` (below).
+      - name: Install the gateway
+        run: sudo install -o root -g root -m 0755 "$RUNNER_TEMP/bin/obolus" /usr/local/bin/obolus
+
+      # The only step whose environment holds the key. live-check.mjs never prints it, and starts
+      # the gateway as `nobody`: as another user, the gateway's code cannot read this step's
+      # environment from /proc, whatever a dependency compiled into it.
+      - name: Pay and check
+        working-directory: ci/live-check
+        env:
+          OBOLUS_BIN: /usr/local/bin/obolus
+          LIVE_CHECK_GATEWAY_USER: nobody
+          LIVE_CHECK_PAYER_KEY: ${{ secrets.LIVE_CHECK_PAYER_KEY }}
+          LIVE_CHECK_PAYER_ADDRESS: ${{ vars.LIVE_CHECK_PAYER_ADDRESS }}
+          LIVE_CHECK_PAY_TO: ${{ vars.LIVE_CHECK_PAY_TO }}
+          LIVE_CHECK_BREAK: ${{ inputs.break || 'none' }}
+          LIVE_CHECK_OUT_DIR: ${{ runner.temp }}/live-check
+        run: node live-check.mjs
+
+      # The gateway's own account of the run: its startup banner and any facilitator reason. It
+      # never sees the key.
+      - name: Gateway log
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/live-check/gateway-stderr.log" ]; then
+            cat "$RUNNER_TEMP/live-check/gateway-stderr.log"
+          else
+            echo "The gateway did not start."
+          fi

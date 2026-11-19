@@ -3,7 +3,8 @@
 //! Phase A has `FakeFacilitator` (`#[cfg(test)]`-only, for hermetic per-PR CI, and absent from
 //! every shipped build) and, at A3, a delegating
 //! implementation that forwards `verify` / `settle` to a third-party facilitator over HTTP
-//! (exercised only by the post-merge cron e2e). Phase B adds a self-settling implementation
+//! (exercised against a real facilitator only by the post-merge live check,
+//! `.github/workflows/live-check.yml`). Phase B adds a self-settling implementation
 //! that verifies the authorization and submits on-chain itself. The gateway above this trait
 //! is identical across all three — that is the entire point of the seam.
 
