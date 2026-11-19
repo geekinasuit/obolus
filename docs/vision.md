@@ -174,9 +174,11 @@ The design is in [`pricing.md`](pricing.md).
   are extracted.
 - **The gateway speaks plain HTTP inbound.** TLS is terminated in front of it, so the binary holds
   no private key; [`exposure.md`](exposure.md) covers how.
-- **Outbound TLS to a facilitator will be built into the gateway, in stages**
-  ([#35](https://github.com/geekinasuit/obolus/issues/35)). Until then a local proxy terminates it,
-  which means only the gateway's authors can deploy it today *(inference)*.
+- **Outbound TLS is built into the gateway.** It reaches an `https://` facilitator itself, trusting
+  roots compiled into the binary ([#35](https://github.com/geekinasuit/obolus/issues/35)). Backend
+  origins get the same client next ([#144](https://github.com/geekinasuit/obolus/issues/144)); until
+  then a hosted backend needs a local proxy, which means only the gateway's authors can deploy
+  against one today *(inference)*.
 - **The MVP is stateless** ([#53](https://github.com/geekinasuit/obolus/issues/53)): configuration
   from the environment and files, telemetry fire-and-forget, no datastore. Admin UX, runtime feature
   flags and kill-switches, per-backend spend caps, and shared state for horizontal scale come after

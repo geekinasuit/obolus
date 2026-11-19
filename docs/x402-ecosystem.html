@@ -589,9 +589,13 @@ CDP         GET /v2/x402/discovery/resources?limit=&amp;offset=
         <div class="lbl">Live</div>
         <p>A bearer-token path exists alongside the 402 branch, fail-closed: anything not positively verified takes the payment branch.</p>
       </div>
+      <div class="st live">
+        <div class="lbl">Live</div>
+        <p>The gateway reaches an <code>https://</code> facilitator itself, trusting roots compiled into the binary; the round trip above predates this and went through a local proxy (<a href="https://github.com/geekinasuit/obolus/issues/35">#35</a>).</p>
+      </div>
       <div class="st gap">
         <div class="lbl">Worked around</div>
-        <p>No outbound TLS client, so the facilitator URL must be <code>http://</code>. A real facilitator is <code>https://</code>, so reaching one takes a TLS-terminating proxy in front of it, as the round trip did (<a href="https://github.com/geekinasuit/obolus/issues/35">#35</a>).</p>
+        <p>Backend origins are still <code>http://</code> only, so a hosted model served over <code>https://</code> needs a local proxy in front of it (<a href="https://github.com/geekinasuit/obolus/issues/144">#144</a>).</p>
       </div>
       <div class="st gap">
         <div class="lbl">Bounded</div>
@@ -626,7 +630,7 @@ CDP         GET /v2/x402/discovery/resources?limit=&amp;offset=
       <li><span class="v-ok">SPEC</span> — the <code>PAYMENT-REQUIRED</code> / <code>PAYMENT-SIGNATURE</code> / <code>PAYMENT-RESPONSE</code> headers: <a href="https://github.com/x402-foundation/x402/blob/main/specs/transports-v2/http.md">transports-v2/http.md</a>. The <code>exact</code> scheme's constructions: <a href="https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_evm.md">scheme_exact_evm.md</a> (EIP-3009, Permit2 and ERC-7710) and <a href="https://github.com/x402-foundation/x402/blob/main/specs/schemes/exact/scheme_exact_svm.md">scheme_exact_svm.md</a> (SPL <code>TransferChecked</code>, the fee payer, and the <code>upfront</code> recommendation for long-running handlers). The <code>auth-capture</code> scheme's lifecycle, its <code>refund</code> and its after-the-response <code>escrow</code> capture: <a href="https://github.com/x402-foundation/x402/blob/main/specs/schemes/auth-capture/scheme_auth_capture.md">scheme_auth_capture.md</a> (v1.1, read 2026-09-29).</li>
       <li><span class="v-soft">CODE</span> — <code>validBefore = now + maxTimeoutSeconds</code>, the facilitator's refusal to settle an authorization about to expire, and the 300-second default window are read from the reference implementation (<code>@x402/core</code> and <code>@x402/evm</code> 2.27.0), not from the specification, which does not state them.</li>
       <li><span class="v-ok">DOCS</span> — Bazaar behaviour, the discovery resource schema and the paginated catalog endpoint: <a href="https://docs.cdp.coinbase.com/x402/bazaar">CDP · x402 Bazaar</a> and <a href="https://docs.cdp.coinbase.com/api-reference/v2/rest-api/x402-facilitator/search-x402-resources">Search x402 resources</a>. Read 2026-08-05 and not re-checked for this rewrite.</li>
-      <li><span class="v-ok">OURS</span> — the status section reflects the gateway source directly, including the <code>https://</code> rejection and the test that pins it, and the round trip recorded on <a href="https://github.com/geekinasuit/obolus/issues/72">#72</a>.</li>
+      <li><span class="v-ok">OURS</span> — the status section reflects the gateway source directly, including the facilitator's TLS client and the tests that pin its certificate checks, and the round trip recorded on <a href="https://github.com/geekinasuit/obolus/issues/72">#72</a>.</li>
     </ul>
     <p class="note">Living document — re-verify load-bearing protocol facts before requoting; the x402 surface, and the discovery layer especially, is still moving. Orientation material for anyone picking up Obolus: this describes the rail Obolus sells on, not the gateway's own internals (see the project <code>README</code>).</p>
   </div>

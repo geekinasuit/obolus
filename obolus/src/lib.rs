@@ -31,5 +31,6 @@ pub mod gateway;
 pub mod pricing;
 pub mod request;
 pub mod telemetry;
+mod tls;
 pub mod upstream;
 pub mod x402;

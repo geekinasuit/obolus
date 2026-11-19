@@ -124,14 +124,10 @@ const PAST_STARTUP: &str = "starting on";
 const STARTUP_LINE: &str = "obolus: ";
 const BAILED: &str = "Error:";
 
-/// The remedy every facilitator-URL refusal points at (#35). This binary has no outbound TLS
-/// client, and the public testnet facilitator is served over https, so the way to reach it is a
-/// proxy in front of the process that accepts `http://` and speaks `https://` onward. One needle
-/// shared by the missing-variable and the https-refusal tests, so the two messages cannot drift
-/// apart — and cannot drift back to recommending a URL the binary then refuses, which is how #35
-/// was found. The phrase names the proxy's outbound leg on purpose: "terminate TLS" is the
-/// inbound idiom, and this direction is the one the README keeps distinct from it.
-const TLS_REMEDY: &str = "speaks https:// to the facilitator";
+/// The facilitator URL the missing-variable refusal recommends. One needle shared by that test and
+/// the one that boots with it, so the refusal cannot drift back to recommending a URL the binary
+/// then refuses, which is how #35 was found.
+const TESTNET_FACILITATOR: &str = "https://x402.org/facilitator";
 
 /// The x402-short-name diagnosis clause's lead-in, asserted both present and absent below. One
 /// constant on purpose: a `must_not_say` written against a stale literal is satisfied by wording
@@ -1414,28 +1410,26 @@ fn an_empty_accepts_alongside_single_chain_vars_reports_the_true_premise() {
 }
 
 #[test]
-fn a_missing_facilitator_url_refuses_and_names_the_tls_remedy() {
+fn a_missing_facilitator_url_refuses_and_names_the_testnet_facilitator() {
     // The one required variable with no default. The refusal is where an operator first meets the
-    // facilitator question, so what it recommends has to be something the binary then accepts.
+    // facilitator question, so what it recommends has to be something the binary then accepts —
+    // which the next test checks with the same needle.
     let run = run_without(&["OBOLUS_FACILITATOR_URL"], &[]);
 
     run.must_have_refused_during_startup();
     run.must_say(BAILED);
     run.must_say("OBOLUS_FACILITATOR_URL is required");
-    run.must_say(TLS_REMEDY);
+    run.must_say(TESTNET_FACILITATOR);
 }
 
 #[test]
-fn an_https_facilitator_url_refuses_and_names_the_tls_remedy() {
-    // The URL an operator would reach for first — the public testnet facilitator — is https, and
-    // this binary speaks plain http. The refusal must say what to do instead, not only what it
-    // will not do; "use an http:// endpoint" on its own reads as "there is no way to reach it".
-    let run = run(&[("OBOLUS_FACILITATOR_URL", "https://x402.org/facilitator")]);
+fn the_recommended_https_facilitator_url_is_accepted() {
+    // Startup only builds the client; nothing is sent until a payment arrives, so this stays off
+    // the network.
+    let run = run(&[("OBOLUS_FACILITATOR_URL", TESTNET_FACILITATOR)]);
 
-    run.must_have_refused_during_startup();
-    run.must_say(BAILED);
-    run.must_say("OBOLUS_FACILITATOR_URL");
-    run.must_say(TLS_REMEDY);
+    run.must_have_got_past_startup();
+    run.must_say(r#"facilitator (verify/settle) -> "https://x402.org/facilitator""#);
 }
 
 #[test]
@@ -1453,12 +1447,13 @@ fn the_startup_lines_do_not_print_a_credential_in_a_url() {
 
 #[test]
 fn a_refused_url_does_not_print_its_credential() {
-    // An https URL is refused today, and it is the one likeliest to carry a hosted service's key.
-    let facilitator = run(&[("OBOLUS_FACILITATOR_URL", "https://key:s3cret@x402.org/facilitator")]);
+    // A refusal is printed, so a key in a URL that is refused would reach the log there.
+    let facilitator = run(&[("OBOLUS_FACILITATOR_URL", "ftp://key:s3cret@x402.org/facilitator")]);
     facilitator.must_have_refused_during_startup();
     facilitator.must_not_say("s3cret");
-    facilitator.must_say(r#""https://x402.org/facilitator" (userinfo not shown)"#);
+    facilitator.must_say(r#""ftp://x402.org/facilitator" (userinfo not shown)"#);
 
+    // The upstream still refuses https: outbound TLS reaches only the facilitator so far.
     let upstream = run(&[("OBOLUS_UPSTREAM_URL", "https://key:s3cret@api.example/v1")]);
     upstream.must_have_refused_during_startup();
     upstream.must_not_say("s3cret");

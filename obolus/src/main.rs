@@ -143,11 +143,8 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!(
             "OBOLUS_FACILITATOR_URL is required: the base URL of the x402 facilitator that \
              verifies and settles payments (/verify and /settle are appended to it). Refusing to \
-             start rather than guess where money settles. This binary speaks plain http:// to it \
-             and has no outbound TLS client, while the public testnet facilitator is served over \
-             https — so put a proxy in front: run a local proxy that accepts http:// and speaks \
-             https:// to the facilitator, and point this variable at the proxy. Recipe: \
-             https://github.com/geekinasuit/obolus#reaching-an-https-facilitator"
+             start rather than guess where money settles. For the public testnet facilitator, \
+             set it to https://x402.org/facilitator."
         )
     })?;
 
@@ -167,9 +164,9 @@ async fn main() -> anyhow::Result<()> {
     let settle_timeout =
         Duration::from_secs(max_timeout_seconds.saturating_add(SETTLE_TIMEOUT_MARGIN_SECS));
 
-    // `new` rejects an `https://` base (no TLS wired) and anything that is not an explicit
-    // `http://` base, so a misconfiguration fails here at startup rather than later as an opaque
-    // "unavailable" at connect time.
+    // `new` rejects anything that is not an explicit `https://` or `http://` base, so a
+    // misconfiguration fails here at startup rather than later as an opaque "unavailable" at
+    // connect time.
     let facilitator = DelegatedFacilitator::new(&facilitator_url)
         .map_err(|e| anyhow::anyhow!("OBOLUS_FACILITATOR_URL: {e}"))?
         .with_timeout(settle_timeout);
@@ -252,7 +249,7 @@ async fn main() -> anyhow::Result<()> {
             if !upstream_url.to_ascii_lowercase().starts_with("http://") {
                 anyhow::bail!(
                     "OBOLUS_UPSTREAM_URL must be an http:// origin (got {}): the \
-                     upstream client speaks plain HTTP only (no TLS is wired), so an https:// or \
+                     upstream client speaks plain HTTP only (TLS to backends is #144), so an https:// or \
                      schemeless URL cannot reach the model. Put a local http proxy in front of a \
                      TLS upstream if needed.",
                     RedactedUrl::new(&upstream_url)

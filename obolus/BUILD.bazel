@@ -25,12 +25,15 @@ rust_library(
         "@crates//:base64",
         "@crates//:futures-util",
         "@crates//:http-body-util",
+        "@crates//:hyper-rustls",
         "@crates//:hyper-util",
         "@crates//:jsonwebtoken",
+        "@crates//:rustls",
         "@crates//:serde",
         "@crates//:serde_json",
         "@crates//:thiserror",
         "@crates//:tokio",
+        "@crates//:webpki-roots",
     ],
 )
 
@@ -40,7 +43,10 @@ rust_test(
     name = "obolus_test",
     crate = ":lib",
     deps = [
+        "@crates//:hyper",
+        "@crates//:rcgen",
         "@crates//:ring",
+        "@crates//:tokio-rustls",
         "@crates//:tower",
     ],
 )

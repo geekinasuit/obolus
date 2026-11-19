@@ -425,8 +425,8 @@ pub enum BackendError {
     /// likeliest URL to carry a key.
     #[error(
         "backend {id:?}: baseUrl must be an http:// origin (got {base_url}). The upstream client \
-         speaks plain HTTP only (no TLS is wired), so reach a TLS origin through a local http→https \
-         proxy — the same pattern OBOLUS_FACILITATOR_URL uses."
+         speaks plain HTTP only (TLS to backends is #144), so reach a TLS origin through a local \
+         http→https proxy."
     )]
     BadBaseUrl { id: String, base_url: RedactedUrl },
 

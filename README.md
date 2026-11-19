@@ -86,7 +86,7 @@ do not delete the test target without a replacement.
 ## Run it locally
 
 ```bash
-OBOLUS_FACILITATOR_URL=http://127.0.0.1:8404/facilitator bazel run //obolus:obolus
+OBOLUS_FACILITATOR_URL=https://x402.org/facilitator bazel run //obolus:obolus
 ```
 
 Listens on `127.0.0.1:8403` (deliberately not 8402, which x402 client-side tooling tends to bind).
@@ -99,18 +99,16 @@ there is no mainnet signing path in the binary.
 
 **`OBOLUS_FACILITATOR_URL` is required and has no default** — a payment gateway must never guess where
 money settles, so the server refuses to start without it. It is the base URL of the x402 facilitator
-(`/verify` and `/settle` are appended); it must be `http://`, because the binary has no outbound TLS
-client. The public testnet facilitator (`x402.org`) is served over `https`, so reaching it means a
-proxy in front of the gateway that speaks `https` on its behalf — the address in the example above
-is where such a proxy would listen, and [Reaching an https facilitator](#reaching-an-https-facilitator)
-gives the recipe.
+(`/verify` and `/settle` are appended), and may be `https://` or `http://`. The example above is the
+public testnet facilitator; [Facilitator TLS](#facilitator-tls) says which certificates the gateway
+trusts when it reaches one over `https`.
 
 Configuration is by environment variable:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `OBOLUS_FACILITATOR_URL` | **required** | Base URL of the x402 facilitator that verifies and settles payments (`/verify` + `/settle` appended). No default: the server refuses to start without it rather than guess where money settles. Must be `http://` (no outbound TLS client) or startup aborts; for an `https` facilitator, point this at a local TLS-terminating proxy — see [Reaching an https facilitator](#reaching-an-https-facilitator). |
-| `OBOLUS_UPSTREAM_URL` | `http://127.0.0.1:11434` | Ollama origin the gateway proxies to. Origin only (scheme + host + port); the `/v1/chat/completions` path is appended. Must be `http://` — the client speaks plain HTTP only (no TLS is wired), so an `https://` or schemeless value is rejected at startup rather than 502-ing every paid request. |
+| `OBOLUS_FACILITATOR_URL` | **required** | Base URL of the x402 facilitator that verifies and settles payments (`/verify` + `/settle` appended). No default: the server refuses to start without it rather than guess where money settles. Must be `https://` or `http://`, or startup aborts. Over `https` the facilitator's certificate is checked against roots compiled into the binary — see [Facilitator TLS](#facilitator-tls). |
+| `OBOLUS_UPSTREAM_URL` | `http://127.0.0.1:11434` | Ollama origin the gateway proxies to. Origin only (scheme + host + port); the `/v1/chat/completions` path is appended. Must be `http://` — the upstream client speaks plain HTTP only (outbound TLS reaches the facilitator but not backends yet, [#144](https://github.com/geekinasuit/obolus/issues/144)), so an `https://` or schemeless value is rejected at startup rather than 502-ing every paid request. A TLS origin needs a local `http://`→`https://` proxy in front of it until then. |
 | `OBOLUS_BACKENDS_FILE` | unset | **Multi-backend override.** Path to a JSON file declaring backends — an array of `{"id","kind","baseUrl", …}` objects, where `kind` is `ollama` \| `openai-compat` \| `anthropic-compat`, with an optional `keyFile` (a path to a file holding the bearer token — the key is *referenced*, never inlined), optional `models` (the aliases this backend serves) / `precedence` (higher wins when two backends serve the same model), and an optional `cost` (this backend's upstream cost in atomic units, a string, read by cost-plus pricing — see below). A request is **routed** to a backend by its `model` field; an unknown model is a clean `404` and a request naming no model is a `400`, unless a single **catch-all** backend — one declaring no `models` — is present, which serves every request (the single-backend case). A body with a case variant of the `model` or `max_tokens` key, such as `MODEL` or `Max_Tokens`, is a `400` before any payment, on either access path and whatever the backends, a sole catch-all included: the upstream may read the variant while the gateway routes and prices by the exact key ([#122](https://github.com/geekinasuit/obolus/issues/122)). A catch-all declared alongside named backends, two backends sharing an `id`, or two serving the same model at equal precedence are startup errors: the route would be swallowed or ambiguous. **Pricing can vary by backend.** Under `OBOLUS_PRICING=cost-plus` (below) each backend is quoted at its own declared `cost` plus a gateway-wide margin, so a free local model and a metered hosted one are billed differently; the default `static` rate charges each advertised option its own configured amount, unchanged. Under cost-plus **every** backend must declare a `cost` (one without is a startup error, named), and `OBOLUS_UPSTREAM_COST` — the single-backend cost — is refused alongside this file, since cost then comes per entry. An entry may also declare per-model **token rates**, `"rates": {"<model>": {"input": "<atomic>", "output": "<atomic>"}}`: decimal strings in the asset's atomic units **per million tokens**, written like `cost` (for USDC, $3 per million tokens is `"3000000"`). Rates are validated at startup — a non-digit value (sign, decimal, exponent, a JSON number), overflow, a missing or unknown key, a repeated model or key, an empty object or model name, both sides `0`, or a model the entry's `models` list does not name is a startup error naming the backend, model and field. They take effect only under `OBOLUS_PRICING=token` (below), where **every** backend must declare some (one without is a startup error, named) and a declared `cost` is refused; under any other rate declared rates are a startup error, since they would sit unread ([#31](https://github.com/geekinasuit/obolus/issues/31)). Per-client rates remain later work. When set it **supersedes** `OBOLUS_UPSTREAM_URL` (and `OBOLUS_UPSTREAM_COST`), and setting **both at once is a startup error** (the single-backend value would sit inert). `ollama` is keyless (a `keyFile` on it is refused); `openai-compat` may carry a `keyFile` (a keyless one is allowed, sending no `Authorization`); `anthropic-compat` is refused as not-yet-implemented. A malformed file, an unreadable / empty / non-header-safe key file, a non-`http://` origin, a malformed or zero `cost`, or an empty `id` / model alias is a startup error, not a per-request one. Unset, the single Ollama backend is built from `OBOLUS_UPSTREAM_URL` above. |
 | `OBOLUS_ADDR` | `127.0.0.1:8403` | Bind address. Must parse as a socket address or the server refuses to start. |
 | `OBOLUS_RESOURCE` | `http://<ADDR>/v1/chat/completions` | The resource the 402 challenge tells the payer to pay for, so it must be an address they can actually reach. The default is derived from the bind address, which is only correct when that address is routable — **set this explicitly** behind a reverse proxy, a container port map, or a wildcard (`0.0.0.0`) bind, or the challenge advertises a resource nobody can pay for. |
@@ -139,7 +137,7 @@ Configuration is by environment variable:
 | `OBOLUS_TELEMETRY` | `stdout` | **Where per-request telemetry goes.** Unset or `stdout` writes one JSON line per request to stdout, which carries nothing else (the banner and diagnostics go to stderr); `off` records nothing. Any other value is a startup error, so a typo cannot silently flip it. Every completion request writes a line, an unpaid 402 included, so the volume follows traffic you do not control: rotate or cap wherever stdout lands. The line format, and how to read revenue against cost from it, is in [`docs/telemetry.md`](docs/telemetry.md). |
 
 `OBOLUS_ADDR`, `OBOLUS_PRICE`, `OBOLUS_MAX_TIMEOUT_SECS`, `OBOLUS_UPSTREAM_HEAD_TIMEOUT_SECS`, and
-`OBOLUS_MAX_OUTPUT_TOKENS` are validated at startup and abort a bad launch; `OBOLUS_FACILITATOR_URL` must be present and `http://`,
+`OBOLUS_MAX_OUTPUT_TOKENS` are validated at startup and abort a bad launch; `OBOLUS_FACILITATOR_URL` must be present and `https://` or `http://`,
 and `OBOLUS_UPSTREAM_URL` (which has a valid default) must also be `http://` if overridden — the
 upstream client speaks plain HTTP only, so an `https://` there fails fast rather than at request time.
 When `OBOLUS_BACKENDS_FILE` is set instead, each declared backend's `baseUrl` faces that same
@@ -164,41 +162,26 @@ empty value takes the multi-chain door and configures nothing, while still super
 single-chain variable — so the refusal says exactly that and tells you to unset it, rather than
 handing you a JSON parser error about column 1 for a value you never meant to be JSON.
 
-### Reaching an https facilitator
+### Facilitator TLS
 
-The gateway has no outbound TLS client, and the public testnet facilitator is served over `https`,
-so between the two sits a proxy that accepts plain `http://` from the gateway and speaks `https://`
-to the facilitator. That is a **deployment requirement, not an implementation detail.** Pointed
-straight at an `https://` URL, the gateway refuses to start and says so. Pointed at a proxy that is
-not running, it starts fine — the facilitator is only dialled when a payment arrives — and then
-answers every paid request with a 502 while `/health` still reports OK.
+The gateway reaches an `https://` facilitator itself, with no proxy in front
+([#35](https://github.com/geekinasuit/obolus/issues/35)). How it decides whom to trust is fixed, not
+configured:
 
-One line does it with [Caddy](https://caddyserver.com/):
+- **Trusted roots are compiled in.** The binary carries Mozilla's root set (from `webpki-roots`) and
+  does not read the host's trust store. A slim container with no CA bundle behaves like any other
+  host, and a CA added to the host is not trusted. The set changes only when the binary is rebuilt.
+- **Verification cannot be turned off.** The certificate chain and the host name are always checked.
+  There is no setting to skip either, and none to add a CA.
+- TLS 1.2 and 1.3 only, with ring as the crypto library.
+- **No revocation checking** (no CRL, no OCSP): a revoked certificate is accepted until it expires.
 
-```bash
-caddy reverse-proxy --from http://127.0.0.1:8404 --to https://x402.org --change-host-header
-```
+A facilitator whose certificate fails these checks is never sent a request: the paid request is
+answered with a 502, and the log line names the reason (for example an unknown issuer, or a
+certificate for another name). The facilitator is only dialled when a payment arrives, so such a
+failure shows on the first paid request, not at startup, and `/health` still reports OK.
 
-```bash
-OBOLUS_FACILITATOR_URL=http://127.0.0.1:8404/facilitator bazel run //obolus:obolus
-```
-
-`--from` carries an explicit `http://` so Caddy serves plain HTTP on the loopback instead of minting
-a local certificate, and `--change-host-header` rewrites `Host` to the upstream's, which a
-facilitator behind a shared front end needs in order to route the request. The proxy validates the
-facilitator's certificate, so peer authenticity is still checked — but by a process the gateway
-cannot inspect. That is acceptable when both run on one host under one operator, and it is why an
-in-process TLS client is still owed before anyone else deploys this
-([#35](https://github.com/geekinasuit/obolus/issues/35)).
-
-The proxy also sits inside the settle deadline. `OBOLUS_MAX_TIMEOUT_SECS` plus its margin bounds
-one `/settle` call so that the facilitator's advertised budget is never undercut by the gateway's
-own client — a proxy-side timeout shorter than that undercuts it anyway, and from the gateway's side
-it is indistinguishable from the case it most wants to avoid: a 502 after the facilitator may
-already have moved the money. The one-liner above sets no such timeout, and Caddy's documented
-defaults are a 3-second dial timeout — which can only fire before a request is sent — and no
-response-header, read, or write timeout. Keep it that way, or set anything you add above the
-settle deadline.
+A plain `http://` facilitator, such as one on the loopback, still works.
 
 This is **outbound** TLS: the gateway as a client. Inbound TLS — clients reaching the gateway — is a
 separate question with the same answer for a different reason: it is terminated outside the process
@@ -559,8 +542,8 @@ What the verifier insists on, and why:
 - **`exp` must be present, and `nbf` is honoured.** A token with no expiry is honoured forever,
   which is not a token; one that is not valid yet is not valid.
 
-**A bearer token is a reusable credential on a plaintext wire.** Obolus speaks `http://` only — no
-TLS is wired anywhere in this binary — so anyone who can see the traffic can lift a token and replay
+**A bearer token is a reusable credential on a plaintext wire.** Obolus serves `http://` only — it
+has no TLS server — so anyone who can see the traffic can lift a token and replay
 it until it expires, and slice 1 has no revocation. Terminate TLS in front of Obolus before any
 token crosses a network you do not control, and keep token lifetimes short. The 402 path does not
 have this exposure in the same way: a payment authorization is scoped to one request, whereas a
