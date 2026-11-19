@@ -7,6 +7,9 @@ target
 /bazel-*
 user.bazelrc
 
+# The live check's npm install (ci/live-check); package-lock.json is committed, the tree is not.
+node_modules/
+
 # AGENTS.md is excluded by some contributors' *global* gitignore, which would silently drop it from
 # commits here. In this repo it is a real, reviewed source file — and AGENTS.compressed.md is
 # derived from it — so re-include it explicitly rather than shipping the compressed form alone.

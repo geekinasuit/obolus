@@ -1,0 +1,18 @@
+{
+  "name": "obolus-live-check",
+  "private": true,
+  "description": "Pays a gateway built from this commit one real Base Sepolia payment through a third-party facilitator, and checks the settlement on chain. Run by .github/workflows/live-check.yml.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test guard.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@x402/core": "2.30.0",
+    "@x402/evm": "2.30.0",
+    "@x402/fetch": "2.30.0",
+    "viem": "2.57.16"
+  }
+}
