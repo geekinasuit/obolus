@@ -27,7 +27,8 @@ construction, because there is no signing path to misuse.
 |---|---|
 | **Shipped (A0–A2)** | 402 challenge, the x402 header codec — x402 v2 only since [#71](https://github.com/geekinasuit/obolus/issues/71): `PAYMENT-REQUIRED` / `PAYMENT-SIGNATURE` / `PAYMENT-RESPONSE`, with v1 support deferred to [#73](https://github.com/geekinasuit/obolus/issues/73) — the `Facilitator` and `Upstream` seams, the fakes, the wired gateway |
 | **Shipped (A3 rewire)** | The real HTTP clients wired into the `obolus` binary: `DelegatedFacilitator` (delegates `/verify` + `/settle` to a facilitator you point it at) and `OllamaUpstream` (proxies a real Ollama). The fakes are now `#[cfg(test)]`-only, so no shipped binary can select "accept every payment + real model". Live-path hardening addressed: upstream head deadline ([#31](https://github.com/geekinasuit/obolus/issues/31) item 1), settle deadline derived from `maxTimeoutSeconds` (item 4), an abandoned upstream's connection closed while its answer is still arriving, which stopped Ollama 0.34.4's MLX runner generating when tried (item 3), pooled-retry double-settle disabled (item 6), and a paid request's upstream wait bounded by its payment window (item 7, found real on the first live round trip; [#83](https://github.com/geekinasuit/obolus/issues/83)), and a facilitator's refusal classified by its reason rather than its HTTP status, so one that blames the gateway or the facilitator answers 502 rather than 402 (item 5), and generation bounded against its price: a paid request must carry a `max_tokens` within the output cap, and `OBOLUS_PRICING=token` quotes it from per-model token rates, refusing a model with no rate (item 2) |
-| **Next (A3 e2e + fast-follows)** | The post-merge **cron** that settles a real testnet payment against a third-party facilitator (touches the network, so cron-only, never per-PR). Plus a finer output price than `max_tokens`, and a remedy for paying for output a request never generated ([#120](https://github.com/geekinasuit/obolus/issues/120)) |
+| **Live check (A3 e2e)** | After merges to `main` (one run at a time, so a burst of merges checks the first and the newest), and weekly, the [live check](.github/workflows/live-check.yml) pays a gateway built from that commit one real Base Sepolia payment through the `https://` x402.org facilitator, and checks the transfer on chain. Each run's transaction is in its summary under **Live check** in the repository's Actions tab. It touches a chain and holds a funded testnet key, so it never runs on a pull request ([#133](https://github.com/geekinasuit/obolus/issues/133)) |
+| **Next (fast-follows)** | A finer output price than `max_tokens`, and a remedy for paying for output a request never generated ([#120](https://github.com/geekinasuit/obolus/issues/120)) |
 | **Later (Phase B)** | A self-settling facilitator that verifies and submits on-chain itself — additive behind the same seam, gated separately |
 
 The payment payload is **opaque** to Phase A: we decode the envelope (the version, and the
@@ -61,6 +62,7 @@ proposed, and milestones after 4 are tentative.
 | `obolus/src/telemetry.rs` | The `Telemetry` seam, the one event recorded per request, the `LineSink` that writes it as a JSON line without ever blocking a request, and the test-only `FakeTelemetry` |
 | `obolus/src/main.rs` | The `obolus` binary, wired to the real facilitator + Ollama upstream (env-configured); testnet-by-construction |
 | `devseller/` | `obolus-devseller`, a seller to test an x402 *client* against: real challenges, offline verification, failure on command. Settles nothing; [not a gateway](#testing-a-client-obolus-devseller) |
+| `ci/live-check/` | The live check's paying client: a stub OpenAI-compatible backend, the gateway under test, one real testnet payment, and the checks on its receipt, telemetry and on-chain transfer. Run by `.github/workflows/live-check.yml` |
 | `docs/x402-ecosystem.html` | **Orientation:** what x402 is, who the participants are, the Bazaar discovery layer, and where Obolus sits on the rail. Start here if the protocol is new to you — this README assumes it |
 | `docs/architecture.md` | **The map:** what Obolus is, the components and seams it is built from, and the paths a request takes — for a reader with no prior context |
 | `docs/pricing.md` | **Pricing design:** how a request's price is decided — the cost-vs-quote denomination frame, the rate structures, the config, and the granularity decision |
@@ -76,8 +78,8 @@ bazel test //...
 ```
 
 Every test is hermetic: no network, no chain, no model. That is deliberate and is the *only*
-CI that gates a merge — external reality is exercised by a post-merge cron job so its flakiness
-cannot block the merge pipeline.
+CI that gates a merge — external reality is exercised by the post-merge [live check](.github/workflows/live-check.yml)
+so its flakiness cannot block the merge pipeline.
 
 `//...` is a registered CI lane, and that lane runs `bazel test` with **no
 `|| test $? -eq 4` tolerance**. A state with no tests is surfaced as a red lane on purpose, so

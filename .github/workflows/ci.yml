@@ -190,3 +190,24 @@ jobs:
         run: |
           cargo doc --workspace --no-deps --locked
           cargo doc -p obolus --bin obolus --no-deps --locked
+
+  # The live check (live-check.yml) pays from a funded key and runs only on main, so a broken client
+  # would otherwise be found after the merge. Its signing guard — what the client will agree to pay —
+  # is tested here instead: no key, and no network beyond the npm install.
+  live-check-client:
+    name: live-check client tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install
+        working-directory: ci/live-check
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Test
+        working-directory: ci/live-check
+        run: npm test
