@@ -49,13 +49,14 @@ called for ([#85](https://github.com/geekinasuit/obolus/pull/85),
 
 Phase A's last item, the round trip repeated automatically, is Milestone 3.
 
-## Milestone 2 — Someone can run this for money (built; demo review pending)
+## Milestone 2 — Someone can run this for money (complete)
 
 **Demo:** one gateway in front of local Ollama and a hosted OpenAI-compatible backend. A request is
 routed by its model under a precedence order and priced per backend (cost-plus) or per model (token
 rates), and each request writes a telemetry line with what it earned. Under cost-plus the line also
 shows what it cost, so an operator can see whether a backend makes money; under token rates the
-cost is unknown, which Milestone 5's design talk takes up.
+cost is unknown, which Milestone 5's design talk takes up. Held on 2026-11-14, with Ollama's
+OpenAI-compatible endpoint standing in for the hosted backend, and accepted the same day.
 
 Epic: [#53](https://github.com/geekinasuit/obolus/issues/53).
 
@@ -75,13 +76,17 @@ escaped startup output, refusal ordering, settlement receipts on refusal, the ex
 Left out: the free rate ([#67](https://github.com/geekinasuit/obolus/issues/67)), deferred until a
 zero-amount settle is confirmed against a real facilitator.
 
-## Milestone 3 — The live check runs itself (next)
+## Milestone 3 — The live check runs itself (built; demo review pending)
 
 **Demo:** after a merge to main, and once a week regardless, a GitHub Actions job starts the
 gateway built from main in front of a stub backend, pays it a real Base Sepolia payment through the
 `https://` x402.org facilitator with no proxy in between, and records the settlement's transaction
 hash in its run. A broken settle path turns the run red. This closes Phase A
-([#17](https://github.com/geekinasuit/obolus/issues/17)).
+([#17](https://github.com/geekinasuit/obolus/issues/17)). First settled payment on 2026-11-26,
+alongside a deliberately broken run that went red
+([details](https://github.com/geekinasuit/obolus/issues/133#issuecomment-7183987462)). Every run is
+listed under [Live check](https://github.com/geekinasuit/obolus/actions/workflows/live-check.yml) in
+the Actions tab.
 
 Epic: [#134](https://github.com/geekinasuit/obolus/issues/134).
 
