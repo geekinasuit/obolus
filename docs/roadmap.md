@@ -102,9 +102,8 @@ Builds:
   environment that only `main` can use, so no pull request can reach it
   ([#133](https://github.com/geekinasuit/obolus/issues/133)).
 
-Decided: the payer is a new testnet-only key used for nothing else. Christian creates it, funds it
-and stores it as the environment's secret; no agent handles the key. Each run moves about 0.001
-testnet USDC.
+Decided: Christian creates the payer key, funds it with testnet USDC and stores it as the
+environment's secret; no agent handles the key. Each run moves about 0.001 testnet USDC.
 
 Design talks carried for Milestone 4: none needed.
 

@@ -226,9 +226,9 @@ through an issue when evidence calls for it. [`architecture.md`](architecture.md
   facilitator.
 - **The live check runs in CI, outside the merge gate**
   ([#17](https://github.com/geekinasuit/obolus/issues/17)): after each merge to main and weekly, a
-  job pays a real testnet payment to the gateway, in front of a stub backend. Its payer is a
-  dedicated testnet-only key held as a secret in a GitHub Actions environment that only `main` can
-  use, so no pull request can reach it. The key is created and funded by a maintainer, never by an
+  job pays a real testnet payment to the gateway, in front of a stub backend. Its payer key is held
+  as a secret in a GitHub Actions environment that only `main` can use, so no pull request can
+  reach it. The key is created and funded by a maintainer, never by an
   agent.
 
 ## Deferred
