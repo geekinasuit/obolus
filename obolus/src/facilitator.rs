@@ -743,8 +743,8 @@ impl Facilitator for DelegatedFacilitator {
             //
             // KNOWN GAP — `errorReason == "duplicate_settlement"` means this authorization already
             // settled on a prior call, so money *did* move; neither 402 nor 502 is right for it. Its
-            // real handling is the A3 payment-keyed idempotency cache short-circuiting it to the
-            // cached receipt, and the fail-open-vs-terminal policy is Christian's call (#17).
+            // real handling is the payment-keyed idempotency cache short-circuiting it to the
+            // cached receipt, and the fail-open-vs-terminal policy is Christian's call (#148).
             // Until that lands it folds into this default; it is deliberately not special-cased.
             Some(false) => Ok(SettlementReceipt {
                 success: false,
@@ -1430,8 +1430,8 @@ mod delegated_tests {
     #[tokio::test]
     async fn settle_duplicate_settlement_folds_into_the_refusal_for_now() {
         // Pins the CURRENT behavior and its comment: `duplicate_settlement` is not special-cased in
-        // Phase A — its real handling (serve the cached receipt) is the A3 idempotency cache, and
-        // the fail-open-vs-terminal policy is Christian's call (#17).
+        // Phase A — its real handling (serve the cached receipt) is the idempotency cache, and
+        // the fail-open-vs-terminal policy is Christian's call (#148).
         let body = r#"{"success":false,"errorReason":"duplicate_settlement","transaction":"","network":"eip155:84532"}"#;
         assert_eq!(settle_against(body).await, Ok(refusal("duplicate_settlement", "")));
     }
