@@ -44,9 +44,9 @@ proposed, and milestones after 4 are tentative.
 | Milestone | Demo | Status |
 |---|---|---|
 | 0 Foundation | Standalone repo, both builds in CI, release binaries | Complete |
-| 1 A real 402 in front of a real model | A testnet payment through a third-party facilitator buys an Ollama answer | Demo held; closes with 3 |
+| 1 A real 402 in front of a real model | A testnet payment through a third-party facilitator buys an Ollama answer | Complete |
 | 2 Someone can run this for money | Several backends, routed by model, priced per backend or model, with per-request revenue (and cost, under cost-plus) | Complete |
-| 3 The live check runs itself | After each merge and weekly, CI pays the gateway a real testnet payment through an `https://` facilitator, no proxy | Built; demo review pending |
+| 3 The live check runs itself | After each merge and weekly, CI pays the gateway a real testnet payment through an `https://` facilitator, no proxy | Complete |
 | 4 Deployable by someone else | A newcomer follows the README from a release binary to a paid round trip | Proposed |
 | 5 Honest prices | Clients list prices before paying; telemetry shows quote beside actual usage and cost | Tentative |
 | 6 The operator's console | Change prices, kill a backend, read revenue against cost, without a restart | Tentative |

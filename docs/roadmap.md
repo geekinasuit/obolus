@@ -27,7 +27,7 @@ on Linux and macOS ([#3](https://github.com/geekinasuit/obolus/pull/3),
 issues ([#8](https://github.com/geekinasuit/obolus/pull/8)); and `obolus-devseller`, the seller to
 test a client against ([#4](https://github.com/geekinasuit/obolus/pull/4)).
 
-## Milestone 1 — A real 402 in front of a real model (demo held; closes with Milestone 3)
+## Milestone 1 — A real 402 in front of a real model (complete)
 
 **Demo:** a client pays a real testnet payment through a third-party facilitator and gets an answer
 from local Ollama. Held by hand on 2026-09-24 on Base Sepolia.
@@ -47,7 +47,7 @@ called for ([#85](https://github.com/geekinasuit/obolus/pull/85),
 [#90](https://github.com/geekinasuit/obolus/pull/90),
 [#109](https://github.com/geekinasuit/obolus/pull/109)).
 
-Phase A's last item, the round trip repeated automatically, is Milestone 3.
+Phase A's last item, the round trip repeated automatically, was Milestone 3; Phase A closed with it.
 
 ## Milestone 2 — Someone can run this for money (complete)
 
@@ -76,7 +76,7 @@ escaped startup output, refusal ordering, settlement receipts on refusal, the ex
 Left out: the free rate ([#67](https://github.com/geekinasuit/obolus/issues/67)), deferred until a
 zero-amount settle is confirmed against a real facilitator.
 
-## Milestone 3 — The live check runs itself (built; demo review pending)
+## Milestone 3 — The live check runs itself (complete)
 
 **Demo:** after a merge to main, and once a week regardless, a GitHub Actions job starts the
 gateway built from main in front of a stub backend, pays it a real Base Sepolia payment through the
@@ -86,11 +86,11 @@ hash in its run. A broken settle path turns the run red. This closes Phase A
 alongside a deliberately broken run that went red
 ([details](https://github.com/geekinasuit/obolus/issues/133#issuecomment-7183987462)). Every run is
 listed under [Live check](https://github.com/geekinasuit/obolus/actions/workflows/live-check.yml) in
-the Actions tab.
+the Actions tab. Reviewed and accepted on 2026-11-27.
 
 Epic: [#134](https://github.com/geekinasuit/obolus/issues/134).
 
-Builds:
+Built:
 
 - an outbound TLS client for the facilitator, with an explicit trust-store posture
   ([#35](https://github.com/geekinasuit/obolus/issues/35)), and the startup-log redaction that must
